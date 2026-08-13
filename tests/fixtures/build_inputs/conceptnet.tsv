@@ -1,0 +1,4 @@
+/a/[/r/PartOf/,/c/en/wheel/,/c/en/car/]	/r/PartOf	/c/en/wheel	/c/en/car	{"weight": 2.0}
+/a/[/r/UsedFor/,/c/en/knife/,/c/en/cutting/]	/r/UsedFor	/c/en/knife	/c/en/cutting	{"weight": 2.0}
+/a/[/r/AtLocation/,/c/en/book/,/c/en/library/]	/r/AtLocation	/c/en/book	/c/en/library	{"weight": 2.0}
+/a/[/r/Synonym/,/c/en/important/,/c/en/significant/]	/r/Synonym	/c/en/important	/c/en/significant	{"weight": 1.0}

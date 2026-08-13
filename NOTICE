@@ -1,0 +1,12 @@
+Lexicon MCP
+Copyright 2026 DilanRG
+
+This product includes software developed independently for the Lexicon MCP project.
+
+The project acknowledges Eyalm321/multilingual-dictionary-mcp as prior art. No source
+code or Git history from that project is included.
+
+The optional/full data bundle contains transformed material from third parties. Those
+materials are not licensed under the software's Apache License 2.0. See
+DATA_LICENSES.md, sources.lock.json, and the notices shipped inside each data release.
+

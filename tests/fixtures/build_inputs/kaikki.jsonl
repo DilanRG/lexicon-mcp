@@ -1,0 +1,10 @@
+{"word":"bank","lang":"English","lang_code":"en","pos":"noun","senses":[{"id":"bank-finance","glosses":["a financial institution"],"examples":[{"text":"She deposited money at the bank."}],"synonyms":[{"word":"depository"}],"translations":[{"word":"Bank","code":"de"}]},{"id":"bank-river","glosses":["the edge of a river"],"translations":[{"word":"Ufer","code":"de"}]}]}
+{"word":"lead","lang":"English","lang_code":"en","pos":"noun","sounds":[{"ipa":"/liːd/","tags":["verb"]},{"ipa":"/lɛd/","tags":["metal"]}],"senses":[{"glosses":["the chemical element Pb"]},{"glosses":["a position in front"]}]}
+{"word":"Schloss","lang":"German","lang_code":"de","pos":"noun","senses":[{"glosses":["castle"]},{"glosses":["lock"]}]}
+{"word":"Gift","lang":"German","lang_code":"de","pos":"noun","senses":[{"glosses":["poison"]}]}
+{"word":"bright","lang":"English","lang_code":"en","pos":"adjective","senses":[{"glosses":["emitting much light"],"antonyms":[{"word":"dim"}]}]}
+{"word":"feliz","lang":"Spanish","lang_code":"es","pos":"adjective","senses":[{"glosses":["happy"],"synonyms":[{"word":"contento"}]}]}
+{"word":"café","lang":"French","lang_code":"fr","pos":"noun","senses":[{"glosses":["coffee"]}]}
+{"word":"猫","lang":"Japanese","lang_code":"ja","pos":"noun","senses":[{"glosses":["cat"]}]}
+{"word":"سلام","lang":"Arabic","lang_code":"ar","pos":"noun","senses":[{"glosses":["peace"]}]}
+{"word":"घर","lang":"Hindi","lang_code":"hi","pos":"noun","senses":[{"glosses":["house"]}]}

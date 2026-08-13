@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<LexicalResource>
+  <Lexicon id="oewn-fixture" language="en">
+    <LexicalEntry id="bank-n">
+      <Lemma writtenForm="bank" partOfSpeech="n"/>
+      <Sense id="bank-finance" synset="syn-bank-finance"><Example>The bank approved the loan.</Example></Sense>
+      <Sense id="bank-river" synset="syn-bank-river"><Example>They sat on the river bank.</Example></Sense>
+    </LexicalEntry>
+    <LexicalEntry id="financial-institution-n">
+      <Lemma writtenForm="financial institution" partOfSpeech="n"/>
+      <Sense id="financial-institution" synset="syn-bank-finance"/>
+    </LexicalEntry>
+    <LexicalEntry id="dog-n">
+      <Lemma writtenForm="dog" partOfSpeech="n"/>
+      <Sense id="dog" synset="syn-dog"/>
+    </LexicalEntry>
+    <LexicalEntry id="poodle-n">
+      <Lemma writtenForm="poodle" partOfSpeech="n"/>
+      <Sense id="poodle" synset="syn-poodle"/>
+    </LexicalEntry>
+    <LexicalEntry id="animal-n">
+      <Lemma writtenForm="animal" partOfSpeech="n"/>
+      <Sense id="animal" synset="syn-animal"/>
+    </LexicalEntry>
+    <Synset id="syn-bank-finance" partOfSpeech="n"><Definition>a financial institution that accepts deposits</Definition></Synset>
+    <Synset id="syn-bank-river" partOfSpeech="n"><Definition>sloping land beside a body of water</Definition></Synset>
+    <Synset id="syn-poodle" partOfSpeech="n"><Definition>a dog of a breed with a curly coat</Definition><SynsetRelation relType="hypernym" target="syn-dog"/></Synset>
+    <Synset id="syn-dog" partOfSpeech="n"><Definition>a domesticated canine</Definition><SynsetRelation relType="hypernym" target="syn-animal"/></Synset>
+    <Synset id="syn-animal" partOfSpeech="n"><Definition>a living organism that feeds on organic matter</Definition></Synset>
+  </Lexicon>
+</LexicalResource>

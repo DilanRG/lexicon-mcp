@@ -1,0 +1,71 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lexicon-mcp"
+version = "1.0.0"
+description = "Offline multilingual dictionary, thesaurus, relations, semantic-neighbour, and wordplay MCP server"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [{ name = "DilanRG" }]
+dependencies = [
+  "mcp>=1.29,<2",
+  "platformdirs>=4.3,<5",
+  "pydantic>=2.11,<3",
+  "httpx>=0.28,<1",
+  "zstandard>=0.24,<1",
+  "usearch==2.26.0",
+  "numpy>=2.1,<3",
+]
+
+[project.optional-dependencies]
+build = [
+  "orjson>=3.10,<4",
+  "ijson>=3.4,<4",
+  "marisa-trie>=1.3,<2",
+]
+test = [
+  "pytest>=8.4,<9",
+  "pytest-asyncio>=1.1,<2",
+  "pytest-cov>=6.2,<7",
+  "psutil>=7,<8",
+]
+dev = [
+  "lexicon-mcp[build,test]",
+  "ruff>=0.12,<1",
+  "mypy>=1.17,<2",
+]
+
+[project.scripts]
+lexicon-mcp = "lexicon_mcp.server:main"
+lexicon-data = "lexicon_mcp.data_cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lexicon_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+  "full_corpus: requires the installed full multilingual corpus",
+  "live_stack: requires the running MCPO/Open WebUI stack",
+  "performance: resource and latency acceptance tests",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+packages = ["lexicon_mcp"]
+
+[[tool.mypy.overrides]]
+module = ["numpy", "numpy.*", "usearch", "usearch.*"]
+follow_imports = "skip"
