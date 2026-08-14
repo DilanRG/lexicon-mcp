@@ -34,6 +34,17 @@ def _dataset(tmp_path: Path) -> tuple[Path, bytes]:
         json.dumps({"schema_version": 1, "sources": []}) + "\n",
         encoding="utf-8",
     )
+    (root / "build-manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "dataset_version": "data-v1.0.0",
+                "profile": "full",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     payload = random.Random(20260814).randbytes(8192)
     (root / "payload.bin").write_bytes(payload)
     return root, payload

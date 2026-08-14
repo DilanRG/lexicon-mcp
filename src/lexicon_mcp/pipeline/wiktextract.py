@@ -136,6 +136,7 @@ def build_wiktextract(
     connection: sqlite3.Connection,
     paths: list[Path],
     commit_interval: int = 10_000,
+    allowed_languages: frozenset[str] | None = None,
 ) -> dict[str, int]:
     counts = {
         "entries": 0,
@@ -177,6 +178,8 @@ def build_wiktextract(
                 counts["malformed"] += 1
                 continue
             language = checked_language(entry.get("lang_code") or entry.get("language_code"))
+            if allowed_languages is not None and language not in allowed_languages:
+                continue
             if language != "und":
                 language_codes.add(language)
             part_of_speech = str(entry.get("pos") or "").strip() or None
@@ -208,6 +211,7 @@ def build_wiktextract(
                     part_of_speech,
                     sense,
                     counts,
+                    allowed_languages,
                 )
                 _insert_antonyms(
                     connection,
@@ -218,6 +222,7 @@ def build_wiktextract(
                     language,
                     sense,
                     counts,
+                    allowed_languages,
                 )
                 _insert_translations(
                     connection,
@@ -228,6 +233,7 @@ def build_wiktextract(
                     part_of_speech,
                     sense,
                     counts,
+                    allowed_languages,
                 )
                 sense_ids.append(sense_id)
                 counts["senses"] += 1
@@ -257,6 +263,7 @@ def build_wiktextract(
                         part_of_speech,
                         unlabeled,
                         counts,
+                        allowed_languages,
                     )
                 counts["senses"] += 1
                 counts["unsensed_senses"] += 1
@@ -281,6 +288,7 @@ def build_wiktextract(
                     part_of_speech,
                     group,
                     counts,
+                    allowed_languages,
                 )
                 counts["senses"] += 1
                 counts["labeled_senses"] += 1
@@ -302,6 +310,7 @@ def _insert_relation_group(
     part_of_speech: str | None,
     group: dict[str, list[dict[str, Any]]],
     counts: dict[str, int],
+    allowed_languages: frozenset[str] | None,
 ) -> None:
     """Insert one exact-label or unlabeled group through shared relation paths."""
 
@@ -315,6 +324,7 @@ def _insert_relation_group(
         part_of_speech,
         {"synonyms": group["synonyms"]},
         counts,
+        allowed_languages,
     )
     _insert_antonyms(
         connection,
@@ -325,6 +335,7 @@ def _insert_relation_group(
         language,
         {"antonyms": group["antonyms"]},
         counts,
+        allowed_languages,
     )
     _insert_translations(
         connection,
@@ -335,6 +346,7 @@ def _insert_relation_group(
         part_of_speech,
         {"translations": group["translations"]},
         counts,
+        allowed_languages,
     )
 
 
@@ -398,12 +410,15 @@ def _insert_synonyms(
     part_of_speech: str | None,
     container: dict[str, Any],
     counts: dict[str, int],
+    allowed_languages: frozenset[str] | None,
 ) -> None:
     position = 0
     seen: set[tuple[str, str]] = set()
     for item in _objects(container.get("synonyms")):
         term = _item_term(item)
         target_language = checked_language(item.get("lang_code"), language)
+        if allowed_languages is not None and target_language not in allowed_languages:
+            continue
         if not term or normalize_term(term) == normalize_term(source_word):
             continue
         marker = (target_language, normalize_term(term))
@@ -433,6 +448,7 @@ def _insert_antonyms(
     language: str,
     container: dict[str, Any],
     counts: dict[str, int],
+    allowed_languages: frozenset[str] | None,
 ) -> None:
     seen: set[tuple[str, str]] = set()
     for item in _objects(container.get("antonyms")):
@@ -440,6 +456,8 @@ def _insert_antonyms(
         if not term:
             continue
         target_language = checked_language(item.get("lang_code"), language)
+        if allowed_languages is not None and target_language not in allowed_languages:
+            continue
         marker = (target_language, normalize_term(term))
         if marker in seen:
             continue
@@ -469,6 +487,7 @@ def _insert_translations(
     part_of_speech: str | None,
     container: dict[str, Any],
     counts: dict[str, int],
+    allowed_languages: frozenset[str] | None,
 ) -> None:
     position = 0
     seen: set[tuple[str, str]] = set()
@@ -476,6 +495,8 @@ def _insert_translations(
         term = _item_term(item)
         target_language = checked_language(item.get("code") or item.get("lang_code"))
         if not term or target_language == "und":
+            continue
+        if allowed_languages is not None and target_language not in allowed_languages:
             continue
         marker = (target_language, normalize_term(term))
         if marker in seen:

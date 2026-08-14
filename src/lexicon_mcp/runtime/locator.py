@@ -81,6 +81,17 @@ class DatasetLocator:
                 f"Activation version {version!r} does not match "
                 f"manifest version {manifest_version!r}"
             )
+        profile = manifest.get("profile", "full")
+        if profile not in {"full", "english"}:
+            raise RuntimeError(f"Dataset manifest has unsupported profile {profile!r}")
+        activation_profile = activation.get("profile")
+        if activation_profile is not None and activation_profile != profile:
+            raise RuntimeError(
+                f"Activation profile {activation_profile!r} does not match "
+                f"manifest profile {profile!r}"
+            )
+        if profile == "english" and manifest.get("languages") != ["en"]:
+            raise RuntimeError("English dataset manifest must declare languages=['en']")
         lexical = dataset_path / "lexicon.sqlite3"
         if not lexical.is_file():
             raise RuntimeError(f"Active dataset is missing {lexical.name}")

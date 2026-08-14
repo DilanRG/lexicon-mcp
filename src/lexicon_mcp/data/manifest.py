@@ -18,6 +18,8 @@ _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _TABLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_LANGUAGE_RE = re.compile(r"^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$")
+_DATASET_PROFILES = frozenset({"full", "english"})
 _SEMANTIC_INDEX_SCHEMA_KEYS = frozenset(
     {
         "semantic_dimensions",
@@ -134,6 +136,7 @@ class DatasetManifest:
     schema_version: int
     dataset_version: str
     profile: str
+    languages: tuple[str, ...]
     release: Release
     created_at: str
     transformation_commit: str
@@ -426,8 +429,25 @@ def parse_manifest(raw: bytes | str) -> DatasetManifest:
         raise ManifestError("schema_version must be 1")
     dataset_version = safe_version(value.get("dataset_version"))
     profile = _string(value.get("profile"), "profile")
-    if profile != "full":
-        raise ManifestError("schema v1 supports only the full profile")
+    if profile not in _DATASET_PROFILES:
+        raise ManifestError("profile must be full or english")
+    languages_value = value.get("languages")
+    if languages_value is None:
+        languages: tuple[str, ...] = ()
+    else:
+        if not isinstance(languages_value, list) or not languages_value:
+            raise ManifestError("languages must be a non-empty array")
+        parsed_languages: list[str] = []
+        for index, language in enumerate(languages_value):
+            if not isinstance(language, str) or not _LANGUAGE_RE.fullmatch(language):
+                raise ManifestError(f"languages[{index}] is not a valid language tag")
+            normalized = language.replace("_", "-").lower()
+            if normalized in parsed_languages:
+                raise ManifestError(f"duplicate language tag: {normalized}")
+            parsed_languages.append(normalized)
+        languages = tuple(parsed_languages)
+    if profile == "english" and languages != ("en",):
+        raise ManifestError("the english profile requires languages=['en']")
     release = _parse_release(value.get("release"), dataset_version)
     sources = _parse_sources(value.get("sources"))
     components = _parse_components(value.get("components"), {item.id for item in sources})
@@ -440,6 +460,7 @@ def parse_manifest(raw: bytes | str) -> DatasetManifest:
         schema_version=1,
         dataset_version=dataset_version,
         profile=profile,
+        languages=languages,
         release=release,
         created_at=_string(value.get("created_at"), "created_at"),
         transformation_commit=transformation_commit,

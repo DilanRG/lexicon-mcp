@@ -224,6 +224,57 @@ def test_full_fixture_build_has_senses_translations_relations_and_wordplay(tmp_p
     assert build_manifest["resource_projection"]["total"] < 30 * 1024**3
 
 
+def test_english_profile_filters_lexical_data_and_reuses_global_semantic_index(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "fixture-english"
+    result = build_full_corpus(
+        BuildInputs(
+            oewn=FIXTURES / "oewn.xml",
+            wiktextract=(FIXTURES / "kaikki.jsonl",),
+            conceptnet=FIXTURES / "conceptnet.tsv",
+            numberbatch=FIXTURES / "numberbatch.txt",
+            cmudict=FIXTURES / "cmudict.dict",
+            notices_dir=FIXTURES / "notices",
+        ),
+        output,
+        tmp_path / "state",
+        dataset_version="fixture-english",
+        profile="english",
+    )
+    assert result["profile"] == "english"
+    assert result["languages"] == ["en"]
+    with sqlite3.connect(output / "lexicon.sqlite3") as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM lexical_terms WHERE language != 'en'"
+        ).fetchone()[0] == 0
+    with sqlite3.connect(output / "semantic" / "mapping.sqlite3") as connection:
+        rows = connection.execute(
+            "SELECT language,index_file,term_count FROM semantic_languages"
+        ).fetchall()
+        assert rows == [("en", "indexes/global.usearch", 4)]
+        assert connection.execute("SELECT DISTINCT language FROM lexical_terms").fetchall() == [
+            ("en",)
+        ]
+    assert not (output / "semantic" / "indexes" / "languages").exists()
+
+    package = tmp_path / "english-release"
+    release_manifest = package_dataset(
+        output,
+        package,
+        dataset_version="fixture-english",
+        repository="DilanRG/lexicon-mcp",
+        tag="fixture-english",
+        transformation_commit="0" * 40,
+        max_part_size=127,
+        created_at="2026-01-01T00:00:00Z",
+    )
+    parsed = parse_manifest((package / "manifest.json").read_bytes())
+    assert release_manifest["profile"] == parsed.profile == "english"
+    assert release_manifest["languages"] == ["en"]
+    assert parsed.languages == ("en",)
+
+
 def test_semantic_artifacts_share_dense_global_ids(tmp_path: Path) -> None:
     root = _build(tmp_path)
     semantic = root / "semantic"

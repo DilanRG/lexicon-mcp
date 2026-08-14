@@ -39,6 +39,7 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--output", type=Path, required=True)
     value.add_argument("--build-state", type=Path, required=True)
     value.add_argument("--dataset-version", default="data-v1.0.0")
+    value.add_argument("--profile", choices=("full", "english"), default="full")
     value.add_argument("--retrieved-at", help="RFC 3339 timestamp recorded for every source")
     return value
 
@@ -60,6 +61,7 @@ def main() -> None:
         dataset_version=args.dataset_version,
         retrieved_at=args.retrieved_at,
         enforce_corpus_floors=True,
+        profile=args.profile,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
 

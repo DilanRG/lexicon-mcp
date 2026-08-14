@@ -23,6 +23,7 @@ from lexicon_mcp.data.manifest import ManifestError
 DEFAULT_MANIFEST = (
     "https://github.com/DilanRG/lexicon-mcp/releases/download/{version}/manifest.json"
 )
+DATASET_PROFILES = ("full", "english")
 
 
 def _manifest_source(value: str | None, *, version: str, profile: str) -> str:
@@ -50,7 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
 
     install = commands.add_parser("install", help="install and atomically activate a release")
-    install.add_argument("--profile", choices=("full",), required=True)
+    install.add_argument("--profile", choices=DATASET_PROFILES, required=True)
     install.add_argument("--version", required=True)
     install.add_argument(
         "--manifest-url",
@@ -65,6 +66,11 @@ def build_parser() -> argparse.ArgumentParser:
     repair = commands.add_parser("repair", help="redownload only damaged components")
     repair.add_argument("--version", help="installed version (defaults to active)")
     repair.add_argument(
+        "--profile",
+        choices=DATASET_PROFILES,
+        help="installed profile (normally detected from activation/manifest metadata)",
+    )
+    repair.add_argument(
         "--manifest-url",
         help="optional pinned manifest URL/path if the installed manifest is damaged",
     )
@@ -72,6 +78,32 @@ def build_parser() -> argparse.ArgumentParser:
     rollback = commands.add_parser("rollback", help="activate the retained previous version")
     rollback.add_argument("--version", help="explicit retained version (defaults to previous)")
     return parser
+
+
+def _repair_profile(
+    lifecycle: DatasetLifecycle, *, version: str | None, requested: str | None
+) -> str:
+    if requested is not None:
+        return requested
+    status = lifecycle.status()
+    current = status.get("current")
+    resolved_version = version
+    if resolved_version is None and isinstance(current, dict):
+        current_version = current.get("version")
+        if isinstance(current_version, str):
+            resolved_version = current_version
+        current_profile = current.get("profile")
+        if isinstance(current_profile, str) and current_profile in DATASET_PROFILES:
+            return current_profile
+    for installed in status.get("installed_versions", []):
+        if not isinstance(installed, dict) or installed.get("version") != resolved_version:
+            continue
+        profile = installed.get("profile")
+        if isinstance(profile, str) and profile in DATASET_PROFILES:
+            return profile
+    # Activation records created before profile support can only refer to the
+    # original full release profile.
+    return "full"
 
 
 def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
@@ -102,7 +134,12 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 if not isinstance(current, dict) or not isinstance(current.get("version"), str):
                     raise LifecycleError("cannot resolve active version for repair manifest")
                 version = current["version"]
-            repair_source = _manifest_source(args.manifest_url, version=version, profile="full")
+            profile = _repair_profile(
+                lifecycle,
+                version=version,
+                requested=args.profile,
+            )
+            repair_source = _manifest_source(args.manifest_url, version=version, profile=profile)
         return lifecycle.repair(version=args.version, manifest_source=repair_source), 0
     if args.command == "rollback":
         return lifecycle.rollback(args.version), 0

@@ -218,11 +218,7 @@ def reproducible_timestamp(explicit: str | None = None) -> str:
     if explicit:
         return explicit
     epoch = int(os.environ.get("SOURCE_DATE_EPOCH", "0"))
-    value = (
-        dt.datetime.fromtimestamp(epoch, tz=dt.UTC)
-        if epoch
-        else dt.datetime.now(tz=dt.UTC)
-    )
+    value = dt.datetime.fromtimestamp(epoch, tz=dt.UTC) if epoch else dt.datetime.now(tz=dt.UTC)
     return value.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
@@ -344,6 +340,33 @@ def package_dataset(
     if not re.fullmatch(r"[0-9a-f]{40}", transformation_commit):
         raise ValueError("transformation_commit must be a lowercase 40-hex Git commit")
     dataset_root = dataset_root.resolve()
+    build_manifest_path = dataset_root / "build-manifest.json"
+    try:
+        build_manifest = json.loads(build_manifest_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ValueError("dataset has no build-manifest.json") from exc
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("dataset build-manifest.json is not valid UTF-8 JSON") from exc
+    if not isinstance(build_manifest, dict):
+        raise ValueError("dataset build-manifest.json must contain an object")
+    if build_manifest.get("dataset_version") != dataset_version:
+        raise ValueError("build manifest dataset_version does not match package request")
+    profile = build_manifest.get("profile")
+    if profile not in {"full", "english"}:
+        raise ValueError("build manifest profile must be full or english")
+    languages = build_manifest.get("languages")
+    if profile == "english" and languages != ["en"]:
+        raise ValueError("english build manifest must declare languages=['en']")
+    if (
+        profile == "full"
+        and languages is not None
+        and (
+            not isinstance(languages, list)
+            or not languages
+            or not all(isinstance(language, str) and language for language in languages)
+        )
+    ):
+        raise ValueError("build manifest languages must be a non-empty string array")
     package_dir.mkdir(parents=True, exist_ok=True)
     notices = dataset_root / "notices"
     missing_notices = [
@@ -382,9 +405,7 @@ def package_dataset(
             )
             sink = _SplitPartWriter(package_dir, part_prefix, max_part_size)
             try:
-                compressor = zstandard.ZstdCompressor(
-                    level=10, threads=0, write_checksum=True
-                )
+                compressor = zstandard.ZstdCompressor(level=10, threads=0, write_checksum=True)
                 with source_path.open("rb") as source_stream:
                     compressor.copy_stream(
                         source_stream,
@@ -411,9 +432,7 @@ def package_dataset(
                 )
             if artifact_type == "semantic_index":
                 if not semantic_schema:
-                    raise ValueError(
-                        f"semantic index has no pinned schema metadata: {relative}"
-                    )
+                    raise ValueError(f"semantic index has no pinned schema metadata: {relative}")
                 integrity.update(semantic_schema)
                 if relative.endswith("/global.usearch"):
                     integrity.update(
@@ -433,8 +452,7 @@ def package_dataset(
                 component_sources = [
                     item
                     for item in available_ids
-                    if item in {"oewn", "conceptnet", "cmudict"}
-                    or item.startswith("wiktextract")
+                    if item in {"oewn", "conceptnet", "cmudict"} or item.startswith("wiktextract")
                 ]
             elif relative.startswith("semantic/"):
                 component_sources = [item for item in available_ids if item == "numberbatch"]
@@ -465,13 +483,15 @@ def package_dataset(
         manifest = {
             "schema_version": 1,
             "dataset_version": dataset_version,
-            "profile": "full",
+            "profile": profile,
             "transformation_commit": transformation_commit,
             "release": release,
             "created_at": reproducible_timestamp(created_at),
             "sources": lock.get("sources", []),
             "components": components,
         }
+        if languages is not None:
+            manifest["languages"] = languages
         write_json_atomic(package_dir / "manifest.json", manifest)
         return manifest
     except BaseException:

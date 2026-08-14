@@ -5,6 +5,8 @@ param(
     [string]$BuildState = 'E:\AI\state\lexicon-mcp-build',
     [string]$Output = 'E:\AI\state\lexicon-mcp-build\built\data-v1.0.0',
     [string]$DatasetVersion = 'data-v1.0.0',
+    [ValidateSet('full', 'english')]
+    [string]$Profile = 'full',
     [switch]$RecoverPartial,
     [string]$OriginalBuildCommit = '',
     [string]$RecoveryCommit = '',
@@ -184,7 +186,8 @@ $arguments = @(
     '--notices-dir', $projectPath,
     '--output', $outputPath,
     '--build-state', $statePath,
-    '--dataset-version', $DatasetVersion
+    '--dataset-version', $DatasetVersion,
+    '--profile', $Profile
 )
 if ($RecoverPartial) {
     $arguments += @(
@@ -407,6 +410,7 @@ if (-not $launcherStillRunning) {
 $summary = [ordered]@{
     operation = $operation
     dataset_version = $DatasetVersion
+    profile = $Profile
     output = $outputPath
     started_at = $startedAt.ToString('o')
     finished_at = [DateTimeOffset]::Now.ToString('o')

@@ -79,6 +79,7 @@ diagnostic containing the exact `lexicon-data install` command.
 
 ```powershell
 lexicon-data install --profile full --version data-v1.0.0
+lexicon-data install --profile english --version data-en-v1.0.0
 lexicon-data status
 lexicon-data verify
 lexicon-data repair
@@ -89,6 +90,12 @@ lexicon-data rollback
 active dataset is selected through an atomically replaced `current.json` pointer.
 Downloads resume into `.partial` files, are hash-checked before extraction, and are
 activated only after database/index integrity checks.
+
+The `english` profile keeps only English lexical terms, English-to-English
+relations, CMUdict pronunciation data, and the English Numberbatch vectors. It
+stores one shared English semantic index instead of a global index plus a
+duplicate language shard. Cross-language calls return a typed unavailable
+response; the same six-tool MCP surface remains stable across profiles.
 
 ## Corpus
 
@@ -138,6 +145,15 @@ memory, and working-set telemetry throughout the build:
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_full_build.ps1
 ```
 
+For the compact English profile, use distinct output/version paths:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_full_build.ps1 `
+  -Profile english `
+  -DatasetVersion data-en-v1.0.0 `
+  -Output E:\AI\state\lexicon-mcp-build\built\data-en-v1.0.0
+```
+
 The equivalent direct command is:
 
 ```powershell
@@ -153,6 +169,10 @@ uv run --frozen python scripts/build_full_corpus.py `
   --build-state E:\AI\state\lexicon-mcp-build `
   --dataset-version data-v1.0.0
 ```
+
+The direct English build uses the same pinned inputs and adds
+`--profile english`, with `data-en-v1.0.0` supplied for both `--output` and
+`--dataset-version`.
 
 Package with the exact clean transformation commit, then validate a clean offline
 install from the same release bundle before uploading it:

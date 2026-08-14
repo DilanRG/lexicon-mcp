@@ -76,6 +76,8 @@ def manifest_bytes(
     components: dict[str, tuple[str, bytes]],
     *,
     override_sha: dict[str, str] | None = None,
+    profile: str = "full",
+    languages: list[str] | None = None,
 ) -> bytes:
     override_sha = override_sha or {}
     items = []
@@ -106,7 +108,7 @@ def manifest_bytes(
     value = {
         "schema_version": 1,
         "dataset_version": version,
-        "profile": "full",
+        "profile": profile,
         "release": {
             "repository": "DilanRG/lexicon-mcp",
             "tag": version,
@@ -131,6 +133,8 @@ def manifest_bytes(
         ],
         "components": items,
     }
+    if languages is not None:
+        value["languages"] = languages
     return (json.dumps(value, sort_keys=True) + "\n").encode()
 
 
@@ -253,6 +257,52 @@ def test_install_resume_verify_and_atomic_activation(tmp_path: Path) -> None:
     assert pointer["path"] == "versions/data-v1.0.0"
     assert pointer["manifest_sha256"] == manifest.sha256
     assert not list((manager.root / "versions").glob(".*.staging"))
+
+
+def test_english_profile_install_activation_status_and_repair(tmp_path: Path) -> None:
+    components = {"lexical": ("lexicon.sqlite3", sqlite_payload(tmp_path, "en.db", ["one"]))}
+    manager = lifecycle(tmp_path / "data", transport_for(components))
+    manifest = parse_manifest(
+        manifest_bytes(
+            "data-en-v1.0.0",
+            components,
+            profile="english",
+            languages=["en"],
+        )
+    )
+
+    result = manager.install(manifest, profile="english", version="data-en-v1.0.0")
+
+    assert result["profile"] == "english"
+    pointer = json.loads((manager.root / "current.json").read_text())
+    assert pointer["profile"] == "english"
+    status = manager.status()
+    assert status["installed_versions"][0]["profile"] == "english"
+    assert manager.repair()["profile"] == "english"
+
+
+def test_manifest_english_profile_requires_exact_language_scope(tmp_path: Path) -> None:
+    components = {"lexical": ("lexicon.sqlite3", sqlite_payload(tmp_path, "en.db", ["one"]))}
+    parsed = parse_manifest(
+        manifest_bytes(
+            "data-en-v1.0.0",
+            components,
+            profile="english",
+            languages=["en"],
+        )
+    )
+    assert parsed.profile == "english"
+    assert parsed.languages == ("en",)
+
+    with pytest.raises(ManifestError, match=r"requires languages=\['en'\]"):
+        parse_manifest(
+            manifest_bytes(
+                "data-en-v1.0.0",
+                components,
+                profile="english",
+                languages=["en", "de"],
+            )
+        )
 
 
 def test_verify_active_checks_pointer_manifest_pin(tmp_path: Path) -> None:

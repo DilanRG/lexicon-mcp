@@ -63,6 +63,21 @@ FULL_CORPUS_FLOORS: dict[str, dict[str, int]] = {
     "cmudict": {"entries": 130_000},
 }
 
+# English source data only.  The lexical floors are calibrated from the
+# verified v1 corpus; relation floors retain margin until the first packaged
+# English release records its exact post-filter counts.
+ENGLISH_CORPUS_FLOORS: dict[str, dict[str, int]] = {
+    "oewn": {"synsets": 100_000, "senses": 180_000},
+    "wiktextract": {
+        "entries": 1_400_000,
+        "senses": 1_900_000,
+        "language_codes": 1,
+    },
+    "conceptnet": {"assertions": 1_000_000, "relations": 1_000_000},
+    "numberbatch": {"terms": 500_000},
+    "cmudict": {"entries": 130_000},
+}
+
 _LEXICAL_STAGE_SOURCES = {
     "oewn": OEWN_SOURCE,
     "wiktextract": WIKTEXTRACT_SOURCE,
@@ -270,12 +285,14 @@ def _installed_size(path: Path) -> int:
 
 def evaluate_corpus_floors(
     stage_counts: dict[str, Any],
+    profile: str = "full",
 ) -> tuple[dict[str, dict[str, dict[str, int | bool]]], list[str]]:
     """Compare exact observed builder counts with public full-corpus floors."""
 
     results: dict[str, dict[str, dict[str, int | bool]]] = {}
     failures: list[str] = []
-    for stage, metrics in FULL_CORPUS_FLOORS.items():
+    floors = FULL_CORPUS_FLOORS if profile == "full" else ENGLISH_CORPUS_FLOORS
+    for stage, metrics in floors.items():
         stage_value = stage_counts.get(stage)
         stage_results: dict[str, dict[str, int | bool]] = {}
         for metric, minimum in metrics.items():
@@ -487,7 +504,10 @@ def _verified_semantic_counts(
             ) from exc
         if metadata_language_count != len(languages):
             raise RuntimeError("semantic metadata language_count is not exact")
-        if metadata.get("language_index_dir") != "indexes/languages":
+        english_global_only = metadata.get("build_profile") == "english"
+        if metadata.get("language_index_dir") != (
+            "" if english_global_only else "indexes/languages"
+        ):
             raise RuntimeError("semantic metadata language index directory is invalid")
         index_files = [str(row["index_file"]) for row in language_rows]
         if len(index_files) != len(set(index_files)):
@@ -502,7 +522,11 @@ def _verified_semantic_counts(
         verify_saved_index(global_path, terms, dimensions)
         for row in language_rows:
             language = str(row["language"])
-            expected_relative = f"indexes/languages/{language.replace('-', '_')}.usearch"
+            expected_relative = (
+                "indexes/global.usearch"
+                if english_global_only and language == "en"
+                else f"indexes/languages/{language.replace('-', '_')}.usearch"
+            )
             if str(row["index_file"]) != expected_relative:
                 raise RuntimeError("semantic language index path is not canonical")
             index_path = (root / str(row["index_file"])).resolve()
@@ -565,7 +589,11 @@ def build_full_corpus(
     dataset_version: str = "data-v1.0.0",
     retrieved_at: str | None = None,
     enforce_corpus_floors: bool = False,
+    profile: str = "full",
 ) -> dict[str, Any]:
+    if profile not in {"full", "english"}:
+        raise ValueError("profile must be 'full' or 'english'")
+    allowed_languages = frozenset({"en"}) if profile == "english" else None
     inputs.validate()
     # Freeze one implementation identity for every stage in this invocation;
     # a source edit during a long build cannot silently produce mixed markers.
@@ -599,7 +627,8 @@ def build_full_corpus(
             )
     partial.mkdir(parents=True, exist_ok=True)
     _copy_notices(inputs.notices_dir, partial / "notices")
-    checkpoints = Checkpoints(build_state / dataset_version / "checkpoints")
+    checkpoint_profile = dataset_version if profile == "full" else f"{dataset_version}-{profile}"
+    checkpoints = Checkpoints(build_state / checkpoint_profile / "checkpoints")
     lexical_path = partial / "lexicon.sqlite3"
     connection = sqlite3.connect(lexical_path)
     stage_counts: dict[str, Any] = {}
@@ -614,12 +643,16 @@ def build_full_corpus(
             (
                 "wiktextract",
                 inputs.wiktextract,
-                lambda: build_wiktextract(connection, list(inputs.wiktextract)),
+                lambda: build_wiktextract(
+                    connection, list(inputs.wiktextract), allowed_languages=allowed_languages
+                ),
             ),
             (
                 "conceptnet",
                 (inputs.conceptnet,),
-                lambda: build_conceptnet(connection, inputs.conceptnet),
+                lambda: build_conceptnet(
+                    connection, inputs.conceptnet, allowed_languages=allowed_languages
+                ),
             ),
             ("cmudict", (inputs.cmudict,), lambda: build_cmudict(connection, inputs.cmudict)),
         )
@@ -674,7 +707,9 @@ def build_full_corpus(
     else:
         if semantic_dir.exists():
             shutil.rmtree(semantic_dir)
-        semantic_counts = build_numberbatch(inputs.numberbatch, semantic_dir, dataset_version)
+        semantic_counts = build_numberbatch(
+            inputs.numberbatch, semantic_dir, dataset_version, allowed_languages=allowed_languages
+        )
         _record_semantic_checkpoint(
             semantic_dir, semantic_fingerprint, semantic_counts
         )
@@ -688,7 +723,7 @@ def build_full_corpus(
         checkpoints.mark("numberbatch", semantic_fingerprint, counts=semantic_counts)
         stage_counts["numberbatch"] = semantic_counts
 
-    corpus_floors, floor_failures = evaluate_corpus_floors(stage_counts)
+    corpus_floors, floor_failures = evaluate_corpus_floors(stage_counts, profile)
     if enforce_corpus_floors and floor_failures:
         raise RuntimeError("full-corpus floor failure: " + "; ".join(floor_failures))
 
@@ -696,7 +731,7 @@ def build_full_corpus(
     manifest: dict[str, Any] = {
         "schema_version": 1,
         "dataset_version": dataset_version,
-        "profile": "full",
+        "profile": profile,
         "pipeline_identity": pipeline_identity,
         "lexical_counts": lexical_counts,
         "stage_counts": stage_counts,
@@ -708,6 +743,8 @@ def build_full_corpus(
         "installed_size_limit": INSTALLED_LIMIT,
         "ngrams_included": False,
     }
+    if profile == "english":
+        manifest["languages"] = ["en"]
     manifest_path = partial / "build-manifest.json"
     for _attempt in range(3):
         write_json_atomic(manifest_path, manifest)

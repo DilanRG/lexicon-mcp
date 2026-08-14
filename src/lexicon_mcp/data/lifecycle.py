@@ -119,6 +119,9 @@ def active_version(data_root: Path | None = None) -> tuple[str, Path] | None:
     value = _read_json(pointer)
     if value.get("schema_version") != 1:
         raise LifecycleError("current.json has an unsupported schema")
+    profile = value.get("profile")
+    if profile is not None and profile not in {"full", "english"}:
+        raise LifecycleError("current.json has an unsupported dataset profile")
     version = safe_version(value.get("version"), field="current.version")
     expected_path = f"versions/{version}"
     relative = value.get("path")
@@ -300,6 +303,13 @@ class DatasetLifecycle:
         if active_pointer is not None and active_pointer.get("manifest_sha256") != manifest.sha256:
             report["ok"] = False
             report["problems"].insert(0, "current.json: manifest SHA-256 mismatch")
+        if (
+            active_pointer is not None
+            and active_pointer.get("profile") is not None
+            and active_pointer.get("profile") != manifest.profile
+        ):
+            report["ok"] = False
+            report["problems"].insert(0, "current.json: dataset profile mismatch")
         report.update({"version": version, "path": str(path)})
         return report
 
@@ -328,9 +338,12 @@ class DatasetLifecycle:
             else:
                 manifest = self.load_manifest(manifest_source)
                 local_asset_root = self._local_asset_root(manifest_source)
-            self._match_request(manifest, profile="full", version=version)
+            self._match_request(manifest, profile=manifest.profile, version=version)
             pointer = self._pointer_or_none()
             if pointer and pointer.get("version") == version:
+                expected_profile = pointer.get("profile")
+                if expected_profile is not None and expected_profile != manifest.profile:
+                    raise LifecycleError("repair manifest profile does not match active profile")
                 expected_manifest_sha = pointer.get("manifest_sha256")
                 if expected_manifest_sha and expected_manifest_sha != manifest.sha256:
                     raise LifecycleError("repair manifest does not match the activated release")
@@ -340,7 +353,12 @@ class DatasetLifecycle:
                 problem.startswith("manifest.json:") for problem in report["problems"]
             )
             if not damaged and not manifest_damaged:
-                return {"action": "healthy", "version": version, "repaired": []}
+                return {
+                    "action": "healthy",
+                    "version": version,
+                    "profile": manifest.profile,
+                    "repaired": [],
+                }
             if damaged:
                 self._preflight(manifest, components=damaged)
             stage = self._staging_path(version, "repair")
@@ -375,6 +393,7 @@ class DatasetLifecycle:
             return {
                 "action": "repaired",
                 "version": version,
+                "profile": manifest.profile,
                 "repaired": repaired,
                 "manifest_restored": manifest_damaged,
             }
@@ -405,8 +424,8 @@ class DatasetLifecycle:
 
     def _match_request(self, manifest: DatasetManifest, *, profile: str, version: str) -> None:
         version = safe_version(version)
-        if profile != "full":
-            raise LifecycleError("only the full dataset profile is supported")
+        if profile not in {"full", "english"}:
+            raise LifecycleError("dataset profile must be full or english")
         if manifest.profile != profile:
             raise LifecycleError(
                 f"manifest profile {manifest.profile!r} does not match requested {profile!r}"
@@ -803,6 +822,7 @@ class DatasetLifecycle:
         pointer: dict[str, Any] = {
             "schema_version": 1,
             "version": manifest.dataset_version,
+            "profile": manifest.profile,
             "path": f"versions/{manifest.dataset_version}",
             "manifest_sha256": manifest.sha256,
             "activated_at": _utc_now(),

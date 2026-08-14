@@ -1259,3 +1259,52 @@ def test_service_rejects_incompatible_dataset_metadata(lexical_database: Path) -
         connection.commit()
     with pytest.raises(RuntimeError, match="Unsupported lexical schema version"):
         LexiconService(lexical_database, "data-test-v1")
+
+
+def test_english_profile_rejects_contaminated_lexical_artifact(
+    lexical_database: Path,
+) -> None:
+    with pytest.raises(RuntimeError, match="non-English lexical term"):
+        LexiconService(
+            lexical_database,
+            "data-test-v1",
+            dataset_profile="english",
+        )
+
+
+def test_english_profile_fails_closed_for_cross_language_requests(
+    tmp_path: Path,
+    lexical_database: Path,
+) -> None:
+    english_database = tmp_path / "english.sqlite3"
+    english_database.write_bytes(lexical_database.read_bytes())
+    with sqlite3.connect(english_database) as connection:
+        connection.execute("DELETE FROM lexical_terms WHERE language <> 'en'")
+        connection.commit()
+    semantic = FakeSemanticSearch()
+
+    with LexiconService(
+        english_database,
+        "data-test-v1",
+        semantic_search=semantic,
+        dataset_profile="english",
+    ) as instance:
+        responses = [
+            instance.dictionary_lookup("chat", "fr"),
+            instance.dictionary_synonyms("chat", "fr"),
+            instance.dictionary_translate("bank", "en", "de"),
+            instance.dictionary_relations("dog", "hypernym", "en", "de"),
+            instance.dictionary_semantic_neighbors("cat", "de"),
+        ]
+        for response in responses:
+            assert response["available"] is False
+            assert response["unavailable_reason"] == "english_profile_supports_only_en"
+            assert response["results"] == []
+        assert responses[1]["candidate_count"] == 0
+        assert responses[2]["candidate_count"] == 0
+        assert semantic.calls == []
+
+        english = instance.dictionary_semantic_neighbors("cat", "en")
+        assert semantic.calls == [("cat", "en", "en", 20, None)]
+        assert english["available"] is True
+        assert english["results"] == []

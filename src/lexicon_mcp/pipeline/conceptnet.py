@@ -51,6 +51,7 @@ def build_conceptnet(
     connection: sqlite3.Connection,
     path: Path,
     commit_interval: int = 100_000,
+    allowed_languages: frozenset[str] | None = None,
 ) -> dict[str, int]:
     counts = {
         "source_assertions": 0,
@@ -76,6 +77,11 @@ def build_conceptnet(
         source = _concept(fields[2])
         target = _concept(fields[3])
         if not mapping or not source or not target:
+            counts["skipped"] += 1
+            continue
+        if allowed_languages is not None and (
+            source[0] not in allowed_languages or target[0] not in allowed_languages
+        ):
             counts["skipped"] += 1
             continue
         if len(fields) == 5:

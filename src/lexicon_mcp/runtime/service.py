@@ -37,6 +37,7 @@ RELATIONS = frozenset(
 )
 WORDPLAY_MODES = frozenset({"rhyme", "near_rhyme", "sounds_like", "spelled_like", "prefix"})
 SUPPORTED_SCHEMA_VERSION = "2"
+SUPPORTED_DATASET_PROFILES = frozenset({"full", "english"})
 
 _RELATION_CODES = {
     "synonym": 1,
@@ -154,13 +155,17 @@ class LexiconService:
         *,
         semantic_directory: str | Path | None = None,
         semantic_search: SemanticSearch | None = None,
+        dataset_profile: str = "full",
     ) -> None:
         self.database_path = Path(database_path).resolve()
         if not self.database_path.is_file():
             raise RuntimeError(f"Lexical database does not exist: {self.database_path}")
         if not dataset_version:
             raise ValueError("dataset_version cannot be empty")
+        if dataset_profile not in SUPPORTED_DATASET_PROFILES:
+            raise ValueError("dataset_profile must be full or english")
         self.dataset_version = dataset_version
+        self.dataset_profile = dataset_profile
         self._connection = sqlite3.connect(
             f"file:{self.database_path.as_posix()}?mode=ro&immutable=1",
             uri=True,
@@ -196,6 +201,7 @@ class LexiconService:
                 + ", ".join(sorted(missing))
             )
         self._check_dataset_version()
+        self._check_dataset_profile()
 
         if semantic_search is not None:
             self._semantic = semantic_search
@@ -216,6 +222,7 @@ class LexiconService:
             dataset.lexical_database,
             dataset.version,
             semantic_directory=dataset.semantic_directory,
+            dataset_profile=str(dataset.manifest.get("profile", "full")),
         )
 
     @classmethod
@@ -240,6 +247,40 @@ class LexiconService:
                 f"Unsupported lexical schema version {metadata.get('schema_version')!r}; "
                 f"this server supports {SUPPORTED_SCHEMA_VERSION!r}"
             )
+
+    def _check_dataset_profile(self) -> None:
+        if self.dataset_profile != "english":
+            return
+        bounds = [
+            self._connection.execute(
+                f"SELECT language FROM lexical_terms ORDER BY language {direction} LIMIT 1"
+            ).fetchone()
+            for direction in ("ASC", "DESC")
+        ]
+        if any(row is not None and row["language"] != "en" for row in bounds):
+            self._connection.close()
+            raise RuntimeError(
+                "English dataset profile contains a non-English lexical term"
+            )
+
+    def _supports_languages(self, *languages: str | None) -> bool:
+        return self.dataset_profile != "english" or all(
+            language is None or language == "en" for language in languages
+        )
+
+    def _unsupported_language_response(
+        self,
+        response_type: str,
+        query: dict[str, Any],
+        *,
+        candidate_count: bool = False,
+    ) -> dict[str, Any]:
+        response = self._response(response_type, query, [])
+        response["available"] = False
+        response["unavailable_reason"] = "english_profile_supports_only_en"
+        if candidate_count:
+            response["candidate_count"] = 0
+        return response
 
     def close(self) -> None:
         self._semantic.close()
@@ -480,6 +521,18 @@ class LexiconService:
             pronunciations_limit, field="pronunciations_limit"
         )
         translations_limit = _validate_fixed_budget(translations_limit, field="translations_limit")
+        query = {
+            "word": original,
+            "normalized_word": key,
+            "language": language,
+            "part_of_speech": part_of_speech,
+            "limit": limit,
+            "examples_limit": examples_limit,
+            "pronunciations_limit": pronunciations_limit,
+            "translations_limit": translations_limit,
+        }
+        if not self._supports_languages(language):
+            return self._unsupported_language_response("dictionary_lookup", query)
         rows = self._lookup_sense_rows(
             key,
             language,
@@ -570,16 +623,7 @@ class LexiconService:
             )
         return self._response(
             "dictionary_lookup",
-            {
-                "word": original,
-                "normalized_word": key,
-                "language": language,
-                "part_of_speech": part_of_speech,
-                "limit": limit,
-                "examples_limit": examples_limit,
-                "pronunciations_limit": pronunciations_limit,
-                "translations_limit": translations_limit,
-            },
+            query,
             results,
         )
 
@@ -601,6 +645,20 @@ class LexiconService:
         limit = validate_limit(limit)
         max_senses = _validate_bounded_integer(max_senses, field="max_senses", minimum=1)
         unsensed_limit = _validate_allocation(unsensed_limit, field="unsensed_limit", limit=limit)
+        query = {
+            "word": original,
+            "normalized_word": key,
+            "language": language,
+            "sense_id": sense_id,
+            "part_of_speech": part_of_speech,
+            "limit": limit,
+            "max_senses": max_senses,
+            "unsensed_limit": unsensed_limit,
+        }
+        if not self._supports_languages(language):
+            return self._unsupported_language_response(
+                "dictionary_synonyms", query, candidate_count=True
+            )
         rows = self._sense_rows(key, language, part_of_speech, sense_id, max_senses)
 
         group_specs: list[dict[str, Any]] = []
@@ -708,16 +766,7 @@ class LexiconService:
             )
         response = self._response(
             "dictionary_synonyms",
-            {
-                "word": original,
-                "normalized_word": key,
-                "language": language,
-                "sense_id": sense_id,
-                "part_of_speech": part_of_speech,
-                "limit": limit,
-                "max_senses": max_senses,
-                "unsensed_limit": unsensed_limit,
-            },
+            query,
             groups,
         )
         response["candidate_count"] = sum(len(group["synonyms"]) for group in groups)
@@ -1559,6 +1608,20 @@ class LexiconService:
         part_of_speech = normalize_optional_text(part_of_speech, field="part_of_speech")
         limit = validate_limit(limit)
         max_senses = _validate_bounded_integer(max_senses, field="max_senses", minimum=1)
+        query = {
+            "word": original,
+            "normalized_word": key,
+            "source_language": source_language,
+            "target_language": target_language,
+            "sense_id": sense_id,
+            "part_of_speech": part_of_speech,
+            "limit": limit,
+            "max_senses": max_senses,
+        }
+        if not self._supports_languages(source_language, target_language):
+            return self._unsupported_language_response(
+                "dictionary_translate", query, candidate_count=True
+            )
         rows = self._sense_rows(key, source_language, part_of_speech, sense_id, max_senses)
         group_specs: list[tuple[sqlite3.Row, list[dict[str, Any]]]] = []
         for row in rows:
@@ -1610,16 +1673,7 @@ class LexiconService:
             )
         response = self._response(
             "dictionary_translate",
-            {
-                "word": original,
-                "normalized_word": key,
-                "source_language": source_language,
-                "target_language": target_language,
-                "sense_id": sense_id,
-                "part_of_speech": part_of_speech,
-                "limit": limit,
-                "max_senses": max_senses,
-            },
+            query,
             groups,
         )
         response["candidate_count"] = sum(len(group["translations"]) for group in groups)
@@ -1652,6 +1706,19 @@ class LexiconService:
         transitive_limit = _validate_allocation(
             transitive_limit, field="transitive_limit", limit=limit
         )
+        query = {
+            "word": original,
+            "normalized_word": key,
+            "language": language,
+            "relation": relation,
+            "target_language": target_language,
+            "sense_id": sense_id,
+            "limit": limit,
+            "max_depth": max_depth,
+            "transitive_limit": transitive_limit,
+        }
+        if not self._supports_languages(language, target_language):
+            return self._unsupported_language_response("dictionary_relations", query)
 
         direct_frontier = self._relation_rows(
             key,
@@ -1752,17 +1819,7 @@ class LexiconService:
             )
         return self._response(
             "dictionary_relations",
-            {
-                "word": original,
-                "normalized_word": key,
-                "language": language,
-                "relation": relation,
-                "target_language": target_language,
-                "sense_id": sense_id,
-                "limit": limit,
-                "max_depth": max_depth,
-                "transitive_limit": transitive_limit,
-            },
+            query,
             results,
         )
 
@@ -1832,19 +1889,31 @@ class LexiconService:
             min_similarity = float(min_similarity)
             if not math.isfinite(min_similarity) or not -1.0 <= min_similarity <= 1.0:
                 raise ValueError("min_similarity must be between -1 and 1")
-        results = self._semantic.search(
-            key, source_language, target_language, limit, min_similarity
+        query = {
+            "word": original,
+            "normalized_word": key,
+            "source_language": source_language,
+            "target_language": target_language,
+            "limit": limit,
+            "min_similarity": min_similarity,
+        }
+        if not self._supports_languages(source_language, target_language):
+            return self._unsupported_language_response(
+                "dictionary_semantic_neighbors", query
+            )
+        effective_target_language = (
+            "en"
+            if self.dataset_profile == "english" and target_language is None
+            else target_language
         )
+        results = self._semantic.search(
+            key, source_language, effective_target_language, limit, min_similarity
+        )
+        if self.dataset_profile == "english":
+            results = [item for item in results if item.get("language") == "en"]
         response = self._response(
             "dictionary_semantic_neighbors",
-            {
-                "word": original,
-                "normalized_word": key,
-                "source_language": source_language,
-                "target_language": target_language,
-                "limit": limit,
-                "min_similarity": min_similarity,
-            },
+            query,
             results,
         )
         response["available"] = self._semantic.available

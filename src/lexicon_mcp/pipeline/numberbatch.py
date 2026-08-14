@@ -104,9 +104,7 @@ def _validate_post_global_partial(
     mapping_path = partial / "mapping.sqlite3"
     if not mapping_path.is_file():
         raise FileNotFoundError(f"semantic mapping does not exist: {mapping_path}")
-    connection = sqlite3.connect(
-        f"file:{mapping_path.as_posix()}?mode=ro", uri=True
-    )
+    connection = sqlite3.connect(f"file:{mapping_path.as_posix()}?mode=ro", uri=True)
     try:
         quick = connection.execute("PRAGMA quick_check").fetchall()
         if len(quick) != 1 or str(quick[0][0]) != "ok":
@@ -187,9 +185,7 @@ def _validate_post_global_partial(
         raise RuntimeError(
             "semantic partial vector byte count does not match its exact matrix shape"
         )
-    verify_saved_index(
-        partial / "indexes" / "global.usearch", accepted, dimensions
-    )
+    verify_saved_index(partial / "indexes" / "global.usearch", accepted, dimensions)
     return accepted, malformed, duplicates
 
 
@@ -321,6 +317,8 @@ def _finish_numberbatch_partial(
     malformed: int,
     duplicates: int,
     batch_size: int,
+    allowed_languages: frozenset[str] | None = None,
+    filtered: int = 0,
 ) -> dict[str, object]:
     mapping_path = partial / "mapping.sqlite3"
     connection = sqlite3.connect(mapping_path)
@@ -354,74 +352,87 @@ def _finish_numberbatch_partial(
         if unknown:
             raise RuntimeError(f"semantic partial contains unknown language rows: {unknown!r}")
 
+        # The English profile's global index already contains every semantic
+        # term, so record it as the en language index instead of duplicating it.
+        single_global_language = allowed_languages == frozenset({"en"})
         language_dir = partial / "indexes" / "languages"
-        language_dir.mkdir(parents=True, exist_ok=True)
-        for language, term_count in language_counts:
-            filename = f"{language.replace('-', '_')}.usearch"
-            relative = f"indexes/languages/{filename}"
-            destination = language_dir / filename
-            stale_temporary = destination.with_name(destination.name + ".partial")
-            destination_valid = _language_index_artifact_is_valid(
+        if single_global_language:
+            if len(language_counts) != 1 or language_counts[0][0] != "en":
+                raise RuntimeError("English semantic profile contains non-English terms")
+            if language_dir.exists() and any(language_dir.iterdir()):
+                raise RuntimeError("English semantic profile has unexpected language shards")
+            _record_language_shard(
                 connection,
-                destination,
-                language=language,
-                expected_count=term_count,
-                dimensions=dimensions,
+                language="en",
+                relative="indexes/global.usearch",
+                term_count=accepted,
             )
-            temporary_valid = _language_index_artifact_is_valid(
-                connection,
-                stale_temporary,
-                language=language,
-                expected_count=term_count,
-                dimensions=dimensions,
-            )
-            if destination_valid:
-                stale_temporary.unlink(missing_ok=True)
-                if recorded_rows.get(language) != (relative, term_count):
+        else:
+            language_dir.mkdir(parents=True, exist_ok=True)
+            for language, term_count in language_counts:
+                filename = f"{language.replace('-', '_')}.usearch"
+                relative = f"indexes/languages/{filename}"
+                destination = language_dir / filename
+                stale_temporary = destination.with_name(destination.name + ".partial")
+                destination_valid = _language_index_artifact_is_valid(
+                    connection,
+                    destination,
+                    language=language,
+                    expected_count=term_count,
+                    dimensions=dimensions,
+                )
+                temporary_valid = _language_index_artifact_is_valid(
+                    connection,
+                    stale_temporary,
+                    language=language,
+                    expected_count=term_count,
+                    dimensions=dimensions,
+                )
+                if destination_valid:
+                    stale_temporary.unlink(missing_ok=True)
+                    if recorded_rows.get(language) != (relative, term_count):
+                        _record_language_shard(
+                            connection,
+                            language=language,
+                            relative=relative,
+                            term_count=term_count,
+                        )
+                    continue
+                if temporary_valid:
+                    os.replace(stale_temporary, destination)
                     _record_language_shard(
                         connection,
                         language=language,
                         relative=relative,
                         term_count=term_count,
                     )
-                continue
-            if temporary_valid:
-                os.replace(stale_temporary, destination)
+                    continue
+                _build_language_index(
+                    connection,
+                    vectors,
+                    destination,
+                    language=language,
+                    term_count=term_count,
+                    dimensions=dimensions,
+                    batch_size=batch_size,
+                )
                 _record_language_shard(
                     connection,
                     language=language,
                     relative=relative,
                     term_count=term_count,
                 )
-                continue
-            _build_language_index(
-                connection,
-                vectors,
-                destination,
-                language=language,
-                term_count=term_count,
-                dimensions=dimensions,
-                batch_size=batch_size,
-            )
-            _record_language_shard(
-                connection,
-                language=language,
-                relative=relative,
-                term_count=term_count,
-            )
 
-        expected_files = {
-            f"{language.replace('-', '_')}.usearch" for language in expected_languages
-        }
-        actual_files = {
-            path.name for path in language_dir.iterdir() if path.is_file()
-        }
-        if actual_files != expected_files:
-            raise RuntimeError(
-                "semantic language artifact set mismatch: "
-                f"missing={sorted(expected_files - actual_files)!r}, "
-                f"extra={sorted(actual_files - expected_files)!r}"
-            )
+            expected_files = {
+                f"{language.replace('-', '_')}.usearch" for language in expected_languages
+            }
+            actual_files = {path.name for path in language_dir.iterdir() if path.is_file()}
+            if actual_files != expected_files:
+                raise RuntimeError(
+                    "semantic language artifact set mismatch: "
+                    f"missing={sorted(expected_files - actual_files)!r}, "
+                    f"extra={sorted(actual_files - expected_files)!r}"
+                )
         del vectors
         vectors = None
 
@@ -432,23 +443,31 @@ def _finish_numberbatch_partial(
         if provenance_row is None:
             raise RuntimeError("semantic source provenance row is missing")
         provenance_id = int(provenance_row[0])
+        metadata_rows = [
+            ("term_count", str(accepted)),
+            ("source_expected_rows", str(expected_rows)),
+            ("source_malformed", str(malformed)),
+            ("source_duplicates", str(duplicates)),
+            ("language_count", str(len(language_counts))),
+            ("language_index_dir", "indexes/languages"),
+            ("connectivity", "16"),
+            ("expansion_add", "256"),
+            ("expansion_search", "512"),
+            ("source", SOURCE),
+            ("source_license", SOURCE_LICENSE),
+            ("source_url", SOURCE_URL),
+            ("source_provenance_id", str(provenance_id)),
+        ]
+        if single_global_language:
+            metadata_rows.extend(
+                (
+                    ("source_filtered", str(filtered)),
+                    ("build_profile", "english"),
+                    ("language_index_dir", ""),
+                )
+            )
         connection.executemany(
-            "INSERT OR REPLACE INTO metadata(key,value) VALUES (?,?)",
-            (
-                ("term_count", str(accepted)),
-                ("source_expected_rows", str(expected_rows)),
-                ("source_malformed", str(malformed)),
-                ("source_duplicates", str(duplicates)),
-                ("language_count", str(len(language_counts))),
-                ("language_index_dir", "indexes/languages"),
-                ("connectivity", "16"),
-                ("expansion_add", "256"),
-                ("expansion_search", "512"),
-                ("source", SOURCE),
-                ("source_license", SOURCE_LICENSE),
-                ("source_url", SOURCE_URL),
-                ("source_provenance_id", str(provenance_id)),
-            ),
+            "INSERT OR REPLACE INTO metadata(key,value) VALUES (?,?)", metadata_rows
         )
         create_semantic_query_indexes(connection)
         foreign_key_failure = connection.execute("PRAGMA foreign_key_check").fetchone()
@@ -468,7 +487,7 @@ def _finish_numberbatch_partial(
     if semantic_dir.exists():
         raise FileExistsError(f"refusing to replace existing semantic directory: {semantic_dir}")
     os.replace(partial, semantic_dir)
-    return {
+    counts: dict[str, object] = {
         "expected_rows": expected_rows,
         "terms": accepted,
         "dimensions": dimensions,
@@ -476,6 +495,9 @@ def _finish_numberbatch_partial(
         "malformed": malformed,
         "duplicates": duplicates,
     }
+    if allowed_languages is not None:
+        counts["filtered"] = filtered
+    return counts
 
 
 def resume_numberbatch_partial(
@@ -516,6 +538,7 @@ def build_numberbatch(
     dataset_version: str,
     *,
     batch_size: int = 8192,
+    allowed_languages: frozenset[str] | None = None,
 ) -> dict[str, object]:
     """Build float16 seed storage and global/per-language i8 cosine indexes.
 
@@ -536,7 +559,9 @@ def build_numberbatch(
     vector_dir = partial / "vectors"
     index_dir = partial / "indexes"
     language_dir = index_dir / "languages"
-    language_dir.mkdir(parents=True)
+    index_dir.mkdir(parents=True)
+    if allowed_languages != frozenset({"en"}):
+        language_dir.mkdir(parents=True)
     vector_dir.mkdir(parents=True)
 
     lines = iter_text_lines(source_path)
@@ -554,7 +579,7 @@ def build_numberbatch(
     mapping_path = partial / "mapping.sqlite3"
     connection = sqlite3.connect(mapping_path)
     global_index: Index | None = None
-    accepted = malformed = duplicates = 0
+    accepted = malformed = duplicates = filtered = 0
     try:
         configure_build_db(connection)
         create_semantic_schema(connection, dataset_version, dimensions)
@@ -576,10 +601,11 @@ def build_numberbatch(
                     malformed += 1
                     continue
                 language, term = parsed
+                if allowed_languages is not None and language not in allowed_languages:
+                    filtered += 1
+                    continue
                 try:
-                    vector: np.ndarray = np.fromstring(
-                        raw_vector, dtype=np.float32, sep=" "
-                    )
+                    vector: np.ndarray = np.fromstring(raw_vector, dtype=np.float32, sep=" ")
                 except ValueError:
                     malformed += 1
                     continue
@@ -619,7 +645,7 @@ def build_numberbatch(
 
         if accepted == 0:
             raise ValueError("Numberbatch import produced no usable vectors")
-        if accepted + malformed + duplicates != expected_rows:
+        if accepted + malformed + duplicates + filtered != expected_rows:
             raise RuntimeError(
                 "Numberbatch header row count does not match imported, malformed, "
                 "and duplicate rows"
@@ -633,6 +659,7 @@ def build_numberbatch(
                 ("source_expected_rows", str(expected_rows)),
                 ("source_malformed", str(malformed)),
                 ("source_duplicates", str(duplicates)),
+                ("source_filtered", str(filtered)),
             ),
         )
         connection.commit()
@@ -661,4 +688,6 @@ def build_numberbatch(
         malformed=malformed,
         duplicates=duplicates,
         batch_size=batch_size,
+        allowed_languages=allowed_languages,
+        filtered=filtered,
     )
