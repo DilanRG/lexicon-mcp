@@ -20,27 +20,33 @@ def _dataset_or_skip() -> Any:
         pytest.skip(str(exc))
 
 
-def _assert_conceptnet_relation(
+def _assert_direct_relation(
     response: dict[str, Any],
     *,
     source: str,
     relation: str,
     target: str,
     direction: str,
+    provenance_source: str,
+    sense_scope: str,
 ) -> None:
     matches = [
         item
         for item in response["results"]
         if str(item["target_term"]).casefold() == target.casefold()
-        and item["provenance"]["source"] == "ConceptNet 5.7"
-        and item["sense_scope"] == "unsensed"
+        and item["provenance"]["source"] == provenance_source
+        and item["sense_scope"] == sense_scope
     ]
     assert len(matches) == 1, (source, relation, target, response)
     item = matches[0]
     assert str(item["source_term"]).casefold() == source.casefold()
     assert item["source_language"] == item["target_language"] == "en"
-    assert item["source_sense_id"] is None
-    assert item["target_sense_id"] is None
+    if sense_scope == "unsensed":
+        assert item["source_sense_id"] is None
+        assert item["target_sense_id"] is None
+    else:
+        assert item["source_sense_id"]
+        assert item["target_sense_id"]
     assert item["relation"] == relation
     assert item["direction"] == direction
     assert item["relation_scope"] == "direct"
@@ -189,21 +195,23 @@ def test_required_full_corpus_anchors_offline() -> None:
             assert any(item["gloss"] for item in lookup["results"])
 
         direct_relations = (
-            ("hot", "antonym", "cold", "symmetric"),
-            ("dog", "capable_of", "bark", "outbound"),
-            ("poodle", "hypernym", "dog", "outbound"),
-            ("car", "meronym", "wheel", "inbound"),
-            ("knife", "used_for", "cutting", "outbound"),
-            ("book", "at_location", "library", "outbound"),
+            ("hot", "antonym", "cold", "outbound", "Open English WordNet", "sense"),
+            ("dog", "capable_of", "bark", "outbound", "ConceptNet 5.7", "unsensed"),
+            ("poodle", "hypernym", "dog", "outbound", "ConceptNet 5.7", "unsensed"),
+            ("car", "meronym", "wheel", "inbound", "ConceptNet 5.7", "unsensed"),
+            ("knife", "used_for", "cutting", "outbound", "ConceptNet 5.7", "unsensed"),
+            ("book", "at_location", "library", "outbound", "ConceptNet 5.7", "unsensed"),
         )
-        for word, relation, target, direction in direct_relations:
+        for word, relation, target, direction, provenance_source, scope in direct_relations:
             response = service.dictionary_relations(word, relation, "en")
-            _assert_conceptnet_relation(
+            _assert_direct_relation(
                 response,
                 source=word,
                 relation=relation,
                 target=target,
                 direction=direction,
+                provenance_source=provenance_source,
+                sense_scope=scope,
             )
 
         dog_hypernyms = service.dictionary_relations(
@@ -270,20 +278,22 @@ def test_required_full_corpus_anchors_offline() -> None:
         # These reverse queries prove that one stored assertion is exposed
         # from its target with the same logical relation and inverted direction.
         inverse_relations = (
-            ("cold", "antonym", "hot", "symmetric"),
-            ("bark", "capable_of", "dog", "inbound"),
-            ("wheel", "holonym", "car", "outbound"),
-            ("cutting", "used_for", "knife", "inbound"),
-            ("library", "at_location", "book", "inbound"),
+            ("cold", "antonym", "hot", "outbound", "Open English WordNet", "sense"),
+            ("bark", "capable_of", "dog", "inbound", "ConceptNet 5.7", "unsensed"),
+            ("wheel", "holonym", "car", "outbound", "ConceptNet 5.7", "unsensed"),
+            ("cutting", "used_for", "knife", "inbound", "ConceptNet 5.7", "unsensed"),
+            ("library", "at_location", "book", "inbound", "ConceptNet 5.7", "unsensed"),
         )
-        for word, relation, target, direction in inverse_relations:
+        for word, relation, target, direction, provenance_source, scope in inverse_relations:
             response = service.dictionary_relations(word, relation, "en")
-            _assert_conceptnet_relation(
+            _assert_direct_relation(
                 response,
                 source=word,
                 relation=relation,
                 target=target,
                 direction=direction,
+                provenance_source=provenance_source,
+                sense_scope=scope,
             )
 
         dog_synonyms = service.dictionary_synonyms("dog", "en")
