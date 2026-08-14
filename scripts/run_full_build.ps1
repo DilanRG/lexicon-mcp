@@ -25,6 +25,18 @@ $pythonPath = Join-Path $projectPath '.venv\Scripts\python.exe'
 if (-not [System.IO.File]::Exists($pythonPath)) {
     throw "Frozen project environment is missing: $pythonPath"
 }
+$venvConfiguration = Join-Path $projectPath '.venv\pyvenv.cfg'
+$homeLine = Get-Content -LiteralPath $venvConfiguration | Where-Object {
+    $_ -match '^home\s*=\s*(.+)$'
+} | Select-Object -First 1
+if (-not $homeLine) {
+    throw "Frozen environment has no base Python home: $venvConfiguration"
+}
+$basePythonHome = ([regex]::Match($homeLine, '^home\s*=\s*(.+)$')).Groups[1].Value.Trim()
+$basePythonPath = [System.IO.Path]::GetFullPath((Join-Path $basePythonHome 'python.exe'))
+if (-not [System.IO.File]::Exists($basePythonPath)) {
+    throw "Frozen environment base Python is missing: $basePythonPath"
+}
 $arguments = @(
     (Join-Path $projectPath 'scripts\build_full_corpus.py'),
     '--oewn', (Join-Path $sourcePath 'oewn-2025.xml.gz'),
@@ -73,31 +85,78 @@ $process.StartInfo = $startInfo
 if (-not $process.Start()) {
     throw 'Could not start the full-corpus build process.'
 }
+$workerProcessId = $null
+
+function Get-BuildProcesses {
+    $tracked = [System.Collections.Generic.List[System.Diagnostics.Process]]::new()
+    try {
+        $tracked.Add([System.Diagnostics.Process]::GetProcessById($process.Id))
+    } catch [System.ArgumentException] {
+        # The launcher can exit immediately after its worker; final samples
+        # remain valid even when neither process is still available.
+    }
+    if ($null -eq $script:workerProcessId) {
+        $candidate = Get-Process -Name python -ErrorAction SilentlyContinue | Where-Object {
+            try {
+                [System.IO.Path]::GetFullPath($_.Path) -eq $basePythonPath -and
+                    $_.StartTime -ge $startedAt.LocalDateTime.AddSeconds(-2) -and
+                    $_.Id -ne $process.Id
+            } catch {
+                $false
+            }
+        } | Sort-Object StartTime, Id | Select-Object -First 1
+        if ($candidate) {
+            $script:workerProcessId = $candidate.Id
+        }
+    }
+    if ($null -ne $script:workerProcessId) {
+        try {
+            $tracked.Add(
+                [System.Diagnostics.Process]::GetProcessById($script:workerProcessId)
+            )
+        } catch [System.ArgumentException] {
+            # The worker has exited between samples.
+        }
+    }
+    return $tracked
+}
+
 $stdoutTask = $process.StandardOutput.ReadToEndAsync()
 $stderrTask = $process.StandardError.ReadToEndAsync()
 
 while (-not $process.WaitForExit(15000)) {
-    $process.Refresh()
+    $trackedProcesses = @(Get-BuildProcesses)
+    foreach ($trackedProcess in $trackedProcesses) {
+        $trackedProcess.Refresh()
+    }
+    $privateBytes = ($trackedProcesses | Measure-Object PrivateMemorySize64 -Sum).Sum
+    $workingSetBytes = ($trackedProcesses | Measure-Object WorkingSet64 -Sum).Sum
     $drive = [System.IO.DriveInfo]::new($driveRoot)
     $free = $drive.AvailableFreeSpace
     $minimumFree = [Math]::Min($minimumFree, $free)
-    $peakPrivateBytes = [Math]::Max($peakPrivateBytes, $process.PrivateMemorySize64)
-    $peakWorkingSetBytes = [Math]::Max($peakWorkingSetBytes, $process.WorkingSet64)
+    $peakPrivateBytes = [Math]::Max($peakPrivateBytes, $privateBytes)
+    $peakWorkingSetBytes = [Math]::Max($peakWorkingSetBytes, $workingSetBytes)
     [pscustomobject]@{
         timestamp = [DateTimeOffset]::Now.ToString('o')
         available_free_bytes = $free
         peak_volume_bytes_consumed = $baselineFree - $minimumFree
-        private_bytes = $process.PrivateMemorySize64
-        working_set_bytes = $process.WorkingSet64
-        build_pid = $process.Id
+        private_bytes = $privateBytes
+        working_set_bytes = $workingSetBytes
+        launcher_pid = $process.Id
+        worker_pid = $workerProcessId
     } | ConvertTo-Json -Compress | Add-Content -LiteralPath $telemetryPath -Encoding utf8
 }
 $process.WaitForExit()
 try {
-    $process.Refresh()
-    $peakPrivateBytes = [Math]::Max($peakPrivateBytes, $process.PrivateMemorySize64)
-    $peakWorkingSetBytes = [Math]::Max($peakWorkingSetBytes, $process.WorkingSet64)
-} catch [System.InvalidOperationException] {
+    $trackedProcesses = @(Get-BuildProcesses)
+    foreach ($trackedProcess in $trackedProcesses) {
+        $trackedProcess.Refresh()
+    }
+    $privateBytes = ($trackedProcesses | Measure-Object PrivateMemorySize64 -Sum).Sum
+    $workingSetBytes = ($trackedProcesses | Measure-Object WorkingSet64 -Sum).Sum
+    $peakPrivateBytes = [Math]::Max($peakPrivateBytes, $privateBytes)
+    $peakWorkingSetBytes = [Math]::Max($peakWorkingSetBytes, $workingSetBytes)
+} catch [System.InvalidOperationException], [System.ArgumentException] {
     # The final in-loop sample remains authoritative after a fast process exit.
 }
 [System.IO.File]::WriteAllText($stdoutPath, $stdoutTask.Result)
