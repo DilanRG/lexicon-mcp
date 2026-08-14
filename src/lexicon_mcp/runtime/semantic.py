@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import atexit
+import json
 import math
-import multiprocessing
 import os
+import queue
 import sqlite3
+import subprocess
+import sys
 import threading
-from collections import OrderedDict
-from concurrent.futures import Future, ProcessPoolExecutor
-from dataclasses import dataclass
+from collections import OrderedDict, deque
+from contextlib import suppress
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, BinaryIO, Protocol
 
 from ..usearch_compat import open_index_view
 from .ann_search import ann_candidate_count
@@ -50,6 +53,7 @@ _INDEX_CACHE: OrderedDict[str, Any] = OrderedDict()
 _INDEX_CACHE_SIZE = 4
 _SUPPORTED_SCHEMA_VERSION = "2"
 _WORKER_IDLE_SECONDS = 180.0
+_WORKER_QUERY_SECONDS = 30.0
 
 
 def _initialize_semantic_worker() -> None:
@@ -304,14 +308,20 @@ class SemanticWorker:
         dataset_version: str,
         *,
         _idle_timeout_seconds: float = _WORKER_IDLE_SECONDS,
+        _query_timeout_seconds: float = _WORKER_QUERY_SECONDS,
     ) -> None:
         if not math.isfinite(_idle_timeout_seconds) or _idle_timeout_seconds <= 0:
             raise ValueError("semantic worker idle timeout must be finite and positive")
+        if not math.isfinite(_query_timeout_seconds) or _query_timeout_seconds <= 0:
+            raise ValueError("semantic worker query timeout must be finite and positive")
         self.directory = directory.resolve()
         self.dataset_version = dataset_version
         self._idle_timeout_seconds = _idle_timeout_seconds
-        self._executor: ProcessPoolExecutor | None = None
-        self._in_flight: set[Future[list[dict[str, Any]]]] = set()
+        self._query_timeout_seconds = _query_timeout_seconds
+        self._process: subprocess.Popen[bytes] | None = None
+        self._responses: queue.Queue[dict[str, Any] | None] = queue.Queue()
+        self._stderr: deque[str] = deque(maxlen=100)
+        self._request_lock = threading.Lock()
         self._idle_timer: threading.Timer | None = None
         self._closed = False
         self._lock = threading.Lock()
@@ -325,58 +335,96 @@ class SemanticWorker:
             and (self.directory / "vectors" / "global.f16").is_file()
         )
 
-    def _pool_locked(self) -> ProcessPoolExecutor:
+    def _worker_locked(self) -> subprocess.Popen[bytes]:
         if self._closed:
             raise RuntimeError("semantic worker is closed")
-        if self._executor is None:
-            context = multiprocessing.get_context("spawn")
-            self._executor = ProcessPoolExecutor(
-                max_workers=1,
-                mp_context=context,
-                initializer=_initialize_semantic_worker,
+        if self._process is None or self._process.poll() is not None:
+            responses: queue.Queue[dict[str, Any] | None] = queue.Queue()
+            stderr: deque[str] = deque(maxlen=100)
+            self._responses = responses
+            self._stderr = stderr
+            environment = os.environ.copy()
+            environment["PYTHONPATH"] = os.pathsep.join(path for path in sys.path if path)
+            environment["PYTHONIOENCODING"] = "utf-8"
+            self._process = subprocess.Popen(
+                [
+                    getattr(sys, "_base_executable", sys.executable),
+                    "-m",
+                    "lexicon_mcp.runtime.semantic_worker",
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=environment,
             )
-        return self._executor
+            assert self._process.stdout is not None
+            assert self._process.stderr is not None
+            threading.Thread(
+                target=self._read_responses, args=(self._process.stdout, responses), daemon=True
+            ).start()
+            threading.Thread(
+                target=self._drain_stderr, args=(self._process.stderr, stderr), daemon=True
+            ).start()
+        return self._process
+
+    def _read_responses(
+        self, stream: BinaryIO, responses: queue.Queue[dict[str, Any] | None]
+    ) -> None:
+        for raw in stream:
+            try:
+                responses.put(json.loads(raw.decode("utf-8")))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                responses.put({"error": f"invalid semantic worker response: {raw!r}"})
+        responses.put(None)
+
+    def _drain_stderr(self, stream: BinaryIO, stderr: deque[str]) -> None:
+        for raw in stream:
+            stderr.append(raw.decode("utf-8", errors="replace").rstrip())
+
+    @staticmethod
+    def _stop_process(process: subprocess.Popen[bytes]) -> None:
+        try:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+        finally:
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None:
+                    with suppress(OSError):
+                        stream.close()
 
     def _cancel_idle_timer_locked(self) -> None:
         timer, self._idle_timer = self._idle_timer, None
         if timer is not None:
             timer.cancel()
 
-    def _schedule_idle_teardown_locked(self, executor: ProcessPoolExecutor) -> None:
+    def _schedule_idle_teardown_locked(self, process: subprocess.Popen[bytes]) -> None:
         self._cancel_idle_timer_locked()
         timer = threading.Timer(
             self._idle_timeout_seconds,
-            self._retire_idle_executor,
-            args=(executor,),
+            self._retire_idle_worker,
+            args=(process,),
         )
         timer.daemon = True
         self._idle_timer = timer
         timer.start()
 
-    def _future_done(self, future: Future[list[dict[str, Any]]]) -> None:
-        with self._lock:
-            self._in_flight.discard(future)
-            executor = self._executor
-            if self._closed or executor is None or self._in_flight:
-                return
-            self._schedule_idle_teardown_locked(executor)
-
-    def _retire_idle_executor(self, executor: ProcessPoolExecutor) -> None:
+    def _retire_idle_worker(self, process: subprocess.Popen[bytes]) -> None:
         current = threading.current_thread()
         with self._lock:
             if (
                 self._idle_timer is not current
                 or self._closed
-                or self._executor is not executor
-                or self._in_flight
+                or self._process is not process
             ):
                 return
             self._idle_timer = None
-            # Hold the worker lock until process teardown completes. A concurrent
-            # close or query then cannot lose the retiring process handle or
-            # briefly overlap it with a replacement worker.
-            executor.shutdown(wait=True, cancel_futures=True)
-            self._executor = None
+            self._stop_process(process)
+            self._process = None
 
     def search(
         self,
@@ -397,23 +445,45 @@ class SemanticWorker:
             limit,
             min_similarity,
         )
-        with self._lock:
-            self._cancel_idle_timer_locked()
-            executor = self._pool_locked()
-            future = executor.submit(_semantic_search_task, request)
-            self._in_flight.add(future)
-        future.add_done_callback(self._future_done)
-        return future.result(timeout=30)
+        with self._request_lock:
+            with self._lock:
+                self._cancel_idle_timer_locked()
+                process = self._worker_locked()
+                if process.stdin is None:
+                    raise RuntimeError("semantic worker has no input stream")
+                process.stdin.write(
+                    json.dumps(asdict(request), ensure_ascii=True, separators=(",", ":"))
+                    .encode("utf-8")
+                    + b"\n"
+                )
+                process.stdin.flush()
+            try:
+                response = self._responses.get(timeout=self._query_timeout_seconds)
+            except queue.Empty as exc:
+                with self._lock:
+                    if self._process is process:
+                        self._stop_process(process)
+                        self._process = None
+                raise TimeoutError("semantic worker timed out") from exc
+            with self._lock:
+                if not self._closed and self._process is process:
+                    self._schedule_idle_teardown_locked(process)
+            if response is None:
+                raise RuntimeError("semantic worker exited: " + "\n".join(self._stderr))
+            if error := response.get("error"):
+                raise RuntimeError(f"semantic worker failed: {error}")
+            results = response.get("results")
+            if not isinstance(results, list):
+                raise RuntimeError("semantic worker returned malformed results")
+            return results
 
     def close(self) -> None:
         with self._lock:
             self._closed = True
             self._cancel_idle_timer_locked()
-            executor, self._executor = self._executor, None
-        if executor is not None:
-            executor.shutdown(wait=True, cancel_futures=True)
-        with self._lock:
-            self._in_flight.clear()
+            process, self._process = self._process, None
+        if process is not None:
+            self._stop_process(process)
 
 
 class UnavailableSemanticSearch:
@@ -433,3 +503,22 @@ class UnavailableSemanticSearch:
 
     def close(self) -> None:
         return None
+
+
+def _worker_main() -> None:
+    """Run the internal JSONL semantic worker without multiprocessing IPC."""
+
+    _initialize_semantic_worker()
+    for raw in sys.stdin.buffer:
+        try:
+            value = json.loads(raw.decode("utf-8"))
+            if not isinstance(value, dict):
+                raise ValueError("request must be an object")
+            request = _SemanticRequest(**value)
+            response: dict[str, Any] = {"results": _semantic_search_task(request)}
+        except Exception as exc:
+            response = {"error": f"{type(exc).__name__}: {exc}"}
+        sys.stdout.buffer.write(
+            json.dumps(response, ensure_ascii=True, separators=(",", ":")).encode("utf-8") + b"\n"
+        )
+        sys.stdout.buffer.flush()

@@ -1,20 +1,29 @@
 from __future__ import annotations
 
+import io
+import json
 import os
+import queue
 import socket
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import pytest
 from usearch.index import Index
 
 import lexicon_mcp.runtime.semantic as semantic_module
-from lexicon_mcp.pipeline.schema import create_semantic_schema
+from lexicon_mcp.pipeline.schema import (
+    create_lexical_query_indexes,
+    create_lexical_schema,
+    create_semantic_schema,
+)
 from lexicon_mcp.runtime.offline import NetworkDisabledError
 from lexicon_mcp.runtime.semantic import SemanticWorker, _semantic_search_task, _SemanticRequest
 
@@ -243,14 +252,14 @@ def test_semantic_worker_is_lazy_single_process_and_cleanly_closes(
 ) -> None:
     worker = SemanticWorker(semantic_directory, "data-test-v1")
     assert worker.available is True
-    assert worker._executor is None
+    assert worker._process is None
     assert worker._idle_timeout_seconds == 180.0
     results = worker.search("cat", "en", "de", 5, None)
     assert results[0]["term"] == "Katze"
-    executor = worker._executor
-    assert executor is not None
+    process = worker._process
+    assert process is not None
     worker.close()
-    assert worker._executor is None
+    assert worker._process is None
 
 
 def test_semantic_worker_initializer_bounds_openblas_threads(
@@ -300,72 +309,201 @@ def test_semantic_worker_initializer_blocks_dns_and_socket_connections(
 
 def test_semantic_worker_idle_teardown_tracks_in_flight_and_respawns(
     semantic_directory: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    started = threading.Event()
-    release = threading.Event()
-    results: list[list[dict[str, Any]]] = []
-    instances: list[ThreadBackedExecutor] = []
-
-    class ThreadBackedExecutor:
-        def __init__(self, **kwargs: object) -> None:
-            assert kwargs["max_workers"] == 1
-            assert kwargs["initializer"] is semantic_module._initialize_semantic_worker
-            self.delegate = ThreadPoolExecutor(max_workers=1)
-            self.shutdown_calls = 0
-            instances.append(self)
-
-        def submit(self, function: Any, *args: Any) -> Future[list[dict[str, Any]]]:
-            return self.delegate.submit(function, *args)
-
-        def shutdown(self, *, wait: bool, cancel_futures: bool) -> None:
-            self.shutdown_calls += 1
-            self.delegate.shutdown(wait=wait, cancel_futures=cancel_futures)
-
-    def blocking_task(_request: _SemanticRequest) -> list[dict[str, Any]]:
-        started.set()
-        assert release.wait(timeout=5)
-        return []
-
-    monkeypatch.setattr(semantic_module, "ProcessPoolExecutor", ThreadBackedExecutor)
-    monkeypatch.setattr(semantic_module, "_semantic_search_task", blocking_task)
     worker = SemanticWorker(
         semantic_directory,
         "data-test-v1",
-        _idle_timeout_seconds=0.05,
+        _idle_timeout_seconds=0.2,
     )
+    assert worker.search("cat", "en", "de", 5, None)[0]["term"] == "Katze"
+    first = worker._process
+    assert first is not None
+    assert worker._idle_timer is not None
 
-    caller = threading.Thread(
-        target=lambda: results.append(worker.search("cat", "en", None, 5, None))
-    )
-    caller.start()
-    assert started.wait(timeout=5)
+    time.sleep(0.05)
+    assert worker.search("cat", "en", "de", 5, None)[0]["term"] == "Katze"
+    assert worker._process is first
     time.sleep(0.1)
-    assert worker._executor is not None
-    assert id(worker._executor) == id(instances[0])
-    assert len(worker._in_flight) == 1
-    assert worker._idle_timer is None
+    assert worker._process is first
 
-    release.set()
-    caller.join(timeout=5)
-    assert not caller.is_alive()
-    assert results == [[]]
     deadline = time.monotonic() + 5
-    while worker._executor is not None and time.monotonic() < deadline:
+    while worker._process is not None and time.monotonic() < deadline:
         time.sleep(0.01)
-    assert worker._executor is None
-    assert instances[0].shutdown_calls == 1
+    assert worker._process is None
+    assert first.poll() is not None
 
-    assert worker.search("cat", "en", None, 5, None) == []
-    assert worker._executor is instances[1]
-    assert len(instances) == 2
+    assert worker.search("cat", "en", "de", 5, None)[0]["term"] == "Katze"
+    second = worker._process
+    assert second is not None and second is not first
     worker.close()
-    assert worker._executor is None
+    assert worker._process is None
     assert worker._idle_timer is None
-    assert worker._in_flight == set()
-    assert instances[1].shutdown_calls == 1
+    assert second.poll() is not None
     with pytest.raises(RuntimeError, match="closed"):
         worker.search("cat", "en", None, 5, None)
+
+
+def test_semantic_worker_timeout_reaps_worker(
+    semantic_directory: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class HangingProcess:
+        def __init__(self) -> None:
+            self.stdin = io.BytesIO()
+            self.stdout = io.BytesIO()
+            self.stderr = io.BytesIO()
+            self.returncode: int | None = None
+            self.terminated = False
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def terminate(self) -> None:
+            self.terminated = True
+            self.returncode = -15
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            assert self.returncode is not None
+            return self.returncode
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    fake = HangingProcess()
+    process = cast(subprocess.Popen[bytes], fake)
+    worker = SemanticWorker(
+        semantic_directory,
+        "data-test-v1",
+        _query_timeout_seconds=0.01,
+    )
+
+    def worker_locked() -> subprocess.Popen[bytes]:
+        worker._process = process
+        return process
+
+    monkeypatch.setattr(worker, "_worker_locked", worker_locked)
+
+    with pytest.raises(TimeoutError, match="timed out"):
+        worker.search("cat", "en", "de", 5, None)
+
+    assert fake.terminated is True
+    assert worker._process is None
+    worker.close()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="reproduces nested Windows stdio IPC")
+def test_windows_stdio_semantic_worker_handles_nested_process_and_unicode(
+    tmp_path: Path,
+    semantic_directory: Path,
+) -> None:
+    database = tmp_path / "lexicon.sqlite3"
+    with sqlite3.connect(database) as connection:
+        create_lexical_schema(connection, "data-test-v1")
+        create_lexical_query_indexes(connection)
+        connection.commit()
+
+    child_code = f"""
+import anyio
+from pathlib import Path
+from lexicon_mcp.runtime.offline import install_network_guard
+from lexicon_mcp.runtime.service import LexiconService
+from lexicon_mcp.server import create_mcp
+
+service = LexiconService(
+    Path({str(database)!r}),
+    "data-test-v1",
+    semantic_directory=Path({str(semantic_directory)!r}),
+)
+mcp = create_mcp(service)
+
+async def run() -> None:
+    install_network_guard()
+    try:
+        await mcp.run_stdio_async()
+    finally:
+        service.close()
+
+anyio.run(run)
+"""
+    environment = os.environ.copy()
+    environment["PYTHONIOENCODING"] = "utf-8"
+    process = subprocess.Popen(
+        [sys.executable, "-c", child_code],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        cwd=Path.cwd(),
+        env=environment,
+    )
+    assert process.stdin is not None
+    assert process.stdout is not None
+    responses: queue.Queue[str] = queue.Queue()
+
+    def read_responses() -> None:
+        for line in process.stdout:
+            responses.put(line)
+
+    threading.Thread(target=read_responses, daemon=True).start()
+    try:
+        initialize = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "semantic-stdio-test", "version": "1"},
+            },
+        }
+        process.stdin.write(json.dumps(initialize) + "\n")
+        process.stdin.flush()
+        assert json.loads(responses.get(timeout=10))["id"] == 1
+        process.stdin.write(
+            json.dumps(
+                {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}
+            )
+            + "\n"
+        )
+
+        for request_id, word, expected_count in ((2, "cat", 1), (3, "café", 0)):
+            call = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "tools/call",
+                "params": {
+                    "name": "dictionary_semantic_neighbors",
+                    "arguments": {
+                        "word": word,
+                        "source_language": "en",
+                        "target_language": "de",
+                        "limit": 5,
+                    },
+                },
+            }
+            process.stdin.write(json.dumps(call, ensure_ascii=False) + "\n")
+            process.stdin.flush()
+            response = json.loads(responses.get(timeout=15))
+            assert response["id"] == request_id
+            assert response["result"].get("isError", False) is False
+            payload = json.loads(response["result"]["content"][0]["text"])
+            assert payload["count"] == expected_count
+    finally:
+        with suppress(OSError):
+            process.stdin.close()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+
+    assert process.returncode == 0
 
 
 def test_semantic_task_rejects_mixed_dataset_versions(semantic_directory: Path) -> None:

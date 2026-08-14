@@ -247,7 +247,7 @@ def create_mcp(service: LexiconService | None = None) -> FastMCP:
         )
 
     @server.tool()
-    def dictionary_semantic_neighbors(
+    async def dictionary_semantic_neighbors(
         word: QueryText,
         source_language: LanguageTag = "en",
         target_language: LanguageTag | None = None,
@@ -264,8 +264,12 @@ def create_mcp(service: LexiconService | None = None) -> FastMCP:
         range -1 through 1.
         """
 
-        return provider.get().dictionary_semantic_neighbors(
-            word, source_language, target_language, limit, min_similarity
+        # Keep the blocking worker protocol off FastMCP's stdio event loop so
+        # other MCP requests remain responsive while ANN search is in flight.
+        return await anyio.to_thread.run_sync(
+            lambda: provider.get().dictionary_semantic_neighbors(
+                word, source_language, target_language, limit, min_similarity
+            )
         )
 
     @server.tool()
