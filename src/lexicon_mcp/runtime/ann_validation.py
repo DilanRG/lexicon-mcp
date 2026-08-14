@@ -12,6 +12,7 @@ from typing import Any
 import numpy as np
 
 from ..usearch_compat import open_index_view
+from .ann_search import ann_candidate_count
 from .evidence import compact_evidence_json
 from .locator import ActiveDataset
 
@@ -421,7 +422,7 @@ def _ann_neighbors(
     index_size: int,
     expected_language: str | None,
 ) -> tuple[tuple[_SemanticRow, ...], bool, bool]:
-    requested = min(index_size, max(200, k * 10, k + 1))
+    requested = ann_candidate_count(k, index_size)
     first = index.search(query, requested)
     second = index.search(query, requested)
     first_ids = tuple(int(key) for key in first.keys)

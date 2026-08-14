@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from ..usearch_compat import open_index_view
+from .ann_search import ann_candidate_count
 from .offline import deny_network, install_network_guard
 
 
@@ -216,7 +217,7 @@ def _semantic_search_task_offline(request: _SemanticRequest) -> list[dict[str, A
             expansion_search,
             expected_count,
         )
-        overfetch = min(max(200, request.limit * 10, request.limit + 1), 500)
+        overfetch = ann_candidate_count(request.limit, expected_count)
         matches = index.search(query_vector, overfetch)
         keys = [int(key) for key in matches.keys]
         if not keys:
