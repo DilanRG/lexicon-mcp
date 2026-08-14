@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from collections import Counter
 from collections.abc import Sequence
@@ -453,6 +454,79 @@ def test_file_notify_decoder_handles_multiple_records() -> None:
         (1, "one.tmp"),
         (3, "two.tmp"),
     )
+
+
+class _ZeroByteCompletionKernel:
+    def __init__(self, *, wait_for_cancel: bool) -> None:
+        self.wait_for_cancel = wait_for_cancel
+        self.cancelled = threading.Event()
+
+    def CreateEventW(self, *_args: object) -> int:
+        return 101
+
+    def ResetEvent(self, *_args: object) -> int:
+        return 1
+
+    def ReadDirectoryChangesW(self, *_args: object) -> int:
+        return 1
+
+    def WaitForSingleObject(self, *_args: object) -> int:
+        if self.wait_for_cancel and not self.cancelled.wait(2):
+            return 0xFFFFFFFF
+        return 0
+
+    def GetOverlappedResult(self, *_args: object) -> int:
+        return 1
+
+    def CancelIoEx(self, *_args: object) -> int:
+        self.cancelled.set()
+        return 1
+
+    def CloseHandle(self, *_args: object) -> int:
+        return 1
+
+
+def _zero_byte_completion_monitor(
+    *,
+    wait_for_cancel: bool,
+) -> tuple[_WindowsChangeMonitor, threading.Event]:
+    monitor = object.__new__(_WindowsChangeMonitor)
+    monitor._kernel32 = _ZeroByteCompletionKernel(wait_for_cancel=wait_for_cancel)
+    monitor._handles = [7]
+    monitor._threads = []
+    monitor._events = []
+    monitor._errors = []
+    monitor._lock = threading.Lock()
+    monitor._stop = threading.Event()
+    monitor._shutdown_cancelled_handles = set()
+    ready = threading.Event()
+    return monitor, ready
+
+
+def test_windows_change_monitor_reports_active_zero_byte_completion_as_overflow(
+    tmp_path: Path,
+) -> None:
+    monitor, ready = _zero_byte_completion_monitor(wait_for_cancel=False)
+
+    monitor._watch(tmp_path, 7, ready)
+
+    assert ready.is_set()
+    assert monitor.errors() == (f"{tmp_path}: change buffer overflow",)
+
+
+def test_windows_change_monitor_accepts_cancelled_zero_byte_completion(
+    tmp_path: Path,
+) -> None:
+    monitor, ready = _zero_byte_completion_monitor(wait_for_cancel=True)
+    thread = threading.Thread(target=monitor._watch, args=(tmp_path, 7, ready))
+    monitor._threads.append(thread)
+    thread.start()
+    assert ready.wait(2)
+
+    monitor.close()
+
+    assert not thread.is_alive()
+    assert monitor.errors() == ()
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows directory notifications")

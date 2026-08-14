@@ -1836,6 +1836,7 @@ class _WindowsChangeMonitor:
         self._errors: list[str] = []
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        self._shutdown_cancelled_handles: set[int] = set()
         for root in roots:
             handle = self._kernel32.CreateFileW(
                 str(root),
@@ -1897,12 +1898,7 @@ class _WindowsChangeMonitor:
                     buffer,
                     len(buffer),
                     True,
-                    0x00000001
-                    | 0x00000002
-                    | 0x00000004
-                    | 0x00000008
-                    | 0x00000010
-                    | 0x00000040,
+                    0x00000001 | 0x00000002 | 0x00000004 | 0x00000008 | 0x00000010 | 0x00000040,
                     None,
                     ctypes.byref(overlapped),
                     None,
@@ -1946,7 +1942,11 @@ class _WindowsChangeMonitor:
                 count = int(bytes_returned.value)
                 if count == 0:
                     with self._lock:
-                        self._errors.append(f"{root}: change buffer overflow")
+                        shutdown_cancellation = (
+                            self._stop.is_set() and handle in self._shutdown_cancelled_handles
+                        )
+                        if not shutdown_cancellation:
+                            self._errors.append(f"{root}: change buffer overflow")
                     return
                 try:
                     decoded = _decode_notify_buffer(buffer.raw, count)
@@ -1981,7 +1981,12 @@ class _WindowsChangeMonitor:
         self._stop.set()
         if hasattr(self, "_kernel32"):
             for handle in getattr(self, "_handles", []):
-                self._kernel32.CancelIoEx(ctypes.c_void_p(handle), None)
+                # Hold the lock until a successful cancellation is recorded.
+                # The worker can otherwise observe the resulting successful
+                # zero-byte completion before close() marks it as intentional.
+                with self._lock:
+                    if self._kernel32.CancelIoEx(ctypes.c_void_p(handle), None):
+                        self._shutdown_cancelled_handles.add(handle)
             for thread in getattr(self, "_threads", []):
                 thread.join(timeout=5)
             for handle in getattr(self, "_handles", []):
