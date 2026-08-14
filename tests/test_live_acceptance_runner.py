@@ -119,7 +119,7 @@ def test_fixture_replay_drives_exactly_ten_stop_start_pairs(tmp_path: Path) -> N
             "dictionary_translate": 2,
             "dictionary_relations": 1,
             "dictionary_semantic_neighbors": 1,
-            "dictionary_wordplay": 1,
+            "rhymes": 1,
             "calculate": 10,
         }
     )

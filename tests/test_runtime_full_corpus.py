@@ -402,7 +402,7 @@ async def test_full_corpus_mcp_exposes_exactly_six_offline_tools() -> None:
             "dictionary_translate",
             "dictionary_relations",
             "dictionary_semantic_neighbors",
-            "dictionary_wordplay",
+            "rhymes",
         }
         assert all(tool.outputSchema is not None for tool in tools)
         _content, structured = await mcp.call_tool(

@@ -1,7 +1,7 @@
 # Lexicon MCP
 
 Lexicon MCP is a local-first multilingual dictionary, thesaurus, translation,
-lexical-relations, semantic-neighbour, and English wordplay server for the Model
+lexical-relations, semantic-neighbour, and English rhyme-search server for the Model
 Context Protocol (MCP). It serves a versioned corpus from disk and performs no
 network access or data mutation while running.
 
@@ -18,7 +18,7 @@ The server exposes exactly six tools:
 3. `dictionary_translate`
 4. `dictionary_relations`
 5. `dictionary_semantic_neighbors`
-6. `dictionary_wordplay`
+6. `rhymes`
 
 Relation results label direct edges as `relation_scope="direct"`, `distance=1`.
 Hypernym and hyponym queries can additionally return a bounded, homogeneous
@@ -49,7 +49,7 @@ broader allocation is returned to sense-scoped or direct candidates.
 
 For semantic neighbours, omitting `target_language` searches the global
 multilingual index; setting it to the source tag produces monolingual results,
-and another tag requests cross-lingual results. English `near_rhyme` wordplay is
+and another tag requests cross-lingual results. English `rhymes(mode="near")` is
 fixed to exactly one ARPAbet-token insertion, deletion, or substitution in v1;
 there is no automatic or caller-configurable edit distance.
 
@@ -99,13 +99,13 @@ The full build combines independently attributed snapshots of:
   senses, examples, pronunciation, etymology, and translations;
 - ConceptNet 5.7 for multilingual lexical and commonsense relations;
 - ConceptNet Numberbatch 19.08 for multilingual semantic neighbours; and
-- CMUdict for English pronunciation and wordplay.
+- CMUdict for English pronunciation and rhyme search.
 
 Every public result identifies its source, dataset version, language, sense scope,
 and license. ConceptNet-only results are explicitly unsensed.
 
 Lexical data uses a compact, interned SQLite schema with deferred read-path indexes.
-English wordplay and prefix completion use a contentless FTS5 index; exact senses,
+English rhyme search and internal prefix completion use a contentless FTS5 index; exact senses,
 translations, relation direction, and provenance remain in ordinary relational tables.
 Numberbatch vectors are searched through memory-mapped cosine/i8 USearch HNSW indexes
 and exact-reranked from float16 vectors without loading or scanning the full matrix.
@@ -205,7 +205,7 @@ page. The lookup itself uses a total `translations_limit=3`, proves the aggregat
 budget is respected, verifies every returned translation remains attached to its
 source sense, and requires per-sense `truncated_fields` evidence. Synonyms, directed
 relations, language-filtered finite-cosine semantic neighbours, and query-excluding
-wordplay are checked against pinned corpus anchors. The full cross-tool flow,
+rhymes are checked against pinned corpus anchors. The full cross-tool flow,
 request/result hashes, both selected sense IDs, and per-tool assertions are written
 to both JSONL events and the final report.
 

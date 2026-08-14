@@ -68,7 +68,7 @@ async def test_mcp_exposes_exactly_six_structured_tools_and_no_admin(
         "dictionary_translate",
         "dictionary_relations",
         "dictionary_semantic_neighbors",
-        "dictionary_wordplay",
+        "rhymes",
     }
     assert all(tool.outputSchema is not None for tool in tools)
     assert not any("install" in name or "repair" in name or "rollback" in name for name in names)
@@ -124,9 +124,10 @@ async def test_mcp_exposes_exactly_six_structured_tools_and_no_admin(
     assert similarity_number["minimum"] == -1.0
     assert similarity_number["maximum"] == 1.0
 
-    wordplay_properties = by_name["dictionary_wordplay"].inputSchema["properties"]
-    assert wordplay_properties["text"]["minLength"] == 1
-    assert wordplay_properties["text"]["maxLength"] == 256
+    rhyme_properties = by_name["rhymes"].inputSchema["properties"]
+    assert rhyme_properties["text"]["minLength"] == 1
+    assert rhyme_properties["text"]["maxLength"] == 256
+    assert rhyme_properties["mode"]["enum"] == ["exact", "near"]
 
 
 @pytest.mark.asyncio

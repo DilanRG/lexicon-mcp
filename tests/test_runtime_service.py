@@ -1103,6 +1103,11 @@ def test_wordplay_modes_are_deterministic_and_exclude_query(service: LexiconServ
         "hello",
         "help",
     ]
+    exact = service.rhymes("cat")
+    assert exact["type"] == "rhymes"
+    assert exact["query"]["mode"] == "exact"
+    assert [item["term"] for item in exact["results"]] == ["bat"]
+    assert all(item["mode"] == "exact" for item in exact["results"])
 
 
 def test_all_public_tools_echo_the_effective_result_limit(
@@ -1114,7 +1119,7 @@ def test_all_public_tools_echo_the_effective_result_limit(
         service.dictionary_translate("bank", "en", "de", limit=2),
         service.dictionary_relations("dog", "hypernym", limit=5),
         service.dictionary_semantic_neighbors("cat", limit=4),
-        service.dictionary_wordplay("rhyme", "cat", limit=3),
+        service.rhymes("cat", limit=3),
     )
     assert [response["query"]["limit"] for response in responses] == [
         2,

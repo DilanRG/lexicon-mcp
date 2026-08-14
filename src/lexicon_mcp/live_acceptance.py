@@ -40,7 +40,7 @@ EXPECTED_LEXICON_TOOLS = frozenset(
         "dictionary_translate",
         "dictionary_relations",
         "dictionary_semantic_neighbors",
-        "dictionary_wordplay",
+        "rhymes",
     }
 )
 ADMIN_TERMS = frozenset({"install", "status", "verify", "repair", "rollback"})
@@ -1212,15 +1212,15 @@ class LiveAcceptanceRunner:
             _require_provenance(item.get("provenance"), f"semantic neighbour {term}")
 
         wordplay, wordplay_value, wordplay_results = self._invoke_lexicon_tool(
-            "dictionary_wordplay",
-            {"mode": "rhyme", "text": "cat", "limit": 100},
+            "rhymes",
+            {"mode": "exact", "text": "cat", "limit": 100},
             installation,
         )
         if (
-            wordplay_value["query"].get("mode") != "rhyme"
+            wordplay_value["query"].get("mode") != "exact"
             or wordplay_value["query"].get("normalized_text") != "cat"
         ):
-            raise AcceptanceFailure("dictionary_wordplay returned a wrong query scope")
+            raise AcceptanceFailure("rhymes returned a wrong query scope")
         wordplay_terms: set[str] = set()
         for item in wordplay_results:
             term = _require_text(item.get("term"), "wordplay term")
@@ -1228,18 +1228,18 @@ class LiveAcceptanceRunner:
             normalized = _normalized_term(term)
             if (
                 item.get("language") != "en"
-                or item.get("mode") != "rhyme"
+                or item.get("mode") != "exact"
                 or item.get("sense_scope") != "unsensed"
             ):
-                raise AcceptanceFailure("dictionary_wordplay returned a malformed result")
+                raise AcceptanceFailure("rhymes returned a malformed result")
             if normalized == "cat":
-                raise AcceptanceFailure("dictionary_wordplay echoed its query")
+                raise AcceptanceFailure("rhymes echoed its query")
             if normalized in wordplay_terms:
-                raise AcceptanceFailure("dictionary_wordplay returned a duplicate")
+                raise AcceptanceFailure("rhymes returned a duplicate")
             wordplay_terms.add(normalized)
             _require_provenance(item.get("provenance"), f"wordplay candidate {term}")
         if "bat" not in wordplay_terms:
-            raise AcceptanceFailure("dictionary_wordplay(rhyme/cat) did not return bat")
+            raise AcceptanceFailure("rhymes(exact/cat) did not return bat")
 
         suite: dict[str, Any] = {
             "schema_version": 1,
@@ -1286,7 +1286,7 @@ class LiveAcceptanceRunner:
                     "finite_similarity_min": min(semantic_scores),
                     "finite_similarity_max": max(semantic_scores),
                 },
-                "dictionary_wordplay": {
+                "rhymes": {
                     "response_sha256": wordplay.body_sha256,
                     "count": len(wordplay_results),
                     "required_candidate": "bat",
@@ -2670,20 +2670,20 @@ class FixtureHost:
                 "results": results,
                 "available": True,
             }
-        elif url.endswith("/dictionary_wordplay"):
+        elif url.endswith("/rhymes"):
             term = "cat" if self._value.get("wordplay_echo_query") else "bat"
             results = [
                 {
                     "term": term,
                     "language": "en",
-                    "mode": "rhyme",
+                    "mode": "exact",
                     "phonemes": "B AE1 T",
                     "sense_scope": "unsensed",
                     "provenance": provenance,
                 }
             ]
             body = {
-                "type": "dictionary_wordplay",
+                "type": "rhymes",
                 "dataset_version": self._installation.version,
                 "query": {
                     **(request_payload or {}),

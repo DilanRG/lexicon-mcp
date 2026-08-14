@@ -1869,6 +1869,28 @@ class LexiconService:
             results,
         )
 
+    def rhymes(self, text: str, mode: str = "exact", limit: int = 20) -> dict[str, Any]:
+        if not isinstance(mode, str) or mode not in {"exact", "near"}:
+            raise ValueError("mode must be one of: exact, near")
+        original = text.strip() if isinstance(text, str) else text
+        key = normalize_key(text, field="text")
+        limit = validate_limit(limit)
+        internal_mode = "rhyme" if mode == "exact" else "near_rhyme"
+        results = self._wordplay.search(internal_mode, key, limit=limit)
+        for result in results:
+            result["mode"] = mode
+        return self._response(
+            "rhymes",
+            {
+                "text": original,
+                "normalized_text": key,
+                "language": "en",
+                "mode": mode,
+                "limit": limit,
+            },
+            results,
+        )
+
     @staticmethod
     def _validate_sense_id(value: str | None) -> str | None:
         if value is None:

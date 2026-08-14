@@ -25,7 +25,7 @@ Relation = Literal[
     "at_location",
     "related",
 ]
-WordplayMode = Literal["rhyme", "near_rhyme", "sounds_like", "spelled_like", "prefix"]
+RhymeMode = Literal["exact", "near"]
 QueryText = Annotated[
     str,
     Field(
@@ -273,20 +273,18 @@ def create_mcp(service: LexiconService | None = None) -> FastMCP:
         )
 
     @server.tool()
-    def dictionary_wordplay(
-        mode: WordplayMode, text: QueryText, limit: ResultLimit = 20
+    def rhymes(
+        text: QueryText, mode: RhymeMode = "exact", limit: ResultLimit = 20
     ) -> dict[str, Any]:
-        """Find English rhymes, near rhymes, homophones, spelling patterns, or prefixes.
+        """Find exact or near English rhymes.
 
-        Results are English CMUdict-backed headwords. near_rhyme means exactly
-        one ARPAbet-token insertion, deletion, or substitution; sounds_like
-        requires an exact full-phoneme match. This fixed v1 behavior has no
-        automatic or configurable edit distance.
-        In spelled_like mode, ? matches exactly one character and * matches any
-        sequence. The query itself is excluded from results.
+        Results are English CMUdict-backed headwords. ``near`` means exactly
+        one ARPAbet-token insertion, deletion, or substitution. This fixed
+        behavior has no automatic or configurable edit distance. The query
+        itself is excluded from results.
         """
 
-        return provider.get().dictionary_wordplay(mode, text, limit)
+        return provider.get().rhymes(text, mode, limit)
 
     return server
 
