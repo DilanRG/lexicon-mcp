@@ -12,6 +12,22 @@ distributed with the attribution and share-alike notices applicable to their inp
 | ConceptNet Numberbatch 19.08 | https://github.com/commonsense/conceptnet-numberbatch | CC BY-SA 4.0 |
 | CMU Pronouncing Dictionary | https://github.com/cmusphinx/cmudict | CMUdict's BSD-style license and acknowledgement |
 
+## Modification and Wiktionary attribution notice
+
+The corpus artifacts are modified compilations, not verbatim upstream snapshots.
+Lexicon MCP parses the pinned snapshots, selects and normalizes lexical fields,
+creates deterministic source-scoped identifiers and lookup keys, and compiles the
+results into indexed SQLite/FTS5 databases and USearch indexes. The Wiktionary-,
+ConceptNet-, and Numberbatch-derived portions remain under CC BY-SA 4.0. No
+upstream project or contributor endorses Lexicon MCP or this redistribution.
+
+Each Wiktionary-derived record preserves its English Wiktionary page title as the
+display term. For a term `T`, contributor attribution, source text, and revision
+history are available at `https://en.wiktionary.org/w/index.php?title=T` and
+`https://en.wiktionary.org/w/index.php?title=T&action=history`, with `T` UTF-8
+percent-encoded as a query value. The exact English Wiktionary dump date and
+Kaikki/Wiktextract artifact are recorded in `sources.lock.json`.
+
 Every published bundle must include:
 
 - exact upstream URL, version or dump date, retrieval time, and SHA-256;
@@ -23,4 +39,3 @@ Every published bundle must include:
   upstream projects.
 
 The release manifest is authoritative for the exact snapshots in a given data tag.
-
