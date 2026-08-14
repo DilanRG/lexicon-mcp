@@ -486,6 +486,65 @@ class _ZeroByteCompletionKernel:
         return 1
 
 
+class _ShutdownInterleavingLock:
+    def __init__(self, worker_name: str) -> None:
+        self._lock = threading.Lock()
+        self._owner: int | None = None
+        self._worker_name = worker_name
+        self.worker_attempted = threading.Event()
+        self.worker_acquired = threading.Event()
+
+    def __enter__(self) -> _ShutdownInterleavingLock:
+        is_worker = threading.current_thread().name == self._worker_name
+        if is_worker:
+            self.worker_attempted.set()
+        self._lock.acquire()
+        self._owner = threading.get_ident()
+        if is_worker:
+            self.worker_acquired.set()
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self._owner = None
+        self._lock.release()
+
+    def owned_by_current_thread(self) -> bool:
+        return self._owner == threading.get_ident()
+
+
+class _StopVisibleCompletion:
+    def __init__(
+        self,
+        lock: _ShutdownInterleavingLock,
+        completion: threading.Event,
+    ) -> None:
+        self._event = threading.Event()
+        self._lock = lock
+        self._completion = completion
+
+    def is_set(self) -> bool:
+        return self._event.is_set()
+
+    def set(self) -> None:
+        self._event.set()
+        self._completion.set()
+        if self._lock.owned_by_current_thread():
+            assert self._lock.worker_attempted.wait(2)
+        else:
+            # This branch deterministically recreates the old ordering: stop
+            # became visible before close() acquired the bookkeeping lock.
+            assert self._lock.worker_acquired.wait(2)
+
+
+class _StopVisibleCompletionKernel(_ZeroByteCompletionKernel):
+    def __init__(self) -> None:
+        super().__init__(wait_for_cancel=False)
+        self.completion = threading.Event()
+
+    def WaitForSingleObject(self, *_args: object) -> int:
+        return 0 if self.completion.wait(2) else 0xFFFFFFFF
+
+
 def _zero_byte_completion_monitor(
     *,
     wait_for_cancel: bool,
@@ -525,6 +584,33 @@ def test_windows_change_monitor_accepts_cancelled_zero_byte_completion(
 
     monitor.close()
 
+    assert not thread.is_alive()
+    assert monitor.errors() == ()
+
+
+def test_windows_change_monitor_publishes_stop_and_cancellation_atomically(
+    tmp_path: Path,
+) -> None:
+    worker_name = "lexicon-test-shutdown-race"
+    monitor, ready = _zero_byte_completion_monitor(wait_for_cancel=False)
+    kernel = _StopVisibleCompletionKernel()
+    lock = _ShutdownInterleavingLock(worker_name)
+    monitor._kernel32 = kernel
+    monitor._lock = lock
+    monitor._stop = _StopVisibleCompletion(lock, kernel.completion)
+    thread = threading.Thread(
+        target=monitor._watch,
+        args=(tmp_path, 7, ready),
+        name=worker_name,
+    )
+    monitor._threads.append(thread)
+    thread.start()
+    assert ready.wait(2)
+
+    monitor.close()
+
+    assert lock.worker_attempted.is_set()
+    assert kernel.cancelled.is_set()
     assert not thread.is_alive()
     assert monitor.errors() == ()
 

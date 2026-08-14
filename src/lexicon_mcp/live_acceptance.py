@@ -1978,19 +1978,21 @@ class _WindowsChangeMonitor:
             return tuple(self._errors)
 
     def close(self) -> None:
-        self._stop.set()
         if hasattr(self, "_kernel32"):
-            for handle in getattr(self, "_handles", []):
-                # Hold the lock until a successful cancellation is recorded.
-                # The worker can otherwise observe the resulting successful
-                # zero-byte completion before close() marks it as intentional.
-                with self._lock:
+            # Publish shutdown and its successful cancellations atomically with
+            # respect to the worker's zero-byte completion check.  Otherwise a
+            # worker can observe _stop before the matching handle is recorded.
+            with self._lock:
+                self._stop.set()
+                for handle in getattr(self, "_handles", []):
                     if self._kernel32.CancelIoEx(ctypes.c_void_p(handle), None):
                         self._shutdown_cancelled_handles.add(handle)
             for thread in getattr(self, "_threads", []):
                 thread.join(timeout=5)
             for handle in getattr(self, "_handles", []):
                 self._kernel32.CloseHandle(ctypes.c_void_p(handle))
+        else:
+            self._stop.set()
         self._handles = []
         self._threads = []
 
