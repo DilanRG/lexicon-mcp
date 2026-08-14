@@ -142,6 +142,24 @@ def test_required_full_corpus_anchors_offline() -> None:
         assert any(sense["translations"] for sense in bank["results"])
         assert any("translations" in sense["truncated_fields"] for sense in bank["results"])
 
+        bounded_bank = service.dictionary_lookup("bank", "en", limit=10)
+        bounded_by_gloss = {
+            str(item["gloss"] or "").casefold(): item for item in bounded_bank["results"]
+        }
+        bounded_finance = bounded_by_gloss["institution"]
+        bounded_river = bounded_by_gloss["edge of river or lake"]
+        assert bounded_finance["sense_id"].startswith("wikt:labeled:")
+        assert bounded_river["sense_id"].startswith("wikt:labeled:")
+        scoped_river_translation = service.dictionary_translate(
+            "bank",
+            "en",
+            "de",
+            sense_id=bounded_river["sense_id"],
+        )
+        assert scoped_river_translation["candidate_count"] == 1
+        assert scoped_river_translation["results"][0]["sense_id"] == bounded_river["sense_id"]
+        assert scoped_river_translation["results"][0]["translations"][0]["term"] == "Ufer"
+
         translations = service.dictionary_translate("bank", "en", "de")
         assert translations["query"]["limit"] == 20
         assert translations["query"]["max_senses"] == 100

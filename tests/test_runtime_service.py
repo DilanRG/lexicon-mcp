@@ -494,6 +494,69 @@ def test_lookup_detail_budgets_are_total_fair_and_truthfully_truncated(
         assert sum(len(item["translations"]) for item in complete["results"]) == 6
 
 
+def test_lookup_retains_high_coverage_translation_senses_within_result_limit(
+    lexical_database: Path,
+) -> None:
+    with sqlite3.connect(lexical_database) as connection:
+        connection.execute(
+            "DELETE FROM translations WHERE sense_id IN (?, ?)",
+            ("oewn:bank-finance-n", "oewn:bank-river-n"),
+        )
+        distractor_entries = [
+            (f"entry:bank-distractor-{index:02d}", 1, "noun", None, 1) for index in range(8)
+        ]
+        connection.executemany(
+            "INSERT INTO lexical_entries VALUES (?, ?, ?, ?, ?)",
+            [
+                *distractor_entries,
+                ("entry:bank-wikt-finance", 1, "noun", None, 2),
+                ("entry:bank-wikt-river", 1, "noun", None, 2),
+            ],
+        )
+        connection.executemany(
+            "INSERT INTO senses VALUES (?, ?, ?)",
+            [
+                *[
+                    (
+                        f"oewn:bank-distractor-{index:02d}",
+                        f"entry:bank-distractor-{index:02d}",
+                        f"Distractor sense {index}.",
+                    )
+                    for index in range(8)
+                ],
+                (
+                    "wikt:labeled:bank-finance",
+                    "entry:bank-wikt-finance",
+                    "institution",
+                ),
+                (
+                    "wikt:labeled:bank-river",
+                    "entry:bank-wikt-river",
+                    "edge of river or lake",
+                ),
+            ],
+        )
+        connection.executemany(
+            "INSERT INTO translations VALUES (?, ?, ?, ?, ?)",
+            [
+                ("wikt:labeled:bank-finance", 5, "noun", 2, 0),
+                ("wikt:labeled:bank-river", 6, "noun", 2, 0),
+            ],
+        )
+
+    with LexiconService(lexical_database, "data-test-v1") as instance:
+        result = instance.dictionary_lookup("bank", limit=10, translations_limit=20)
+        by_id = {item["sense_id"]: item for item in result["results"]}
+        assert result["count"] == 10
+        assert by_id["wikt:labeled:bank-finance"]["translations"][0]["term"] == "Bank"
+        assert by_id["wikt:labeled:bank-river"]["translations"][0]["term"] == "Ufer"
+
+        metadata_only = instance.dictionary_lookup("bank", limit=10, translations_limit=0)
+        assert all(
+            not item["sense_id"].startswith("wikt:labeled:") for item in metadata_only["results"]
+        )
+
+
 def test_lookup_uses_nfkc_casefold_and_returns_typed_oov(service: LexiconService) -> None:
     result = service.dictionary_lookup("  ＣＡＦÉ  ", "fr")
     assert result["query"]["word"] == "ＣＡＦÉ"

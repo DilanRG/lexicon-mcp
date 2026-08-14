@@ -343,6 +343,77 @@ class LexiconService:
                 parameters,
             ).fetchall()
 
+    def _translation_coverage(self, sense_ids: list[str]) -> dict[str, tuple[int, int]]:
+        """Return distinct-language and row counts for a bounded sense set."""
+
+        if not sense_ids or "translations" not in self._tables:
+            return {}
+        placeholders = ", ".join("?" for _sense_id in sense_ids)
+        with self._lock:
+            rows = self._connection.execute(
+                f"""
+                SELECT translation.sense_id,
+                       COUNT(DISTINCT term.language) AS language_count,
+                       COUNT(*) AS translation_count
+                FROM translations AS translation
+                JOIN lexical_terms AS term
+                  ON term.term_id = translation.target_term_id
+                WHERE translation.sense_id IN ({placeholders})
+                GROUP BY translation.sense_id
+                """,
+                sense_ids,
+            ).fetchall()
+        return {
+            str(row["sense_id"]): (int(row["language_count"]), int(row["translation_count"]))
+            for row in rows
+        }
+
+    def _lookup_sense_rows(
+        self,
+        normalized_word: str,
+        language: str,
+        part_of_speech: str | None,
+        *,
+        limit: int,
+        prefer_translated: bool,
+    ) -> list[sqlite3.Row]:
+        """Select bounded senses while retaining translation-bearing source scopes."""
+
+        scan_limit = _MAX_QUERY_BUDGET if prefer_translated else limit
+        candidates = self._sense_rows(
+            normalized_word,
+            language,
+            part_of_speech,
+            None,
+            scan_limit,
+        )
+        if len(candidates) <= limit or not prefer_translated:
+            return candidates[:limit]
+
+        sense_ids = [str(row["sense_id"]) for row in candidates]
+        coverage = self._translation_coverage(sense_ids)
+        if not coverage:
+            return candidates[:limit]
+
+        candidate_positions = {
+            str(row["sense_id"]): position for position, row in enumerate(candidates)
+        }
+        translated = sorted(
+            (row for row in candidates if str(row["sense_id"]) in coverage),
+            key=lambda row: (
+                -coverage[str(row["sense_id"])][0],
+                -coverage[str(row["sense_id"])][1],
+                candidate_positions[str(row["sense_id"])],
+            ),
+        )
+        translation_reserve = 0 if limit < 2 else max(1, limit // 4)
+        selected_ids = {str(row["sense_id"]) for row in translated[:translation_reserve]}
+        for row in candidates:
+            if len(selected_ids) >= limit:
+                break
+            selected_ids.add(str(row["sense_id"]))
+        return [row for row in candidates if str(row["sense_id"]) in selected_ids][:limit]
+
     def _synonym_rows(self, sense_id: str, *, limit: int) -> list[sqlite3.Row]:
         with self._lock:
             return self._connection.execute(
@@ -409,7 +480,13 @@ class LexiconService:
             pronunciations_limit, field="pronunciations_limit"
         )
         translations_limit = _validate_fixed_budget(translations_limit, field="translations_limit")
-        rows = self._sense_rows(key, language, part_of_speech, None, limit)
+        rows = self._lookup_sense_rows(
+            key,
+            language,
+            part_of_speech,
+            limit=limit,
+            prefer_translated=translations_limit > 0,
+        )
 
         example_candidates: list[list[str]] = []
         pronunciation_candidates: list[list[dict[str, Any]]] = []
