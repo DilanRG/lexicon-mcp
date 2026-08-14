@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import threading
 import time
 from collections import Counter
@@ -265,6 +266,35 @@ def test_active_models_supports_router_status_objects_without_weakening_empty_ga
     assert _active_models({"active_models": []}) == []
     with pytest.raises(AcceptanceFailure, match=r"status\.value"):
         _active_models({"data": [{"id": "ambiguous"}]})
+
+
+def test_windows_host_run_script_uses_files_not_pipes_for_background_services(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    script = tmp_path / "start.ps1"
+    script.write_text("exit 0", encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        captured["args"] = args
+        captured.update(kwargs)
+        stdout = kwargs["stdout"]
+        stderr = kwargs["stderr"]
+        assert hasattr(stdout, "write")
+        assert hasattr(stderr, "write")
+        assert stdout is not subprocess.PIPE
+        assert stderr is not subprocess.PIPE
+        stdout.write(b"script output")  # type: ignore[union-attr]
+        stderr.write(b"script warning")  # type: ignore[union-attr]
+        return subprocess.CompletedProcess(args[0], 0)
+
+    monkeypatch.setattr("lexicon_mcp.live_acceptance.subprocess.run", fake_run)
+
+    observation = WindowsHost().run_script(script, timeout_seconds=1)
+
+    assert "capture_output" not in captured
+    assert observation.stdout_tail == "script output"
+    assert observation.stderr_tail == "script warning"
 
 
 def test_capture_mcpo_tree_tracks_transitive_children_and_markers() -> None:

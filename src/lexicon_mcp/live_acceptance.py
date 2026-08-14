@@ -17,6 +17,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unicodedata
@@ -2084,20 +2085,31 @@ class WindowsHost:
             raise AcceptanceFailure(f"stack script does not exist: {path}")
         started = time.monotonic()
         try:
-            result = subprocess.run(
-                [
-                    "powershell.exe",
-                    "-NoProfile",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-File",
-                    str(path),
-                ],
-                cwd=path.parent,
-                check=False,
-                capture_output=True,
-                timeout=timeout_seconds,
-            )
+            # The scripts deliberately launch long-lived background services.
+            # Captured pipes can be inherited by those descendants, making
+            # subprocess.run() wait indefinitely for EOF after PowerShell exits.
+            # Files preserve command evidence without making pipe closure part of
+            # the completion condition.
+            with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+                result = subprocess.run(
+                    [
+                        "powershell.exe",
+                        "-NoProfile",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-File",
+                        str(path),
+                    ],
+                    cwd=path.parent,
+                    check=False,
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    timeout=timeout_seconds,
+                )
+                stdout_file.seek(0)
+                stderr_file.seek(0)
+                stdout = stdout_file.read()
+                stderr = stderr_file.read()
         except subprocess.TimeoutExpired as exc:
             raise AcceptanceFailure(f"stack script timed out: {path}") from exc
         duration = time.monotonic() - started
@@ -2105,10 +2117,10 @@ class WindowsHost:
             script=str(path),
             exit_code=result.returncode,
             duration_seconds=duration,
-            stdout_sha256=_sha256_bytes(result.stdout),
-            stderr_sha256=_sha256_bytes(result.stderr),
-            stdout_tail=_display_tail(result.stdout),
-            stderr_tail=_display_tail(result.stderr),
+            stdout_sha256=_sha256_bytes(stdout),
+            stderr_sha256=_sha256_bytes(stderr),
+            stdout_tail=_display_tail(stdout),
+            stderr_tail=_display_tail(stderr),
         )
 
     def request(
