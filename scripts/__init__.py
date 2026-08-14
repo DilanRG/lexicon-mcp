@@ -1,1 +1,1 @@
-"""Repository maintenance and integration helpers."""
+"""Repository-local build and release command modules."""

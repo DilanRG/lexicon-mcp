@@ -36,13 +36,14 @@ def test_pipeline_artifacts_are_directly_queryable_by_runtime(tmp_path: Path) ->
             "the edge of a river",
         }
 
-        translations = service.dictionary_translate("bank", "en", "de")
+        translations = service.dictionary_translate("bank", "en", "de", limit=100)
         by_gloss = {
             item["gloss"]: item["translations"][0]["term"]
             for item in translations["results"]
         }
-        assert by_gloss["a financial institution"] == "Bank"
-        assert by_gloss["the edge of a river"] == "Ufer"
+        assert by_gloss["institution"] == "Bank"
+        assert by_gloss["edge of a river or lake"] == "Ufer"
+        assert len({item["sense_id"] for item in translations["results"]}) == 2
 
         relation = service.dictionary_relations("dog", "hypernym")
         assert relation["results"][0]["target_term"] == "animal"

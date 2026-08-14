@@ -2,7 +2,26 @@
 
 from __future__ import annotations
 
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
+
+RELATION_CODES = {
+    "synonym": 1,
+    "antonym": 2,
+    "hypernym": 3,
+    "hyponym": 4,
+    "meronym": 5,
+    "holonym": 6,
+    "derived_from": 7,
+    "etymologically_related": 8,
+    "used_for": 9,
+    "capable_of": 10,
+    "at_location": 11,
+    "related": 12,
+}
+RELATION_NAMES = {value: key for key, value in RELATION_CODES.items()}
+
+DIRECTION_CODES = {"outbound": 1, "inbound": 2, "symmetric": 3}
+DIRECTION_NAMES = {value: key for key, value in DIRECTION_CODES.items()}
 
 SOURCE_EXPECTATIONS = {
     "oewn": {

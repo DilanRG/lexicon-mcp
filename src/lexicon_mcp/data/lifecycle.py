@@ -184,11 +184,12 @@ class DatasetLifecycle:
         profile: str,
         version: str,
     ) -> dict[str, Any]:
-        manifest = (
-            manifest_source
-            if isinstance(manifest_source, DatasetManifest)
-            else self.load_manifest(manifest_source)
-        )
+        if isinstance(manifest_source, DatasetManifest):
+            manifest = manifest_source
+            local_asset_root: Path | None = None
+        else:
+            manifest = self.load_manifest(manifest_source)
+            local_asset_root = self._local_asset_root(manifest_source)
         self._match_request(manifest, profile=profile, version=version)
         with InstallationLock(self.lock_path):
             self._preflight(manifest)
@@ -219,7 +220,12 @@ class DatasetLifecycle:
                 stage.mkdir(parents=True, exist_ok=False)
                 (stage / "manifest.json").write_bytes(manifest.raw)
                 for component in manifest.components:
-                    self._materialize_component(manifest, component, stage)
+                    self._materialize_component(
+                        manifest,
+                        component,
+                        stage,
+                        local_asset_root=local_asset_root,
+                    )
                 report = self._verify_path(stage, manifest)
                 if not report["ok"]:
                     raise VerificationError("; ".join(report["problems"]))
@@ -314,12 +320,14 @@ class DatasetLifecycle:
                 target = self._version_path(version)
             if not target.is_dir() or target.is_symlink():
                 raise LifecycleError(f"dataset version is not installed: {version}")
+            local_asset_root: Path | None = None
             if manifest_source is None:
                 manifest = self._load_installed_manifest(target)
             elif isinstance(manifest_source, DatasetManifest):
                 manifest = manifest_source
             else:
                 manifest = self.load_manifest(manifest_source)
+                local_asset_root = self._local_asset_root(manifest_source)
             self._match_request(manifest, profile="full", version=version)
             pointer = self._pointer_or_none()
             if pointer and pointer.get("version") == version:
@@ -342,7 +350,12 @@ class DatasetLifecycle:
                 for component in manifest.components:
                     if component.id not in damaged:
                         continue
-                    self._materialize_component(manifest, component, stage)
+                    self._materialize_component(
+                        manifest,
+                        component,
+                        stage,
+                        local_asset_root=local_asset_root,
+                    )
                     source = stage.joinpath(*component.path.parts)
                     destination = target.joinpath(*component.path.parts)
                     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -469,6 +482,19 @@ class DatasetLifecycle:
         return f"https://github.com/{repository}/releases/download/{tag}/{encoded}"
 
     @staticmethod
+    def _local_asset_root(source: str | Path) -> Path | None:
+        """Resolve sibling assets only when the manifest itself is local.
+
+        This allows a clean installation of the exact production manifest
+        before its immutable GitHub release is published. HTTP manifests retain
+        the ordinary release URL behavior.
+        """
+
+        if isinstance(source, Path) or not str(source).startswith(("http://", "https://")):
+            return Path(source).expanduser().resolve().parent
+        return None
+
+    @staticmethod
     def _valid_file(path: Path, size: int, digest: str) -> bool:
         try:
             return (
@@ -481,7 +507,13 @@ class DatasetLifecycle:
             return False
 
     def _download_part(
-        self, manifest: DatasetManifest, component: Component, index: int, part: Part
+        self,
+        manifest: DatasetManifest,
+        component: Component,
+        index: int,
+        part: Part,
+        *,
+        local_asset_root: Path | None = None,
     ) -> Path:
         cache = self._component_cache(manifest.dataset_version, component)
         cache.mkdir(parents=True, exist_ok=True)
@@ -494,6 +526,50 @@ class DatasetLifecycle:
             raise DownloadError(f"unsafe partial download path: {partial}")
         if partial.is_file() and partial.stat().st_size > part.size:
             partial.unlink()
+        if local_asset_root is not None and part.url is None:
+            if part.name is None:  # guarded by manifest parsing
+                raise DownloadError("local release part has no asset name")
+            source_candidate = local_asset_root.joinpath(*part.name.split("/"))
+            cursor = local_asset_root
+            for piece in part.name.split("/"):
+                cursor /= piece
+                if cursor.is_symlink():
+                    raise DownloadError(
+                        f"local release asset must not traverse a symlink: {part.name}"
+                    )
+            try:
+                source = source_candidate.resolve(strict=True)
+            except OSError as exc:
+                raise DownloadError(f"local release asset is missing: {part.name}") from exc
+            if not source.is_relative_to(local_asset_root) or not source.is_file():
+                raise DownloadError(f"local release asset is missing or unsafe: {part.name}")
+            offset = partial.stat().st_size if partial.is_file() else 0
+            try:
+                with (
+                    source.open("rb") as input_stream,
+                    partial.open("ab" if offset else "wb") as output,
+                ):
+                    input_stream.seek(offset)
+                    received = offset
+                    while chunk := input_stream.read(1024 * 1024):
+                        received += len(chunk)
+                        if received > part.size:
+                            raise DownloadError("local release asset exceeds its declared size")
+                        output.write(chunk)
+                    output.flush()
+                    os.fsync(output.fileno())
+            except OSError as exc:
+                raise DownloadError(f"cannot copy local release asset {part.name}: {exc}") from exc
+            if partial.stat().st_size != part.size:
+                raise DownloadError(
+                    f"incomplete local release asset (expected {part.size}, "
+                    f"got {partial.stat().st_size})"
+                )
+            if sha256_file(partial) != part.sha256:
+                partial.unlink(missing_ok=True)
+                raise DownloadError(f"local release asset SHA-256 mismatch: {part.name}")
+            os.replace(partial, complete)
+            return complete
         url = self._part_url(manifest, part)
         last_error: BaseException | None = None
         for attempt in range(self.retries):
@@ -542,14 +618,25 @@ class DatasetLifecycle:
         ) from last_error
 
     def _materialize_component(
-        self, manifest: DatasetManifest, component: Component, stage: Path
+        self,
+        manifest: DatasetManifest,
+        component: Component,
+        stage: Path,
+        *,
+        local_asset_root: Path | None = None,
     ) -> None:
         destination = stage.joinpath(*component.path.parts)
         destination.parent.mkdir(parents=True, exist_ok=True)
         if destination.exists() or destination.is_symlink():
             raise LifecycleError(f"component destination already exists: {component.path}")
         parts = [
-            self._download_part(manifest, component, index, part)
+            self._download_part(
+                manifest,
+                component,
+                index,
+                part,
+                local_asset_root=local_asset_root,
+            )
             for index, part in enumerate(component.parts)
         ]
         if component.compression == "none":

@@ -7,7 +7,9 @@ import sqlite3
 from pathlib import Path
 from urllib.parse import unquote
 
-from .common import checked_language, iter_text_lines, normalize_term
+from .common import checked_language, iter_text_lines
+from .constants import DIRECTION_CODES, RELATION_CODES
+from .interner import CorpusInterner
 
 SOURCE = "ConceptNet 5.7"
 SOURCE_LICENSE = "CC-BY-SA-4.0"
@@ -50,7 +52,17 @@ def build_conceptnet(
     path: Path,
     commit_interval: int = 100_000,
 ) -> dict[str, int]:
-    counts = {"assertions": 0, "relations": 0, "skipped": 0, "malformed": 0}
+    counts = {
+        "source_assertions": 0,
+        "assertions": 0,
+        "relations": 0,
+        "skipped": 0,
+        "malformed": 0,
+    }
+    interner = CorpusInterner(connection)
+    provenance_id = interner.provenance(SOURCE, SOURCE_LICENSE, SOURCE_URL)
+    connection.execute("DELETE FROM relations WHERE provenance_id=?", (provenance_id,))
+    connection.commit()
     for _line_number, line in iter_text_lines(path):
         if not line:
             continue
@@ -58,6 +70,7 @@ def build_conceptnet(
         if len(fields) < 4:
             counts["malformed"] += 1
             continue
+        counts["source_assertions"] += 1
         relation_name = fields[1].rsplit("/", 1)[-1]
         mapping = _MAP.get(relation_name)
         source = _concept(fields[2])
@@ -73,11 +86,18 @@ def build_conceptnet(
                     continue
             except (ValueError, TypeError, json.JSONDecodeError):
                 pass
-        forward, forward_direction, reverse, reverse_direction = mapping
-        _insert(connection, source, forward, target, forward_direction)
-        _insert(connection, target, reverse, source, reverse_direction)
+        forward, forward_direction, _reverse, _reverse_direction = mapping
+        inserted = _insert(
+            connection,
+            interner,
+            provenance_id,
+            source,
+            forward,
+            target,
+            forward_direction,
+        )
         counts["assertions"] += 1
-        counts["relations"] += 2
+        counts["relations"] += int(inserted)
         if counts["assertions"] % commit_interval == 0:
             connection.commit()
     connection.commit()
@@ -86,29 +106,27 @@ def build_conceptnet(
 
 def _insert(
     connection: sqlite3.Connection,
+    interner: CorpusInterner,
+    provenance_id: int,
     source: tuple[str, str],
     relation: str,
     target: tuple[str, str],
     direction: str,
-) -> None:
+) -> bool:
     source_language, source_term = source
     target_language, target_term = target
-    connection.execute(
-        "INSERT OR IGNORE INTO relations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    source_term_id = interner.term(source_term, source_language)
+    target_term_id = interner.term(target_term, target_language)
+    cursor = connection.execute(
+        "INSERT OR IGNORE INTO relations VALUES (?,?,?,?,?,?,?)",
         (
-            source_term,
-            normalize_term(source_term),
-            source_language,
+            source_term_id,
             None,
-            relation,
-            target_term,
-            normalize_term(target_term),
-            target_language,
+            RELATION_CODES[relation],
+            target_term_id,
             None,
-            direction,
-            SOURCE,
-            SOURCE_LICENSE,
-            SOURCE_URL,
+            DIRECTION_CODES[direction],
+            provenance_id,
         ),
     )
-
+    return cursor.rowcount > 0

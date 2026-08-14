@@ -24,7 +24,7 @@ def normalize_key(value: str, *, field: str = "word", allow_wildcards: bool = Fa
         raise ValueError(f"{field} must be at most {MAX_TEXT_LENGTH} characters")
     if any(unicodedata.category(char) == "Cc" for char in value):
         raise ValueError(f"{field} cannot contain control characters")
-    normalized = unicodedata.normalize("NFKC", value).casefold()
+    normalized = " ".join(unicodedata.normalize("NFKC", value).casefold().split())
     if not allow_wildcards and ("*" in normalized or "?" in normalized):
         # Wildcards are ordinary headword characters outside the one pattern API.
         return normalized
@@ -32,7 +32,7 @@ def normalize_key(value: str, *, field: str = "word", allow_wildcards: bool = Fa
 
 
 def normalize_language(value: str, *, field: str = "language") -> str:
-    """Validate and canonicalize a practical BCP-47 language tag."""
+    """Validate and normalize a practical BCP-47 tag to on-disk lowercase."""
 
     if not isinstance(value, str):
         raise ValueError(f"{field} must be text")
@@ -45,15 +45,10 @@ def normalize_language(value: str, *, field: str = "language") -> str:
     ):
         raise ValueError(f"{field} must be a valid BCP-47 language tag")
 
-    canonical = [parts[0].lower()]
-    for part in parts[1:]:
-        if len(part) == 4 and part.isalpha():
-            canonical.append(part.title())
-        elif (len(part) == 2 and part.isalpha()) or (len(part) == 3 and part.isdigit()):
-            canonical.append(part.upper())
-        else:
-            canonical.append(part.lower())
-    return "-".join(canonical)
+    # Builders and Numberbatch shard filenames use casefolded tags. Keep that
+    # representation at the query boundary so valid script/region tags such as
+    # zh-Hant and pt-BR address the rows and shards stored as zh-hant/pt-br.
+    return "-".join(part.casefold() for part in parts)
 
 
 def validate_limit(value: int) -> int:

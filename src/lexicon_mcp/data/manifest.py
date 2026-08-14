@@ -214,6 +214,7 @@ def _parse_integrity(value: Any, field: str) -> dict[str, Any]:
         "semantic_mapping",
         "semantic_mapping_table",
         "semantic_table",
+        "dataset_schema_version",
         "archive_member",
     }
     unknown = set(value) - allowed
@@ -224,6 +225,13 @@ def _parse_integrity(value: Any, field: str) -> dict[str, Any]:
         raise ManifestError(f"{field}.sqlite must be boolean")
     if "semantic_count" in result:
         result["semantic_count"] = _size(result["semantic_count"], f"{field}.semantic_count")
+    if "dataset_schema_version" in result:
+        schema_version = _size(
+            result["dataset_schema_version"], f"{field}.dataset_schema_version"
+        )
+        if schema_version < 1:
+            raise ManifestError(f"{field}.dataset_schema_version must be a positive integer")
+        result["dataset_schema_version"] = schema_version
     if "semantic_mapping" in result:
         result["semantic_mapping"] = str(
             safe_relative_path(result["semantic_mapping"], field=f"{field}.semantic_mapping")

@@ -12,8 +12,9 @@ from urllib.parse import unquote
 import numpy as np
 from usearch.index import Index
 
-from .common import configure_build_db, finalize_readonly_db, iter_text_lines, normalize_term
-from .schema import create_semantic_schema
+from .common import configure_build_db, finalize_readonly_db, iter_text_lines
+from .interner import CorpusInterner
+from .schema import create_semantic_query_indexes, create_semantic_schema
 
 SOURCE = "ConceptNet Numberbatch 19.08"
 SOURCE_LICENSE = "CC-BY-SA-4.0"
@@ -37,8 +38,8 @@ def _index(dimensions: int, _expected: int) -> Index:
         metric="cos",
         dtype="i8",
         connectivity=16,
-        expansion_add=128,
-        expansion_search=128,
+        expansion_add=256,
+        expansion_search=512,
     )
 
 
@@ -54,6 +55,23 @@ def _flush_index(
     index.add(keys, vectors, copy=False)
     pending_keys.clear()
     pending_vectors.clear()
+
+
+def verify_saved_index(path: Path, expected_count: int) -> None:
+    """Reopen a persisted mmap index and require its exact key count."""
+
+    index = Index.restore(path, view=True)
+    if index is None:  # pragma: no cover - USearch ordinarily raises
+        raise RuntimeError(f"USearch could not reopen saved index: {path}")
+    try:
+        observed = len(index)
+        if observed != expected_count:
+            raise RuntimeError(
+                f"saved USearch index count mismatch for {path}: "
+                f"expected {expected_count}, got {observed}"
+            )
+    finally:
+        index.reset()
 
 
 def build_numberbatch(
@@ -98,6 +116,8 @@ def build_numberbatch(
     connection = sqlite3.connect(mapping_path)
     configure_build_db(connection)
     create_semantic_schema(connection, dataset_version, dimensions)
+    interner = CorpusInterner(connection)
+    provenance_id = interner.provenance(SOURCE, SOURCE_LICENSE, SOURCE_URL)
     global_index = _index(dimensions, expected_rows)
     vector_path = vector_dir / "global.f16"
     accepted = 0
@@ -108,18 +128,19 @@ def build_numberbatch(
 
     with vector_path.open("wb") as vector_stream:
         for _line_number, line in lines:
-            pieces = line.split()
-            if len(pieces) != dimensions + 1:
+            concept, separator, raw_vector = line.partition(" ")
+            if not separator:
                 malformed += 1
                 continue
-            concept = pieces[0]
             parsed = _parse_concept(concept)
             if not parsed:
                 malformed += 1
                 continue
             language, term = parsed
             try:
-                vector = np.asarray(pieces[1:], dtype=np.float32)
+                vector: np.ndarray = np.fromstring(
+                    raw_vector, dtype=np.float32, sep=" "
+                )
             except ValueError:
                 malformed += 1
                 continue
@@ -135,18 +156,12 @@ def build_numberbatch(
             try:
                 connection.execute(
                     """INSERT INTO semantic_terms
-                    (semantic_id,concept,term,normalized_term,language,vector_offset,
-                     source,source_license,source_url) VALUES (?,?,?,?,?,?,?,?,?)""",
+                    (semantic_id,concept,term_id,vector_offset) VALUES (?,?,?,?)""",
                     (
                         semantic_id,
                         concept,
-                        term,
-                        normalize_term(term),
-                        language,
+                        interner.term(term, language),
                         semantic_id,
-                        SOURCE,
-                        SOURCE_LICENSE,
-                        SOURCE_URL,
                     ),
                 )
             except sqlite3.IntegrityError:
@@ -174,20 +189,24 @@ def build_numberbatch(
     global_path = index_dir / "global.usearch"
     global_index.save(global_path)
     del global_index
+    verify_saved_index(global_path, accepted)
 
     vectors: np.memmap = np.memmap(
         vector_path, mode="r", dtype="<f2", shape=(accepted, dimensions)
     )
     language_counts = connection.execute(
-        "SELECT language,COUNT(*) FROM semantic_terms GROUP BY language ORDER BY language"
+        """SELECT t.language,COUNT(*)
+        FROM semantic_terms s JOIN lexical_terms t ON t.term_id=s.term_id
+        GROUP BY t.language ORDER BY t.language"""
     ).fetchall()
     for language, term_count in language_counts:
         filename = f"{language.replace('-', '_')}.usearch"
         relative = f"indexes/languages/{filename}"
         language_index = _index(dimensions, term_count)
         cursor = connection.execute(
-            "SELECT semantic_id,vector_offset FROM semantic_terms "
-            "WHERE language=? ORDER BY semantic_id",
+            """SELECT s.semantic_id,s.vector_offset
+            FROM semantic_terms s JOIN lexical_terms t ON t.term_id=s.term_id
+            WHERE t.language=? ORDER BY s.semantic_id""",
             (language,),
         )
         while rows := cursor.fetchmany(batch_size):
@@ -202,6 +221,7 @@ def build_numberbatch(
         destination = language_dir / filename
         language_index.save(destination)
         del language_index
+        verify_saved_index(destination, int(term_count))
         connection.execute(
             "INSERT INTO semantic_languages(language,index_file,term_count) VALUES (?,?,?)",
             (language, relative, term_count),
@@ -217,10 +237,21 @@ def build_numberbatch(
             ("language_count", str(len(language_counts))),
             ("language_index_dir", "indexes/languages"),
             ("connectivity", "16"),
-            ("expansion_add", "128"),
-            ("expansion_search", "128"),
+            ("expansion_add", "256"),
+            ("expansion_search", "512"),
+            ("source", SOURCE),
+            ("source_license", SOURCE_LICENSE),
+            ("source_url", SOURCE_URL),
+            ("source_provenance_id", str(provenance_id)),
         ),
     )
+    create_semantic_query_indexes(connection)
+    foreign_key_failure = connection.execute("PRAGMA foreign_key_check").fetchone()
+    if foreign_key_failure is not None:
+        connection.close()
+        raise RuntimeError(
+            f"semantic mapping foreign-key check failed: {foreign_key_failure!r}"
+        )
     integrity = connection.execute("PRAGMA integrity_check").fetchone()
     if not integrity or integrity[0] != "ok":
         connection.close()

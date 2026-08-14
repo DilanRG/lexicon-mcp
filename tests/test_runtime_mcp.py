@@ -5,7 +5,10 @@ from pathlib import Path
 
 import pytest
 
-from lexicon_mcp.pipeline.schema import create_lexical_schema
+from lexicon_mcp.pipeline.schema import (
+    create_lexical_query_indexes,
+    create_lexical_schema,
+)
 from lexicon_mcp.runtime.service import LexiconService
 from lexicon_mcp.server import create_mcp
 
@@ -16,25 +19,24 @@ def service(tmp_path: Path) -> LexiconService:
     with sqlite3.connect(database) as connection:
         create_lexical_schema(connection, "data-test-v1")
         connection.execute(
-            """
-            INSERT INTO senses(
-                sense_id, word, normalized_word, language, part_of_speech, gloss,
-                etymology, source, source_license, source_url
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
+            "INSERT INTO provenance VALUES (?, ?, ?, ?)",
             (
-                "oewn:cat-n",
-                "cat",
-                "cat",
-                "en",
-                "noun",
-                "A small domesticated feline.",
-                None,
+                1,
                 "Open English WordNet",
                 "CC-BY-4.0",
                 "https://en-word.net/",
             ),
         )
+        connection.execute("INSERT INTO lexical_terms VALUES (1, 'cat', 'cat', 'en')")
+        connection.execute(
+            "INSERT INTO lexical_entries VALUES (?, ?, ?, ?, ?)",
+            ("oewn:entry:cat", 1, "noun", None, 1),
+        )
+        connection.execute(
+            "INSERT INTO senses VALUES (?, ?, ?)",
+            ("oewn:cat-n", "oewn:entry:cat", "A small domesticated feline."),
+        )
+        create_lexical_query_indexes(connection)
         connection.commit()
     instance = LexiconService(database, "data-test-v1")
     yield instance

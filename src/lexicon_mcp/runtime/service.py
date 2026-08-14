@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-import re
 import sqlite3
 import threading
 from collections.abc import Mapping
@@ -19,6 +18,7 @@ from .normalization import (
     validate_limit,
 )
 from .semantic import SemanticSearch, SemanticWorker, UnavailableSemanticSearch
+from .wordplay import SQLiteWordplaySearch
 
 RELATIONS = frozenset(
     {
@@ -38,13 +38,39 @@ RELATIONS = frozenset(
 WORDPLAY_MODES = frozenset(
     {"rhyme", "near_rhyme", "sounds_like", "spelled_like", "prefix"}
 )
-SUPPORTED_SCHEMA_VERSION = "1"
+SUPPORTED_SCHEMA_VERSION = "2"
 
-_CMU_PROVENANCE = {
-    "source": "CMU Pronouncing Dictionary",
-    "license": "CMUdict license",
-    "url": "https://github.com/cmusphinx/cmudict",
+_RELATION_CODES = {
+    "synonym": 1,
+    "antonym": 2,
+    "hypernym": 3,
+    "hyponym": 4,
+    "meronym": 5,
+    "holonym": 6,
+    "derived_from": 7,
+    "etymologically_related": 8,
+    "used_for": 9,
+    "capable_of": 10,
+    "at_location": 11,
+    "related": 12,
 }
+_RELATION_NAMES = {code: name for name, code in _RELATION_CODES.items()}
+_DIRECTION_NAMES = {1: "outbound", 2: "inbound", 3: "symmetric"}
+_INVERSE_RELATION_CODES = {
+    1: 1,
+    2: 2,
+    3: 4,
+    4: 3,
+    5: 6,
+    6: 5,
+    7: 7,
+    8: 8,
+    9: 9,
+    10: 10,
+    11: 11,
+    12: 12,
+}
+_INVERSE_DIRECTION_CODES = {1: 2, 2: 1, 3: 3}
 
 
 def _provenance(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, str | None]:
@@ -53,48 +79,6 @@ def _provenance(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, str | None]:
         "license": str(row["source_license"] or "unknown"),
         "url": str(row["source_url"]) if row["source_url"] else None,
     }
-
-
-def _phoneme_rhyme(phonemes: str) -> tuple[str, ...]:
-    tokens = tuple(phonemes.upper().split())
-    for index in range(len(tokens) - 1, -1, -1):
-        token = tokens[index]
-        if token[-1:].isdigit() and token[-1] in {"1", "2"}:
-            return tokens[index:]
-    for index in range(len(tokens) - 1, -1, -1):
-        if tokens[index][-1:].isdigit():
-            return tokens[index:]
-    return tokens[-2:]
-
-
-def _token_edit_distance(left: tuple[str, ...], right: tuple[str, ...], ceiling: int = 1) -> int:
-    if abs(len(left) - len(right)) > ceiling:
-        return ceiling + 1
-    previous = list(range(len(right) + 1))
-    for left_index, left_token in enumerate(left, start=1):
-        current = [left_index]
-        for right_index, right_token in enumerate(right, start=1):
-            current.append(
-                min(
-                    current[-1] + 1,
-                    previous[right_index] + 1,
-                    previous[right_index - 1] + (left_token != right_token),
-                )
-            )
-        if min(current) > ceiling:
-            return ceiling + 1
-        previous = current
-    return previous[-1]
-
-
-def _spelling_pattern_matches(pattern: str, candidate: str) -> bool:
-    """Match only the documented ? and * wildcards; all other text is literal."""
-
-    expression = "".join(
-        "." if char == "?" else ".*" if char == "*" else re.escape(char)
-        for char in pattern
-    )
-    return re.fullmatch(expression, candidate, flags=re.DOTALL) is not None
 
 
 class LexiconService:
@@ -128,9 +112,26 @@ class LexiconService:
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-        if "senses" not in self._tables:
+        required_tables = {
+            "metadata",
+            "provenance",
+            "lexical_terms",
+            "lexical_entries",
+            "senses",
+            "examples",
+            "pronunciations",
+            "translations",
+            "synonyms",
+            "relations",
+            "pronunciations_words",
+        }
+        missing = required_tables - self._tables
+        if missing:
             self._connection.close()
-            raise RuntimeError("Lexical database has no senses table")
+            raise RuntimeError(
+                "Lexical database is missing required compact-schema tables: "
+                + ", ".join(sorted(missing))
+            )
         self._check_dataset_version()
 
         if semantic_search is not None:
@@ -144,7 +145,7 @@ class LexiconService:
             )
         else:
             self._semantic = UnavailableSemanticSearch()
-        self._wordplay_rows: tuple[tuple[str, str, str], ...] | None = None
+        self._wordplay = SQLiteWordplaySearch(self.database_path)
 
     @classmethod
     def from_active_dataset(cls, dataset: ActiveDataset) -> LexiconService:
@@ -159,28 +160,27 @@ class LexiconService:
         return cls.from_active_dataset((locator or DatasetLocator()).active())
 
     def _check_dataset_version(self) -> None:
-        if "metadata" not in self._tables:
-            return
         metadata = {
             str(row["key"]): str(row["value"])
             for row in self._connection.execute(
                 "SELECT key, value FROM metadata WHERE key IN ('dataset_version', 'schema_version')"
             ).fetchall()
         }
-        if metadata.get("dataset_version") not in {None, self.dataset_version}:
+        if metadata.get("dataset_version") != self.dataset_version:
             self._connection.close()
             raise RuntimeError(
                 "Lexical database version does not match the activated dataset version"
             )
-        if metadata.get("schema_version") not in {None, SUPPORTED_SCHEMA_VERSION}:
+        if metadata.get("schema_version") != SUPPORTED_SCHEMA_VERSION:
             self._connection.close()
             raise RuntimeError(
-                f"Unsupported lexical schema version {metadata['schema_version']!r}; "
+                f"Unsupported lexical schema version {metadata.get('schema_version')!r}; "
                 f"this server supports {SUPPORTED_SCHEMA_VERSION!r}"
             )
 
     def close(self) -> None:
         self._semantic.close()
+        self._wordplay.close()
         with self._lock:
             self._connection.close()
 
@@ -198,41 +198,113 @@ class LexiconService:
         sense_id: str | None,
         limit: int,
     ) -> list[sqlite3.Row]:
-        clauses = ["normalized_word = ?", "language = ?"]
+        clauses = ["term.normalized_term = ?", "term.language = ?"]
         parameters: list[Any] = [word, language]
         if part_of_speech is not None:
-            clauses.append("LOWER(part_of_speech) = ?")
+            clauses.append("LOWER(entry.part_of_speech) = ?")
             parameters.append(part_of_speech)
         if sense_id is not None:
-            clauses.append("sense_id = ?")
+            clauses.append("sense.sense_id = ?")
             parameters.append(sense_id)
         parameters.append(limit)
         with self._lock:
             return self._connection.execute(
                 f"""
-                SELECT sense_id, word, normalized_word, language, part_of_speech,
-                       gloss, etymology, source, source_license, source_url
-                FROM senses
+                SELECT sense.sense_id, entry.entry_id, term.term AS word,
+                       term.normalized_term AS normalized_word,
+                       term.language, entry.part_of_speech, sense.gloss,
+                       entry.etymology, provenance.source,
+                       provenance.source_license, provenance.source_url
+                FROM senses AS sense
+                JOIN lexical_entries AS entry ON entry.entry_id = sense.entry_id
+                JOIN lexical_terms AS term ON term.term_id = entry.term_id
+                JOIN provenance ON provenance.provenance_id = entry.provenance_id
                 WHERE {' AND '.join(clauses)}
-                ORDER BY CASE WHEN gloss IS NULL THEN 1 ELSE 0 END, sense_id
+                ORDER BY CASE WHEN sense.gloss IS NULL THEN 1 ELSE 0 END,
+                         sense.sense_id
                 LIMIT ?
                 """,
                 parameters,
             ).fetchall()
 
     def _dependent_rows(
-        self, table: str, columns: str, sense_id: str, *, limit: int = 100
+        self,
+        table: str,
+        columns: str,
+        identifier: str,
+        *,
+        id_column: str = "sense_id",
+        limit: int = 100,
     ) -> list[sqlite3.Row]:
         if table not in self._tables:
             return []
+        if id_column not in {"sense_id", "entry_id"}:
+            raise RuntimeError(f"unsafe dependent-row key {id_column!r}")
         with self._lock:
             return self._connection.execute(
-                f"SELECT {columns} FROM {table} WHERE sense_id = ? ORDER BY position LIMIT ?",
+                f"SELECT {columns} FROM {table} WHERE {id_column} = ? "
+                "ORDER BY position LIMIT ?",
+                (identifier, limit),
+            ).fetchall()
+
+    def _translation_rows(
+        self,
+        sense_id: str,
+        *,
+        target_language: str | None = None,
+        limit: int = 100,
+    ) -> list[sqlite3.Row]:
+        clauses = ["translation.sense_id = ?"]
+        parameters: list[Any] = [sense_id]
+        if target_language is not None:
+            clauses.append("term.language = ?")
+            parameters.append(target_language)
+        parameters.append(limit)
+        with self._lock:
+            return self._connection.execute(
+                f"""
+                SELECT term.term, term.normalized_term,
+                       term.language AS target_language,
+                       translation.part_of_speech, translation.position,
+                       provenance.source, provenance.source_license,
+                       provenance.source_url
+                FROM translations AS translation
+                JOIN lexical_terms AS term
+                  ON term.term_id = translation.target_term_id
+                JOIN provenance
+                  ON provenance.provenance_id = translation.provenance_id
+                WHERE {' AND '.join(clauses)}
+                ORDER BY translation.position, term.language,
+                         term.normalized_term, term.term
+                LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
+
+    def _synonym_rows(self, sense_id: str, *, limit: int) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._connection.execute(
+                """
+                SELECT term.term, term.normalized_term, term.language,
+                       synonym.part_of_speech, synonym.position,
+                       provenance.source, provenance.source_license,
+                       provenance.source_url
+                FROM synonyms AS synonym
+                JOIN lexical_terms AS term
+                  ON term.term_id = synonym.target_term_id
+                JOIN provenance
+                  ON provenance.provenance_id = synonym.provenance_id
+                WHERE synonym.sense_id = ?
+                ORDER BY synonym.position, term.language,
+                         term.normalized_term, term.term
+                LIMIT ?
+                """,
                 (sense_id, limit),
             ).fetchall()
 
     def _sense_result(self, row: sqlite3.Row) -> dict[str, Any]:
         sense_id = str(row["sense_id"])
+        entry_id = str(row["entry_id"])
         examples = [
             str(item["example"])
             for item in self._dependent_rows("examples", "example, position", sense_id)
@@ -240,7 +312,10 @@ class LexiconService:
         pronunciations = [
             {"ipa": item["ipa"], "region": item["region"]}
             for item in self._dependent_rows(
-                "pronunciations", "ipa, region, position", sense_id
+                "pronunciations",
+                "ipa, region, position",
+                entry_id,
+                id_column="entry_id",
             )
         ]
         translations = [
@@ -252,12 +327,7 @@ class LexiconService:
                 "sense_scope": sense_scope(sense_id),
                 "provenance": _provenance(item),
             }
-            for item in self._dependent_rows(
-                "translations",
-                "target_language, term, part_of_speech, source, source_license, "
-                "source_url, position",
-                sense_id,
-            )
+            for item in self._translation_rows(sense_id)
         ]
         return {
             "sense_id": sense_id,
@@ -316,24 +386,18 @@ class LexiconService:
         limit = validate_limit(limit)
         rows = self._sense_rows(key, language, part_of_speech, sense_id, limit)
         groups: list[dict[str, Any]] = []
-        seen: set[tuple[str, str]] = set()
         remaining = limit
         for row in rows:
             if remaining <= 0:
                 break
             row_sense_id = str(row["sense_id"])
             candidates: list[dict[str, Any]] = []
-            for item in self._dependent_rows(
-                "synonyms",
-                "term, normalized_term, language, part_of_speech, source, "
-                "source_license, source_url, position",
-                row_sense_id,
-                limit=remaining,
-            ):
+            seen_in_sense: set[tuple[str, str]] = set()
+            for item in self._synonym_rows(row_sense_id, limit=remaining):
                 identity = (str(item["normalized_term"]), str(item["language"]))
-                if identity == (key, language) or identity in seen:
+                if identity == (key, language) or identity in seen_in_sense:
                     continue
-                seen.add(identity)
+                seen_in_sense.add(identity)
                 candidates.append(
                     {
                         "term": item["term"],
@@ -359,7 +423,12 @@ class LexiconService:
                     }
                 )
         if sense_id is None and remaining > 0:
-            fallback = self._relation_synonyms(key, language, part_of_speech, remaining, seen)
+            # ConceptNet fallback is an independently unsensed association, so
+            # do not suppress it merely because the same display term occurs
+            # in a source-scoped sense group above.
+            fallback = self._relation_synonyms(
+                key, language, part_of_speech, remaining, set()
+            )
             if fallback:
                 groups.append(fallback)
         return self._response(
@@ -374,6 +443,127 @@ class LexiconService:
             groups,
         )
 
+    def _relation_rows(
+        self,
+        word: str,
+        language: str,
+        relation_code: int,
+        *,
+        target_language: str | None,
+        source_sense_id: str | None,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Orient compact physical assertions around the requested source term."""
+
+        forward_clauses = [
+            "source.normalized_term = ?",
+            "source.language = ?",
+            "relation.relation_code = ?",
+        ]
+        forward_parameters: list[Any] = [word, language, relation_code]
+        if target_language is not None:
+            forward_clauses.append("target.language = ?")
+            forward_parameters.append(target_language)
+        if source_sense_id is not None:
+            forward_clauses.append("relation.source_sense_id = ?")
+            forward_parameters.append(source_sense_id)
+        forward_parameters.append(limit)
+
+        inverse_code = _INVERSE_RELATION_CODES[relation_code]
+        reverse_clauses = [
+            "target.normalized_term = ?",
+            "target.language = ?",
+            "relation.relation_code = ?",
+        ]
+        reverse_parameters: list[Any] = [word, language, inverse_code]
+        if target_language is not None:
+            reverse_clauses.append("source.language = ?")
+            reverse_parameters.append(target_language)
+        if source_sense_id is not None:
+            reverse_clauses.append("relation.target_sense_id = ?")
+            reverse_parameters.append(source_sense_id)
+        reverse_parameters.append(limit)
+
+        select_forward = f"""
+            SELECT source.term AS source_term,
+                   source.normalized_term AS source_normalized,
+                   source.language AS source_language,
+                   relation.source_sense_id,
+                   target.term AS target_term,
+                   target.normalized_term AS target_normalized,
+                   target.language AS target_language,
+                   relation.target_sense_id,
+                   relation.direction_code,
+                   provenance.source, provenance.source_license,
+                   provenance.source_url
+            FROM relations AS relation
+            JOIN lexical_terms AS source
+              ON source.term_id = relation.source_term_id
+            JOIN lexical_terms AS target
+              ON target.term_id = relation.target_term_id
+            JOIN provenance
+              ON provenance.provenance_id = relation.provenance_id
+            WHERE {' AND '.join(forward_clauses)}
+            ORDER BY target.language, target.normalized_term, target.term,
+                     relation.target_sense_id
+            LIMIT ?
+        """
+        select_reverse = f"""
+            SELECT target.term AS source_term,
+                   target.normalized_term AS source_normalized,
+                   target.language AS source_language,
+                   relation.target_sense_id AS source_sense_id,
+                   source.term AS target_term,
+                   source.normalized_term AS target_normalized,
+                   source.language AS target_language,
+                   relation.source_sense_id AS target_sense_id,
+                   relation.direction_code,
+                   provenance.source, provenance.source_license,
+                   provenance.source_url
+            FROM relations AS relation
+            JOIN lexical_terms AS source
+              ON source.term_id = relation.source_term_id
+            JOIN lexical_terms AS target
+              ON target.term_id = relation.target_term_id
+            JOIN provenance
+              ON provenance.provenance_id = relation.provenance_id
+            WHERE {' AND '.join(reverse_clauses)}
+            ORDER BY source.language, source.normalized_term, source.term,
+                     relation.source_sense_id
+            LIMIT ?
+        """
+        with self._lock:
+            forward = self._connection.execute(
+                select_forward, forward_parameters
+            ).fetchall()
+            reverse = self._connection.execute(
+                select_reverse, reverse_parameters
+            ).fetchall()
+
+        oriented: list[dict[str, Any]] = []
+        for row in forward:
+            item = dict(row)
+            item["relation_code"] = relation_code
+            oriented.append(item)
+        for row in reverse:
+            item = dict(row)
+            item["relation_code"] = relation_code
+            item["direction_code"] = _INVERSE_DIRECTION_CODES[
+                int(item["direction_code"])
+            ]
+            oriented.append(item)
+        oriented.sort(
+            key=lambda item: (
+                str(item["target_language"]),
+                str(item["target_normalized"]),
+                str(item["target_term"]),
+                str(item["target_sense_id"] or ""),
+                int(item["direction_code"]),
+                str(item["source"]),
+            )
+        )
+        return oriented[:limit]
+
     def _relation_synonyms(
         self,
         word: str,
@@ -382,28 +572,21 @@ class LexiconService:
         limit: int,
         seen: set[tuple[str, str]],
     ) -> dict[str, Any] | None:
-        if "relations" not in self._tables:
-            return None
-        clauses = ["source_normalized = ?", "source_language = ?", "relation = 'synonym'"]
-        parameters: list[Any] = [word, language]
         if part_of_speech is not None:
             # Relations carry no POS. A requested POS must never receive unscoped fallback data.
             return None
-        parameters.append(limit * 2)
-        with self._lock:
-            rows = self._connection.execute(
-                f"""
-                SELECT target_term, target_normalized, target_language, source,
-                       source_license, source_url
-                FROM relations
-                WHERE {' AND '.join(clauses)}
-                ORDER BY target_language, target_normalized
-                LIMIT ?
-                """,
-                parameters,
-            ).fetchall()
+        rows = self._relation_rows(
+            word,
+            language,
+            _RELATION_CODES["synonym"],
+            target_language=None,
+            source_sense_id=None,
+            limit=limit * 2,
+        )
         candidates: list[dict[str, Any]] = []
         for row in rows:
+            if row["source_sense_id"] is not None:
+                continue
             identity = (str(row["target_normalized"]), str(row["target_language"]))
             if identity == (word, language) or identity in seen:
                 continue
@@ -458,15 +641,9 @@ class LexiconService:
                 break
             row_sense_id = str(row["sense_id"])
             translations: list[dict[str, Any]] = []
-            for item in self._dependent_rows(
-                "translations",
-                "target_language, term, normalized_term, part_of_speech, source, "
-                "source_license, source_url, position",
-                row_sense_id,
-                limit=limit,
+            for item in self._translation_rows(
+                row_sense_id, target_language=target_language, limit=limit
             ):
-                if item["target_language"] != target_language:
-                    continue
                 identity = (
                     row_sense_id,
                     str(item["normalized_term"]),
@@ -536,56 +713,49 @@ class LexiconService:
         sense_id = self._validate_sense_id(sense_id)
         limit = validate_limit(limit)
         results: list[dict[str, Any]] = []
-        if "relations" in self._tables:
-            clauses = ["source_normalized = ?", "source_language = ?", "relation = ?"]
-            parameters: list[Any] = [key, language, relation]
-            if target_language is not None:
-                clauses.append("target_language = ?")
-                parameters.append(target_language)
-            if sense_id is not None:
-                clauses.append("source_sense_id = ?")
-                parameters.append(sense_id)
-            parameters.append(limit * 2)
-            with self._lock:
-                rows = self._connection.execute(
-                    f"""
-                    SELECT source_term, source_sense_id, relation, target_term,
-                           target_language, target_sense_id, direction, source,
-                           source_license, source_url, target_normalized
-                    FROM relations
-                    WHERE {' AND '.join(clauses)}
-                    ORDER BY target_language, target_normalized, target_sense_id
-                    LIMIT ?
-                    """,
-                    parameters,
-                ).fetchall()
-            seen: set[tuple[str, str, str | None]] = set()
-            for row in rows:
-                identity = (
-                    str(row["target_normalized"]),
-                    str(row["target_language"]),
-                    row["target_sense_id"],
-                )
-                if identity in seen:
-                    continue
-                seen.add(identity)
-                source_id = row["source_sense_id"]
-                results.append(
-                    {
-                        "source_term": row["source_term"],
-                        "source_language": language,
-                        "source_sense_id": source_id,
-                        "sense_scope": sense_scope(source_id),
-                        "relation": row["relation"],
-                        "target_term": row["target_term"],
-                        "target_language": row["target_language"],
-                        "target_sense_id": row["target_sense_id"],
-                        "direction": row["direction"],
-                        "provenance": _provenance(row),
-                    }
-                )
-                if len(results) == limit:
-                    break
+        rows = self._relation_rows(
+            key,
+            language,
+            _RELATION_CODES[relation],
+            target_language=target_language,
+            source_sense_id=sense_id,
+            limit=limit * 2,
+        )
+        seen: set[tuple[str, str, str | None, str | None]] = set()
+        for row in rows:
+            identity = (
+                str(row["target_normalized"]),
+                str(row["target_language"]),
+                row["source_sense_id"],
+                row["target_sense_id"],
+            )
+            if identity in seen:
+                continue
+            seen.add(identity)
+            source_id = row["source_sense_id"]
+            relation_code = int(row["relation_code"])
+            direction_code = int(row["direction_code"])
+            try:
+                relation_name = _RELATION_NAMES[relation_code]
+                direction_name = _DIRECTION_NAMES[direction_code]
+            except KeyError as exc:  # artifact corruption, not model input
+                raise RuntimeError("Relation artifact contains an unknown code") from exc
+            results.append(
+                {
+                    "source_term": row["source_term"],
+                    "source_language": row["source_language"],
+                    "source_sense_id": source_id,
+                    "sense_scope": sense_scope(source_id),
+                    "relation": relation_name,
+                    "target_term": row["target_term"],
+                    "target_language": row["target_language"],
+                    "target_sense_id": row["target_sense_id"],
+                    "direction": direction_name,
+                    "provenance": _provenance(row),
+                }
+            )
+            if len(results) == limit:
+                break
         return self._response(
             "dictionary_relations",
             {
@@ -647,72 +817,12 @@ class LexiconService:
         original = text.strip() if isinstance(text, str) else text
         key = normalize_key(text, field="text", allow_wildcards=mode == "spelled_like")
         limit = validate_limit(limit)
-        rows = self._load_wordplay_rows()
-        source_pronunciations = [
-            phonemes for _word, normalized, phonemes in rows if normalized == key
-        ]
-        source_phoneme_set = set(source_pronunciations)
-        source_rhymes = {_phoneme_rhyme(phonemes) for phonemes in source_pronunciations}
-        results: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        for word, normalized, phonemes in rows:
-            if normalized == key or normalized in seen:
-                continue
-            match_kind: str | None = None
-            if mode == "prefix" and normalized.startswith(key):
-                match_kind = "prefix"
-            elif mode == "spelled_like" and _spelling_pattern_matches(key, normalized):
-                match_kind = "spelled_like"
-            elif mode == "sounds_like" and phonemes in source_phoneme_set:
-                match_kind = "sounds_like"
-            elif mode == "rhyme" and source_rhymes and _phoneme_rhyme(phonemes) in source_rhymes:
-                match_kind = "rhyme"
-            elif mode == "near_rhyme" and source_rhymes:
-                candidate_rhyme = _phoneme_rhyme(phonemes)
-                if candidate_rhyme not in source_rhymes and any(
-                    _token_edit_distance(candidate_rhyme, source_rhyme) == 1
-                    for source_rhyme in source_rhymes
-                ):
-                    match_kind = "near_rhyme"
-            if match_kind is None:
-                continue
-            seen.add(normalized)
-            results.append(
-                {
-                    "term": word,
-                    "language": "en",
-                    "mode": match_kind,
-                    "phonemes": phonemes,
-                    "sense_scope": "unsensed",
-                    "provenance": dict(_CMU_PROVENANCE),
-                }
-            )
-            if len(results) == limit:
-                break
+        results = self._wordplay.search(mode, key, limit=limit)
         return self._response(
             "dictionary_wordplay",
             {"text": original, "normalized_text": key, "language": "en", "mode": mode},
             results,
         )
-
-    def _load_wordplay_rows(self) -> tuple[tuple[str, str, str], ...]:
-        with self._lock:
-            if self._wordplay_rows is not None:
-                return self._wordplay_rows
-            if "pronunciations_words" not in self._tables:
-                self._wordplay_rows = ()
-            else:
-                self._wordplay_rows = tuple(
-                    (str(row["word"]), str(row["normalized_word"]), str(row["phonemes"]))
-                    for row in self._connection.execute(
-                        """
-                        SELECT word, normalized_word, phonemes
-                        FROM pronunciations_words
-                        ORDER BY normalized_word, phonemes
-                        """
-                    ).fetchall()
-                )
-            return self._wordplay_rows
 
     @staticmethod
     def _validate_sense_id(value: str | None) -> str | None:

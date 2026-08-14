@@ -59,6 +59,7 @@ def main() -> None:
         args.build_state,
         dataset_version=args.dataset_version,
         retrieved_at=args.retrieved_at,
+        enforce_corpus_floors=True,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
 

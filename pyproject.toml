@@ -23,8 +23,6 @@ dependencies = [
 [project.optional-dependencies]
 build = [
   "orjson>=3.10,<4",
-  "ijson>=3.4,<4",
-  "marisa-trie>=1.3,<2",
 ]
 test = [
   "pytest>=8.4,<9",
@@ -47,11 +45,13 @@ packages = ["src/lexicon_mcp"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 addopts = "-ra --strict-markers"
 markers = [
   "full_corpus: requires the installed full multilingual corpus",
   "live_stack: requires the running MCPO/Open WebUI stack",
   "performance: resource and latency acceptance tests",
+  "ann: exact-cosine semantic-index recall acceptance tests",
 ]
 
 [tool.ruff]

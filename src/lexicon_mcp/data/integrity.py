@@ -59,6 +59,25 @@ def sqlite_count(path: Path, table: str) -> int:
     return int(row[0])
 
 
+def sqlite_metadata_value(path: Path, key: str) -> str:
+    """Read one required metadata value from an immutable SQLite artifact."""
+
+    uri = path.resolve().as_uri() + "?mode=ro&immutable=1"
+    try:
+        connection = sqlite3.connect(uri, uri=True)
+        try:
+            row = connection.execute(
+                "SELECT value FROM metadata WHERE key = ?", (key,)
+            ).fetchone()
+        finally:
+            connection.close()
+    except sqlite3.Error as exc:
+        raise IntegrityError(f"unable to read SQLite metadata from {path}: {exc}") from exc
+    if row is None:
+        raise IntegrityError(f"SQLite metadata {key!r} is missing from {path}")
+    return str(row[0])
+
+
 def default_semantic_count(path: Path, component: Component) -> int:
     """Read an index/mapping count without loading all vectors into memory."""
 
@@ -126,6 +145,18 @@ def verify_component(
             sqlite_quick_check(path)
         except IntegrityError as exc:
             problems.append(f"{component.id}: {exc}")
+    expected_schema = component.integrity.get("dataset_schema_version")
+    if expected_schema is not None:
+        try:
+            actual_schema = sqlite_metadata_value(path, "schema_version")
+        except IntegrityError as exc:
+            problems.append(f"{component.id}: {exc}")
+        else:
+            if actual_schema != str(expected_schema):
+                problems.append(
+                    f"{component.id}: dataset schema version mismatch "
+                    f"(expected {expected_schema}, got {actual_schema!r})"
+                )
     expected_count = component.integrity.get("semantic_count")
     actual_count: int | None = None
     if expected_count is not None:

@@ -82,9 +82,15 @@ def iter_text_lines(path: Path) -> Iterator[tuple[int, str]]:
 
 
 def configure_build_db(connection: sqlite3.Connection) -> None:
+    # Page size must be set before the first table is created. The negative
+    # cache size is KiB and keeps the bulk importer bounded at roughly 256 MiB.
+    connection.execute("PRAGMA page_size=32768")
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute("PRAGMA synchronous=NORMAL")
     connection.execute("PRAGMA temp_store=FILE")
+    connection.execute("PRAGMA cache_size=-262144")
+    connection.execute("PRAGMA mmap_size=268435456")
+    connection.execute("PRAGMA wal_autocheckpoint=4096")
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA busy_timeout=30000")
 
@@ -118,16 +124,23 @@ class Checkpoints:
         return self.directory / f"{safe}.json"
 
     def complete(self, stage: str, fingerprint: str) -> bool:
+        return self.record(stage, fingerprint) is not None
+
+    def record(self, stage: str, fingerprint: str) -> dict[str, Any] | None:
+        """Return one matching completed marker, or ``None`` when stale/invalid."""
+
         path = self._path(stage)
         if not path.exists():
-            return False
+            return None
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            return False
-        return bool(
-            value.get("state") == "complete" and value.get("fingerprint") == fingerprint
-        )
+            return None
+        if not isinstance(value, dict):
+            return None
+        if value.get("state") != "complete" or value.get("fingerprint") != fingerprint:
+            return None
+        return {str(key): item for key, item in value.items()}
 
     def mark(self, stage: str, fingerprint: str, **details: object) -> None:
         write_json_atomic(

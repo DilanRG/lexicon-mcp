@@ -9,6 +9,8 @@
       "retrieved_at": "2026-08-13T22:20:45Z",
       "sha256": "81917843c7f44ce2b094ac63873c2c7a4cf802040792c455ba3ca406891c3d22",
       "size": 3618488,
+      "row_count": 135166,
+      "row_digest": "81917843c7f44ce2b094ac63873c2c7a4cf802040792c455ba3ca406891c3d22",
       "license": "CMUdict BSD-style license"
     },
     {
@@ -19,6 +21,8 @@
       "retrieved_at": "2026-08-13T22:20:45Z",
       "sha256": "accd65fe94038584295574ddc26e1500c1919c8c4532bf771811cafd0948af7e",
       "size": 497963447,
+      "row_count": 34074917,
+      "row_digest": "40ad6e34b1bf86b013e46645fcb20e9b9c74091614c8b914c3c42f55c117afd2",
       "license": "CC-BY-SA-4.0"
     },
     {
@@ -29,6 +33,8 @@
       "retrieved_at": "2026-08-13T22:20:45Z",
       "sha256": "d6137c52374b43d5465dc2a38b610720110817d45376ec861457fe0d1f06b7f0",
       "size": 3191580656,
+      "row_count": 9161912,
+      "row_digest": "47eedbcd366551ad400ce3389eb295a3eef24bd87e13a0664bd42867f41f7798",
       "license": "CC-BY-SA-4.0"
     },
     {
@@ -39,6 +45,8 @@
       "retrieved_at": "2026-08-13T22:20:45Z",
       "sha256": "9ca6d1dcb75f822fdd66617f7d9da48142ace38dd544d6ad5e2feca1674ad3fe",
       "size": 11363503,
+      "row_count": 1120304,
+      "row_digest": "f76c81db8886deb9cf93b5c04a9836d9f9645a3f4758e9ab6b757fe4cb50493e",
       "license": "CC-BY-4.0 and Princeton WordNet License"
     },
     {
@@ -49,6 +57,8 @@
       "retrieved_at": "2026-08-13T22:20:45Z",
       "sha256": "70aed691c8b06e44e336ff5bc17e32d9bfcfa8cf3185bdeafb3974af95a6384a",
       "size": 2826620052,
+      "row_count": 10806865,
+      "row_digest": "66870cb96d1ed14a2cc7b9d42293347bb7832e936445d8309c171a629b04d8a9",
       "license": "CC-BY-SA-4.0 and GFDL-1.3-or-later"
     }
   ]

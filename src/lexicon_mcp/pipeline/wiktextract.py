@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 import sqlite3
 from pathlib import Path
 from typing import Any
 
 from .common import checked_language, iter_text_lines, normalize_term, stable_id
+from .constants import DIRECTION_CODES, RELATION_CODES
+from .interner import CorpusInterner
+
+try:
+    _orjson: Any = importlib.import_module("orjson")
+except ImportError:  # pragma: no cover - standard-library fallback
+    _orjson = None
 
 SOURCE = "Wiktionary via Wiktextract"
 SOURCE_LICENSE = "CC-BY-SA-4.0 and GFDL-1.3-or-later"
@@ -16,6 +24,10 @@ SOURCE_URL = "https://kaikki.org/"
 
 def _objects(value: object) -> list[dict[str, Any]]:
     return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+
+def _load_json(line: str) -> object:
+    return _orjson.loads(line) if _orjson is not None else json.loads(line)
 
 
 def _strings(value: object) -> list[str]:
@@ -33,25 +45,91 @@ def _item_term(item: dict[str, Any]) -> str | None:
 
 
 def _sense_id(
-    word: str,
-    language: str,
-    part_of_speech: str | None,
+    entry_id: str,
     sense: dict[str, Any],
     position: int,
 ) -> str:
-    native = sense.get("id") or sense.get("senseid") or sense.get("sense_id")
+    native_value = sense.get("id") or sense.get("senseid") or sense.get("sense_id")
+    native: object
+    if isinstance(native_value, list):
+        native = tuple(sorted(str(item) for item in native_value))
+    elif native_value is None:
+        native = None
+    else:
+        native = str(native_value)
+    return stable_id("wikt:sense", entry_id, native, _strings(sense.get("glosses")), position)
+
+
+def _unsensed_id(entry_id: str) -> str:
+    return stable_id("wikt:unsensed", entry_id)
+
+
+def _labeled_id(
+    entry_id: str,
+    label: str,
+) -> str:
+    """Return a stable ID for an explicit source label, without sense matching."""
+
+    return stable_id("wikt:labeled", entry_id, label)
+
+
+def _entry_id(
+    word: str,
+    language: str,
+    part_of_speech: str | None,
+    entry: dict[str, Any],
+    source_position: int,
+) -> str:
     return stable_id(
-        f"wikt:{language}",
+        "wikt:entry",
+        language,
         word,
         part_of_speech,
-        native,
-        _strings(sense.get("glosses")),
-        position,
+        entry.get("etymology_number"),
+        _entry_etymology(entry),
+        source_position,
     )
 
 
-def _unsensed_id(word: str, language: str, part_of_speech: str | None) -> str:
-    return stable_id("wikt:unsensed", language, word, part_of_speech)
+def _item_sense_label(item: dict[str, Any]) -> str | None:
+    """Preserve a non-empty Wiktextract relation label exactly as supplied."""
+
+    value = item.get("sense")
+    return value if isinstance(value, str) and value.strip() else None
+
+
+def _entry_relation_groups(
+    entry: dict[str, Any],
+) -> dict[str | None, dict[str, list[dict[str, Any]]]]:
+    """Group entry-level lexical facts by their explicit source sense label.
+
+    The labels are not compared with, or attached to, Wiktextract sense
+    glosses. That would be heuristic linking. Equal exact labels share one
+    standalone source-sense row; missing labels share the unsensed row.
+    """
+
+    groups: dict[str | None, dict[str, list[dict[str, Any]]]] = {}
+    for relation in ("translations", "synonyms", "antonyms"):
+        for item in _objects(entry.get(relation)):
+            label = _item_sense_label(item)
+            group = groups.setdefault(
+                label,
+                {"translations": [], "synonyms": [], "antonyms": []},
+            )
+            group[relation].append(item)
+    return groups
+
+
+def _insert_source_sense(
+    connection: sqlite3.Connection,
+    sense_id: str,
+    entry_id: str,
+    gloss: str | None,
+) -> None:
+    connection.execute(
+        "INSERT OR REPLACE INTO senses VALUES (?,?,?)",
+        (sense_id, entry_id, gloss),
+    )
 
 
 def build_wiktextract(
@@ -67,92 +145,197 @@ def build_wiktextract(
         "translations": 0,
         "synonyms": 0,
         "antonyms": 0,
+        "labeled_senses": 0,
+        "unsensed_senses": 0,
+        "language_codes": 0,
         "malformed": 0,
     }
+    language_codes: set[str] = set()
+    interner = CorpusInterner(connection)
+    provenance_id = interner.provenance(SOURCE, SOURCE_LICENSE, SOURCE_URL)
+    # A stage can be resumed after committed batches. Remove only this source's
+    # rows so restart is idempotent while preserving completed earlier stages.
+    connection.execute("DELETE FROM relations WHERE provenance_id=?", (provenance_id,))
+    connection.execute("DELETE FROM lexical_entries WHERE provenance_id=?", (provenance_id,))
+    connection.commit()
+    source_position = 0
     for path in sorted(paths, key=lambda item: item.as_posix()):
         for _line_number, line in iter_text_lines(path):
             if not line.strip():
                 continue
             try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
+                entry = _load_json(line)
+            except ValueError:
                 counts["malformed"] += 1
                 continue
             if not isinstance(entry, dict):
                 counts["malformed"] += 1
                 continue
+            source_position += 1
             word = str(entry.get("word") or "").strip()
             if not word:
                 counts["malformed"] += 1
                 continue
             language = checked_language(entry.get("lang_code") or entry.get("language_code"))
+            if language != "und":
+                language_codes.add(language)
             part_of_speech = str(entry.get("pos") or "").strip() or None
             etymology = _entry_etymology(entry)
+            entry_id = _entry_id(word, language, part_of_speech, entry, source_position)
+            term_id = interner.term(word, language)
+            connection.execute(
+                "INSERT INTO lexical_entries VALUES (?,?,?,?,?)",
+                (entry_id, term_id, part_of_speech, etymology, provenance_id),
+            )
             sense_ids: list[str] = []
             for position, sense in enumerate(_objects(entry.get("senses"))):
-                sense_id = _sense_id(word, language, part_of_speech, sense, position)
+                sense_id = _sense_id(entry_id, sense, position)
                 glosses = _strings(sense.get("glosses")) or _strings(sense.get("raw_glosses"))
-                connection.execute(
-                    """INSERT OR REPLACE INTO senses VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                    (
-                        sense_id,
-                        word,
-                        normalize_term(word),
-                        language,
-                        part_of_speech,
-                        "; ".join(glosses) or None,
-                        etymology,
-                        SOURCE,
-                        SOURCE_LICENSE,
-                        SOURCE_URL,
-                    ),
+                _insert_source_sense(
+                    connection,
+                    sense_id,
+                    entry_id,
+                    "; ".join(glosses) or None,
                 )
                 _insert_examples(connection, sense_id, sense, counts)
                 _insert_synonyms(
-                    connection, sense_id, word, language, part_of_speech, sense, counts
+                    connection,
+                    interner,
+                    provenance_id,
+                    sense_id,
+                    word,
+                    language,
+                    part_of_speech,
+                    sense,
+                    counts,
                 )
-                _insert_antonyms(connection, sense_id, word, language, sense, counts)
+                _insert_antonyms(
+                    connection,
+                    interner,
+                    provenance_id,
+                    sense_id,
+                    word,
+                    language,
+                    sense,
+                    counts,
+                )
                 _insert_translations(
-                    connection, sense_id, language, part_of_speech, sense, counts
+                    connection,
+                    interner,
+                    provenance_id,
+                    sense_id,
+                    language,
+                    part_of_speech,
+                    sense,
+                    counts,
                 )
                 sense_ids.append(sense_id)
                 counts["senses"] += 1
 
-            entry_level = any(
-                entry.get(key)
-                for key in ("sounds", "translations", "synonyms", "antonyms", "etymology_text")
+            relation_groups = _entry_relation_groups(entry)
+            needs_unsensed = bool(
+                None in relation_groups
+                or (not sense_ids and not any(label is not None for label in relation_groups))
             )
-            if entry_level or not sense_ids:
-                unsensed_id = _unsensed_id(word, language, part_of_speech)
-                connection.execute(
-                    "INSERT OR REPLACE INTO senses VALUES (?,?,?,?,?,?,?,?,?,?)",
-                    (
+            if needs_unsensed:
+                unsensed_id = _unsensed_id(entry_id)
+                _insert_source_sense(
+                    connection,
+                    unsensed_id,
+                    entry_id,
+                    None,
+                )
+                unlabeled = relation_groups.get(None)
+                if unlabeled:
+                    _insert_relation_group(
+                        connection,
+                        interner,
+                        provenance_id,
                         unsensed_id,
                         word,
-                        normalize_term(word),
                         language,
                         part_of_speech,
-                        None,
-                        etymology,
-                        SOURCE,
-                        SOURCE_LICENSE,
-                        SOURCE_URL,
-                    ),
+                        unlabeled,
+                        counts,
+                    )
+                counts["senses"] += 1
+                counts["unsensed_senses"] += 1
+            _insert_pronunciations(connection, entry_id, entry, counts)
+            for label, group in relation_groups.items():
+                if label is None:
+                    continue
+                sense_id = _labeled_id(entry_id, label)
+                _insert_source_sense(
+                    connection,
+                    sense_id,
+                    entry_id,
+                    label,
                 )
-                _insert_pronunciations(connection, unsensed_id, entry, counts)
-                _insert_synonyms(
-                    connection, unsensed_id, word, language, part_of_speech, entry, counts
-                )
-                _insert_antonyms(connection, unsensed_id, word, language, entry, counts)
-                _insert_translations(
-                    connection, unsensed_id, language, part_of_speech, entry, counts
+                _insert_relation_group(
+                    connection,
+                    interner,
+                    provenance_id,
+                    sense_id,
+                    word,
+                    language,
+                    part_of_speech,
+                    group,
+                    counts,
                 )
                 counts["senses"] += 1
+                counts["labeled_senses"] += 1
             counts["entries"] += 1
             if counts["entries"] % commit_interval == 0:
                 connection.commit()
     connection.commit()
+    counts["language_codes"] = len(language_codes)
     return counts
+
+
+def _insert_relation_group(
+    connection: sqlite3.Connection,
+    interner: CorpusInterner,
+    provenance_id: int,
+    sense_id: str,
+    source_word: str,
+    language: str,
+    part_of_speech: str | None,
+    group: dict[str, list[dict[str, Any]]],
+    counts: dict[str, int],
+) -> None:
+    """Insert one exact-label or unlabeled group through shared relation paths."""
+
+    _insert_synonyms(
+        connection,
+        interner,
+        provenance_id,
+        sense_id,
+        source_word,
+        language,
+        part_of_speech,
+        {"synonyms": group["synonyms"]},
+        counts,
+    )
+    _insert_antonyms(
+        connection,
+        interner,
+        provenance_id,
+        sense_id,
+        source_word,
+        language,
+        {"antonyms": group["antonyms"]},
+        counts,
+    )
+    _insert_translations(
+        connection,
+        interner,
+        provenance_id,
+        sense_id,
+        language,
+        part_of_speech,
+        {"translations": group["translations"]},
+        counts,
+    )
 
 
 def _entry_etymology(entry: dict[str, Any]) -> str | None:
@@ -181,7 +364,7 @@ def _insert_examples(
 
 def _insert_pronunciations(
     connection: sqlite3.Connection,
-    sense_id: str,
+    entry_id: str,
     container: dict[str, Any],
     counts: dict[str, int],
 ) -> None:
@@ -199,7 +382,7 @@ def _insert_pronunciations(
         seen.add(value)
         connection.execute(
             "INSERT OR REPLACE INTO pronunciations VALUES (?,?,?,?)",
-            (sense_id, value[0], value[1], position),
+            (entry_id, value[0], value[1], position),
         )
         position += 1
         counts["pronunciations"] += 1
@@ -207,6 +390,8 @@ def _insert_pronunciations(
 
 def _insert_synonyms(
     connection: sqlite3.Connection,
+    interner: CorpusInterner,
+    provenance_id: int,
     sense_id: str,
     source_word: str,
     language: str,
@@ -226,16 +411,12 @@ def _insert_synonyms(
             continue
         seen.add(marker)
         connection.execute(
-            "INSERT OR IGNORE INTO synonyms VALUES (?,?,?,?,?,?,?,?,?)",
+            "INSERT OR IGNORE INTO synonyms VALUES (?,?,?,?,?)",
             (
                 sense_id,
-                term,
-                marker[1],
-                target_language,
+                interner.term(term, target_language),
                 part_of_speech,
-                SOURCE,
-                SOURCE_LICENSE,
-                SOURCE_URL,
+                provenance_id,
                 position,
             ),
         )
@@ -245,19 +426,28 @@ def _insert_synonyms(
 
 def _insert_antonyms(
     connection: sqlite3.Connection,
+    interner: CorpusInterner,
+    provenance_id: int,
     sense_id: str,
     source_word: str,
     language: str,
     container: dict[str, Any],
     counts: dict[str, int],
 ) -> None:
+    seen: set[tuple[str, str]] = set()
     for item in _objects(container.get("antonyms")):
         term = _item_term(item)
         if not term:
             continue
         target_language = checked_language(item.get("lang_code"), language)
-        _relation(
+        marker = (target_language, normalize_term(term))
+        if marker in seen:
+            continue
+        seen.add(marker)
+        inserted = _relation(
             connection,
+            interner,
+            provenance_id,
             source_word,
             language,
             sense_id,
@@ -267,11 +457,13 @@ def _insert_antonyms(
             None,
             "symmetric",
         )
-        counts["antonyms"] += 1
+        counts["antonyms"] += int(inserted)
 
 
 def _insert_translations(
     connection: sqlite3.Connection,
+    interner: CorpusInterner,
+    provenance_id: int,
     sense_id: str,
     language: str,
     part_of_speech: str | None,
@@ -290,16 +482,12 @@ def _insert_translations(
             continue
         seen.add(marker)
         connection.execute(
-            "INSERT OR IGNORE INTO translations VALUES (?,?,?,?,?,?,?,?,?)",
+            "INSERT OR IGNORE INTO translations VALUES (?,?,?,?,?)",
             (
                 sense_id,
-                target_language,
-                term,
-                marker[1],
+                interner.term(term, target_language),
                 str(item.get("pos") or part_of_speech or "").strip() or None,
-                SOURCE,
-                SOURCE_LICENSE,
-                SOURCE_URL,
+                provenance_id,
                 position,
             ),
         )
@@ -309,6 +497,8 @@ def _insert_translations(
 
 def _relation(
     connection: sqlite3.Connection,
+    interner: CorpusInterner,
+    provenance_id: int,
     source_word: str,
     source_language: str,
     source_sense_id: str | None,
@@ -317,22 +507,17 @@ def _relation(
     target_language: str,
     target_sense_id: str | None,
     direction: str,
-) -> None:
-    connection.execute(
-        "INSERT OR IGNORE INTO relations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+) -> bool:
+    cursor = connection.execute(
+        "INSERT OR IGNORE INTO relations VALUES (?,?,?,?,?,?,?)",
         (
-            source_word,
-            normalize_term(source_word),
-            source_language,
+            interner.term(source_word, source_language),
             source_sense_id,
-            relation,
-            target_word,
-            normalize_term(target_word),
-            target_language,
+            RELATION_CODES[relation],
+            interner.term(target_word, target_language),
             target_sense_id,
-            direction,
-            SOURCE,
-            SOURCE_LICENSE,
-            SOURCE_URL,
+            DIRECTION_CODES[direction],
+            provenance_id,
         ),
     )
+    return cursor.rowcount > 0

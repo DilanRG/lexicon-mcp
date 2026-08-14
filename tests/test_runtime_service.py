@@ -7,8 +7,12 @@ from typing import Any
 
 import pytest
 
-from lexicon_mcp.pipeline.schema import create_lexical_schema
+from lexicon_mcp.pipeline.schema import (
+    create_lexical_query_indexes,
+    create_lexical_schema,
+)
 from lexicon_mcp.runtime.locator import DatasetLocator
+from lexicon_mcp.runtime.normalization import normalize_key, normalize_language
 from lexicon_mcp.runtime.service import LexiconService
 
 
@@ -47,7 +51,7 @@ class FakeSemanticSearch:
         return None
 
 
-def _insert_fixture_data(connection: sqlite3.Connection) -> None:
+def _insert_legacy_fixture_data(connection: sqlite3.Connection) -> None:
     source = ("Wiktextract", "CC-BY-SA-4.0", "https://kaikki.org/")
     senses = [
         (
@@ -242,12 +246,129 @@ def _insert_fixture_data(connection: sqlite3.Connection) -> None:
     connection.commit()
 
 
+def _insert_fixture_data(connection: sqlite3.Connection) -> None:
+    connection.executemany(
+        "INSERT INTO provenance VALUES (?, ?, ?, ?)",
+        [
+            (1, "Open English WordNet", "CC-BY-4.0", "https://en-word.net/"),
+            (2, "Wiktextract", "CC-BY-SA-4.0", "https://kaikki.org/"),
+            (3, "ConceptNet", "CC-BY-SA-4.0", "https://conceptnet.io/"),
+        ],
+    )
+    terms = [
+        (1, "bank", "bank", "en"),
+        (2, "lead", "lead", "en"),
+        (3, "bright", "bright", "en"),
+        (4, "café", "café", "fr"),
+        (5, "Bank", "bank", "de"),
+        (6, "Ufer", "ufer", "de"),
+        (7, "financial institution", "financial institution", "en"),
+        (8, "riverbank", "riverbank", "en"),
+        (9, "luminous", "luminous", "en"),
+        (10, "dog", "dog", "en"),
+        (11, "animal", "animal", "en"),
+        (12, "radiant", "radiant", "en"),
+        (13, "cat", "cat", "en"),
+        (14, "bat", "bat", "en"),
+        (15, "kit", "kit", "en"),
+        (16, "night", "night", "en"),
+        (17, "knight", "knight", "en"),
+        (18, "hello", "hello", "en"),
+        (19, "hallo", "hallo", "en"),
+        (20, "help", "help", "en"),
+        (21, "wheel", "wheel", "en"),
+        (22, "car", "car", "en"),
+        (23, "shared candidate", "shared candidate", "en"),
+    ]
+    connection.executemany("INSERT INTO lexical_terms VALUES (?, ?, ?, ?)", terms)
+    connection.executemany(
+        "INSERT INTO lexical_entries VALUES (?, ?, ?, ?, ?)",
+        [
+            ("entry:bank-finance", 1, "noun", "From Italian banca.", 1),
+            ("entry:bank-river", 1, "noun", None, 1),
+            ("entry:lead-metal", 2, "noun", None, 2),
+            ("entry:lead-verb", 2, "verb", None, 2),
+            ("entry:bright", 3, "adjective", None, 2),
+            ("entry:cafe", 4, "noun", None, 2),
+        ],
+    )
+    connection.executemany(
+        "INSERT INTO senses VALUES (?, ?, ?)",
+        [
+            ("oewn:bank-finance-n", "entry:bank-finance", "A financial institution."),
+            ("oewn:bank-river-n", "entry:bank-river", "Sloping land beside a river."),
+            ("wikt:lead-metal", "entry:lead-metal", "A heavy metallic element."),
+            ("wikt:lead-verb", "entry:lead-verb", "To guide."),
+            ("wikt:unsensed:bright-adj", "entry:bright", None),
+            (
+                "wikt:cafe-fr",
+                "entry:cafe",
+                "Établissement où l'on sert des boissons.",
+            ),
+        ],
+    )
+    connection.executemany(
+        "INSERT INTO examples VALUES (?, ?, ?)",
+        [
+            ("oewn:bank-finance-n", "She deposited money at the bank.", 0),
+            ("oewn:bank-river-n", "They sat on the river bank.", 0),
+        ],
+    )
+    connection.executemany(
+        "INSERT INTO pronunciations VALUES (?, ?, ?, ?)",
+        [
+            ("entry:lead-metal", "/lɛd/", "", 0),
+            ("entry:lead-verb", "/li\u02d0d/", "", 0),
+        ],
+    )
+    connection.executemany(
+        "INSERT INTO translations VALUES (?, ?, ?, ?, ?)",
+        [
+            ("oewn:bank-finance-n", 5, "noun", 2, 0),
+            ("oewn:bank-river-n", 6, "noun", 2, 0),
+        ],
+    )
+    connection.executemany(
+        "INSERT INTO synonyms VALUES (?, ?, ?, ?, ?)",
+        [
+            ("oewn:bank-finance-n", 7, "noun", 1, 0),
+            ("oewn:bank-finance-n", 23, "noun", 1, 1),
+            ("oewn:bank-river-n", 8, "noun", 1, 0),
+            ("oewn:bank-river-n", 23, "noun", 1, 1),
+            ("wikt:unsensed:bright-adj", 9, "adjective", 2, 0),
+        ],
+    )
+    connection.executemany(
+        "INSERT INTO relations VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [
+            (10, None, 3, 11, None, 1, 3),
+            (3, None, 1, 12, None, 3, 3),
+            (21, None, 6, 22, None, 1, 3),
+        ],
+    )
+    connection.executemany(
+        "INSERT INTO pronunciations_words VALUES (?, ?, ?)",
+        [
+            (13, "K AE1 T", "AE1 T"),
+            (14, "B AE1 T", "AE1 T"),
+            (15, "K IH1 T", "IH1 T"),
+            (16, "N AY1 T", "AY1 T"),
+            (17, "N AY1 T", "AY1 T"),
+            (18, "HH AH0 L OW1", "OW1"),
+            (19, "HH AE1 L OW0", "AE1 L OW0"),
+            (20, "HH EH1 L P", "EH1 L P"),
+        ],
+    )
+    connection.commit()
+
+
 @pytest.fixture()
 def lexical_database(tmp_path: Path) -> Path:
     path = tmp_path / "lexicon.sqlite3"
     with sqlite3.connect(path) as connection:
         create_lexical_schema(connection, "data-test-v1")
         _insert_fixture_data(connection)
+        create_lexical_query_indexes(connection)
     return path
 
 
@@ -282,6 +403,10 @@ def test_lookup_uses_nfkc_casefold_and_returns_typed_oov(service: LexiconService
     assert result["query"]["word"] == "ＣＡＦÉ"
     assert result["query"]["normalized_word"] == "café"
     assert result["results"][0]["word"] == "café"
+    assert service.dictionary_lookup("cafe\u0301", "fr")["results"][0]["word"] == "café"
+    assert normalize_key("  two\u2003  words  ") == "two words"
+    assert normalize_language("zh-Hant") == "zh-hant"
+    assert normalize_language("PT_br") == "pt-br"
 
     oov = service.dictionary_lookup("definitely-not-present", "en")
     assert oov == {
@@ -304,9 +429,18 @@ def test_synonyms_are_sense_grouped_and_unsensed_is_explicit(service: LexiconSer
     )
     assert finance["count"] == 1
     assert [item["term"] for item in finance["results"][0]["synonyms"]] == [
-        "financial institution"
+        "financial institution",
+        "shared candidate",
     ]
     assert finance["results"][0]["sense_scope"] == "sense"
+
+    all_bank = service.dictionary_synonyms("bank")
+    shared_scopes = {
+        group["sense_id"]
+        for group in all_bank["results"]
+        if any(item["term"] == "shared candidate" for item in group["synonyms"])
+    }
+    assert shared_scopes == {"oewn:bank-finance-n", "oewn:bank-river-n"}
 
     bright = service.dictionary_synonyms("bright")
     groups = {group["sense_id"]: group for group in bright["results"]}
@@ -345,9 +479,25 @@ def test_relations_include_direction_language_and_unsensed_scope(service: Lexico
     assert result["count"] == 1
     relation = result["results"][0]
     assert relation["target_term"] == "animal"
-    assert relation["direction"] == "outgoing"
+    assert relation["direction"] == "outbound"
     assert relation["source_language"] == relation["target_language"] == "en"
     assert relation["sense_scope"] == "unsensed"
+
+
+def test_relations_orient_one_physical_assertion_both_ways(
+    service: LexiconService,
+) -> None:
+    animal = service.dictionary_relations("animal", "hyponym")
+    assert [item["target_term"] for item in animal["results"]] == ["dog"]
+    assert animal["results"][0]["direction"] == "inbound"
+
+    wheel = service.dictionary_relations("wheel", "holonym")
+    assert [item["target_term"] for item in wheel["results"]] == ["car"]
+    assert wheel["results"][0]["direction"] == "outbound"
+
+    car = service.dictionary_relations("car", "meronym")
+    assert [item["target_term"] for item in car["results"]] == ["wheel"]
+    assert car["results"][0]["direction"] == "inbound"
 
 
 def test_wordplay_modes_are_deterministic_and_exclude_query(service: LexiconService) -> None:

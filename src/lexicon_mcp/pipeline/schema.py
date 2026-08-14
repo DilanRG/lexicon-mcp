@@ -1,4 +1,8 @@
-"""Stable on-disk schema shared by builders and the query runtime."""
+"""Compact v2 on-disk schema shared by corpus builders and query runtime.
+
+No v1 dataset was publicly released, so no migration is required.  Builders
+always create v2 artifacts from pinned upstream sources.
+"""
 
 from __future__ import annotations
 
@@ -6,123 +10,146 @@ import sqlite3
 
 from .constants import SCHEMA_VERSION
 
-LEXICAL_SCHEMA = """
+DIMENSION_SCHEMA = """
+CREATE TABLE IF NOT EXISTS provenance (
+    provenance_id INTEGER PRIMARY KEY,
+    source TEXT NOT NULL,
+    source_license TEXT NOT NULL,
+    source_url TEXT NOT NULL,
+    UNIQUE (source, source_license, source_url)
+);
+CREATE TABLE IF NOT EXISTS lexical_terms (
+    term_id INTEGER PRIMARY KEY,
+    term TEXT NOT NULL,
+    normalized_term TEXT NOT NULL,
+    language TEXT NOT NULL,
+    UNIQUE (language, normalized_term, term)
+);
+"""
+
+LEXICAL_SCHEMA = (
+    """
 CREATE TABLE IF NOT EXISTS metadata (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+"""
+    + DIMENSION_SCHEMA
+    + """
+CREATE TABLE IF NOT EXISTS lexical_entries (
+    entry_id TEXT PRIMARY KEY,
+    term_id INTEGER NOT NULL REFERENCES lexical_terms(term_id),
+    part_of_speech TEXT,
+    etymology TEXT,
+    provenance_id INTEGER NOT NULL REFERENCES provenance(provenance_id)
+);
 CREATE TABLE IF NOT EXISTS senses (
     sense_id TEXT PRIMARY KEY,
-    word TEXT NOT NULL,
-    normalized_word TEXT NOT NULL,
-    language TEXT NOT NULL,
-    part_of_speech TEXT,
-    gloss TEXT,
-    etymology TEXT,
-    source TEXT NOT NULL,
-    source_license TEXT NOT NULL,
-    source_url TEXT NOT NULL
+    entry_id TEXT NOT NULL REFERENCES lexical_entries(entry_id) ON DELETE CASCADE,
+    gloss TEXT
 );
 CREATE TABLE IF NOT EXISTS examples (
     sense_id TEXT NOT NULL REFERENCES senses(sense_id) ON DELETE CASCADE,
     example TEXT NOT NULL,
     position INTEGER NOT NULL,
     PRIMARY KEY (sense_id, position)
-);
+) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS pronunciations (
-    sense_id TEXT NOT NULL REFERENCES senses(sense_id) ON DELETE CASCADE,
+    entry_id TEXT NOT NULL REFERENCES lexical_entries(entry_id) ON DELETE CASCADE,
     ipa TEXT NOT NULL,
     region TEXT NOT NULL DEFAULT '',
     position INTEGER NOT NULL,
-    PRIMARY KEY (sense_id, position)
-);
+    PRIMARY KEY (entry_id, position)
+) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS translations (
     sense_id TEXT NOT NULL REFERENCES senses(sense_id) ON DELETE CASCADE,
-    target_language TEXT NOT NULL,
-    term TEXT NOT NULL,
-    normalized_term TEXT NOT NULL,
+    target_term_id INTEGER NOT NULL REFERENCES lexical_terms(term_id),
     part_of_speech TEXT,
-    source TEXT NOT NULL,
-    source_license TEXT NOT NULL,
-    source_url TEXT NOT NULL,
+    provenance_id INTEGER NOT NULL REFERENCES provenance(provenance_id),
     position INTEGER NOT NULL,
-    PRIMARY KEY (sense_id, target_language, normalized_term, position)
-);
+    PRIMARY KEY (sense_id, target_term_id, position)
+) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS synonyms (
     sense_id TEXT NOT NULL REFERENCES senses(sense_id) ON DELETE CASCADE,
-    term TEXT NOT NULL,
-    normalized_term TEXT NOT NULL,
-    language TEXT NOT NULL,
+    target_term_id INTEGER NOT NULL REFERENCES lexical_terms(term_id),
     part_of_speech TEXT,
-    source TEXT NOT NULL,
-    source_license TEXT NOT NULL,
-    source_url TEXT NOT NULL,
+    provenance_id INTEGER NOT NULL REFERENCES provenance(provenance_id),
     position INTEGER NOT NULL,
-    PRIMARY KEY (sense_id, language, normalized_term, position)
-);
+    PRIMARY KEY (sense_id, target_term_id, position)
+) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS relations (
-    source_term TEXT NOT NULL,
-    source_normalized TEXT NOT NULL,
-    source_language TEXT NOT NULL,
+    source_term_id INTEGER NOT NULL REFERENCES lexical_terms(term_id),
     source_sense_id TEXT,
-    relation TEXT NOT NULL,
-    target_term TEXT NOT NULL,
-    target_normalized TEXT NOT NULL,
-    target_language TEXT NOT NULL,
+    relation_code INTEGER NOT NULL CHECK (relation_code BETWEEN 1 AND 12),
+    target_term_id INTEGER NOT NULL REFERENCES lexical_terms(term_id),
     target_sense_id TEXT,
-    direction TEXT NOT NULL,
-    source TEXT NOT NULL,
-    source_license TEXT NOT NULL,
-    source_url TEXT NOT NULL
+    direction_code INTEGER NOT NULL CHECK (direction_code BETWEEN 1 AND 3),
+    provenance_id INTEGER NOT NULL REFERENCES provenance(provenance_id)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS relations_unique ON relations (
-    source_normalized, source_language, IFNULL(source_sense_id, ''), relation,
-    target_normalized, target_language, IFNULL(target_sense_id, ''), direction, source
+    source_term_id, IFNULL(source_sense_id, ''), relation_code,
+    target_term_id, IFNULL(target_sense_id, ''), direction_code, provenance_id
 );
 CREATE TABLE IF NOT EXISTS pronunciations_words (
-    word TEXT NOT NULL,
-    normalized_word TEXT NOT NULL,
+    term_id INTEGER NOT NULL REFERENCES lexical_terms(term_id),
     phonemes TEXT NOT NULL,
-    PRIMARY KEY (normalized_word, phonemes)
-);
-CREATE INDEX IF NOT EXISTS senses_lookup
-    ON senses(language, normalized_word, part_of_speech);
-CREATE INDEX IF NOT EXISTS translations_lookup
-    ON translations(target_language, normalized_term);
-CREATE INDEX IF NOT EXISTS synonyms_lookup
-    ON synonyms(language, normalized_term);
+    rhyme_key TEXT NOT NULL,
+    PRIMARY KEY (term_id, phonemes)
+) WITHOUT ROWID;
+"""
+)
+
+LEXICAL_QUERY_INDEXES = """
+CREATE INDEX IF NOT EXISTS lexical_entries_lookup
+    ON lexical_entries(term_id, part_of_speech);
+CREATE INDEX IF NOT EXISTS senses_entry_lookup
+    ON senses(entry_id);
 CREATE INDEX IF NOT EXISTS relations_source_lookup
-    ON relations(source_language, source_normalized, relation);
+    ON relations(source_term_id, relation_code);
 CREATE INDEX IF NOT EXISTS relations_target_lookup
-    ON relations(target_language, target_normalized, relation);
-CREATE INDEX IF NOT EXISTS pronunciations_words_lookup
-    ON pronunciations_words(normalized_word);
+    ON relations(target_term_id, relation_code);
+CREATE INDEX IF NOT EXISTS pronunciations_words_rhyme
+    ON pronunciations_words(rhyme_key);
+CREATE INDEX IF NOT EXISTS pronunciations_words_phonemes
+    ON pronunciations_words(phonemes);
+DROP TABLE IF EXISTS wordplay_fts;
+CREATE VIRTUAL TABLE wordplay_fts USING fts5(
+    normalized_term,
+    content='',
+    detail=none,
+    columnsize=0,
+    tokenize='unicode61 remove_diacritics 0',
+    prefix='2 3 4 5 6 7 8'
+);
 """
 
 
-SEMANTIC_SCHEMA = """
+SEMANTIC_SCHEMA = (
+    """
 CREATE TABLE IF NOT EXISTS metadata (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+"""
+    + DIMENSION_SCHEMA
+    + """
 CREATE TABLE IF NOT EXISTS semantic_terms (
     semantic_id INTEGER PRIMARY KEY,
     concept TEXT NOT NULL UNIQUE,
-    term TEXT NOT NULL,
-    normalized_term TEXT NOT NULL,
-    language TEXT NOT NULL,
-    vector_offset INTEGER NOT NULL UNIQUE,
-    source TEXT NOT NULL,
-    source_license TEXT NOT NULL,
-    source_url TEXT NOT NULL
+    term_id INTEGER NOT NULL REFERENCES lexical_terms(term_id),
+    vector_offset INTEGER NOT NULL UNIQUE
 );
 CREATE TABLE IF NOT EXISTS semantic_languages (
     language TEXT PRIMARY KEY,
     index_file TEXT NOT NULL,
     term_count INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS semantic_terms_lookup
-    ON semantic_terms(language, normalized_term);
+"""
+)
+
+SEMANTIC_QUERY_INDEXES = """
+CREATE INDEX IF NOT EXISTS semantic_terms_term_lookup
+    ON semantic_terms(term_id);
 """
 
 
@@ -154,4 +181,29 @@ def create_semantic_schema(
             ("index_dtype", "i8"),
         ),
     )
+    connection.commit()
+
+
+def create_lexical_query_indexes(connection: sqlite3.Connection) -> None:
+    """Create read-path B-tree and FTS5 indexes after bulk imports complete."""
+
+    connection.executescript(LEXICAL_QUERY_INDEXES)
+    connection.execute(
+        """INSERT INTO wordplay_fts(rowid, normalized_term)
+        SELECT DISTINCT term.term_id, term.normalized_term
+        FROM lexical_terms AS term
+        JOIN pronunciations_words AS pronunciation
+          ON pronunciation.term_id = term.term_id
+        WHERE term.language = 'en' AND term.normalized_term <> ''"""
+    )
+    connection.execute(
+        "INSERT INTO wordplay_fts(wordplay_fts) VALUES('integrity-check')"
+    )
+    connection.commit()
+
+
+def create_semantic_query_indexes(connection: sqlite3.Connection) -> None:
+    """Create semantic mapping read-path indexes after interning completes."""
+
+    connection.executescript(SEMANTIC_QUERY_INDEXES)
     connection.commit()

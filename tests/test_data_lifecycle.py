@@ -13,7 +13,7 @@ import pytest
 import zstandard
 from usearch.index import Index
 
-from lexicon_mcp.data.integrity import default_semantic_count
+from lexicon_mcp.data.integrity import default_semantic_count, verify_component
 from lexicon_mcp.data.lifecycle import (
     DatasetLifecycle,
     DownloadError,
@@ -107,6 +107,42 @@ def manifest_bytes(
     return (json.dumps(value, sort_keys=True) + "\n").encode()
 
 
+def write_local_zstd_package(
+    package_dir: Path,
+    final: bytes,
+    *,
+    version: str = "data-v1.0.0",
+) -> tuple[Path, tuple[bytes, bytes]]:
+    compressed = zstandard.ZstdCompressor(level=3, write_checksum=True).compress(final)
+    split_at = max(1, len(compressed) // 2)
+    part_payloads = (compressed[:split_at], compressed[split_at:])
+    part_names = (f"{version}-lexical.part0000", f"{version}-lexical.part0001")
+    value = json.loads(manifest_bytes(version, {"lexical": ("lexicon.sqlite3", final)}))
+    component = value["components"][0]
+    component.update(
+        {
+            "compression": "zstd",
+            "compressed_size": len(compressed),
+            "compressed_sha256": digest(compressed),
+            "parts": [
+                {
+                    "name": name,
+                    "size": len(payload),
+                    "sha256": digest(payload),
+                    "offset": sum(len(previous) for previous in part_payloads[:index]),
+                }
+                for index, (name, payload) in enumerate(zip(part_names, part_payloads, strict=True))
+            ],
+        }
+    )
+    package_dir.mkdir(parents=True)
+    for name, payload in zip(part_names, part_payloads, strict=True):
+        (package_dir / name).write_bytes(payload)
+    manifest_path = package_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
+    return manifest_path, part_payloads
+
+
 class InterruptingBody(io.BytesIO):
     def __init__(self, payload: bytes, cutoff: int) -> None:
         super().__init__(payload)
@@ -140,6 +176,15 @@ class FakeTransport:
             body = io.BytesIO(payload[offset:])
         headers = {"content-range": f"bytes {offset}-{len(payload) - 1}/{len(payload)}"}
         return Response(206 if offset else 200, headers, body)
+
+
+class NoNetworkTransport:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, int]] = []
+
+    def open(self, url: str, offset: int = 0) -> Response:
+        self.calls.append((url, offset))
+        raise AssertionError(f"unexpected network request: {url}")
 
 
 def transport_for(components: dict[str, tuple[str, bytes]]) -> FakeTransport:
@@ -229,6 +274,92 @@ def test_install_pipeline_style_zstd_component(tmp_path: Path) -> None:
     installed = manager.root / "versions" / "data-v1.0.0" / "lexicon.sqlite3"
     assert installed.read_bytes() == final
     assert manager.verify()["ok"] is True
+
+
+def test_install_local_package_uses_sibling_parts_without_network(tmp_path: Path) -> None:
+    final = sqlite_payload(tmp_path, "local-package.db", ["local package"])
+    manifest_path, _parts = write_local_zstd_package(tmp_path / "package", final)
+    transport = NoNetworkTransport()
+    manager = DatasetLifecycle(
+        tmp_path / "data",
+        transport=transport,
+        sleep=lambda _seconds: None,
+        safety_margin=0,
+    )
+
+    result = manager.install(
+        manifest_path,
+        profile="full",
+        version="data-v1.0.0",
+    )
+
+    installed = manager.root / "versions" / "data-v1.0.0" / "lexicon.sqlite3"
+    assert result["action"] == "installed"
+    assert installed.read_bytes() == final
+    assert manager.verify()["ok"] is True
+    assert transport.calls == []
+
+
+def test_install_local_package_resumes_verified_partial_without_network(
+    tmp_path: Path,
+) -> None:
+    final = sqlite_payload(tmp_path, "local-resume.db", ["resume"])
+    manifest_path, parts = write_local_zstd_package(tmp_path / "package", final)
+    manifest = parse_manifest(manifest_path.read_bytes())
+    transport = NoNetworkTransport()
+    manager = DatasetLifecycle(
+        tmp_path / "data",
+        transport=transport,
+        sleep=lambda _seconds: None,
+        safety_margin=0,
+    )
+    component = manifest.components[0]
+    part = component.parts[0]
+    cache = manager.root / ".downloads" / manifest.dataset_version / component.id
+    cache.mkdir(parents=True)
+    partial = manager._part_path(cache, 0, part, complete=False)
+    partial.write_bytes(parts[0][:17])
+
+    manager.install(manifest_path, profile="full", version=manifest.dataset_version)
+
+    complete = manager._part_path(cache, 0, part, complete=True)
+    assert complete.read_bytes() == parts[0]
+    assert not partial.exists()
+    assert manager.verify()["ok"] is True
+    assert transport.calls == []
+
+
+def test_install_local_package_rejects_corrupt_partial_before_activation(
+    tmp_path: Path,
+) -> None:
+    final = sqlite_payload(tmp_path, "local-corrupt.db", ["corrupt partial"])
+    manifest_path, parts = write_local_zstd_package(tmp_path / "package", final)
+    manifest = parse_manifest(manifest_path.read_bytes())
+    transport = NoNetworkTransport()
+    manager = DatasetLifecycle(
+        tmp_path / "data",
+        transport=transport,
+        sleep=lambda _seconds: None,
+        safety_margin=0,
+    )
+    component = manifest.components[0]
+    part = component.parts[0]
+    cache = manager.root / ".downloads" / manifest.dataset_version / component.id
+    cache.mkdir(parents=True)
+    partial = manager._part_path(cache, 0, part, complete=False)
+    partial.write_bytes(b"\x00" * min(17, len(parts[0])))
+
+    with pytest.raises(DownloadError, match="local release asset SHA-256 mismatch"):
+        manager.install(manifest_path, profile="full", version=manifest.dataset_version)
+
+    assert not partial.exists()
+    assert not (manager.root / "current.json").exists()
+    assert not (manager.root / "versions" / manifest.dataset_version).exists()
+    assert transport.calls == []
+
+    manager.install(manifest_path, profile="full", version=manifest.dataset_version)
+    assert manager.verify()["ok"] is True
+    assert transport.calls == []
 
 
 def test_failed_update_never_replaces_current(tmp_path: Path) -> None:
@@ -418,3 +549,57 @@ def test_usearch_226_semantic_count_uses_present_vectors(tmp_path: Path) -> None
     )
 
     assert default_semantic_count(path, component) == 2
+
+
+def test_sqlite_dataset_schema_version_integrity_is_enforced(tmp_path: Path) -> None:
+    path = tmp_path / "lexicon.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO metadata VALUES ('schema_version', '2');
+            """
+        )
+    payload = path.read_bytes()
+    component = Component(
+        id="lexical",
+        artifact_type="lexical_sqlite",
+        path=PurePosixPath("lexicon.sqlite3"),
+        compression="none",
+        compressed_size=len(payload),
+        compressed_sha256=digest(payload),
+        final_size=len(payload),
+        final_sha256=digest(payload),
+        parts=(),
+        sources=("fixture",),
+        integrity={"sqlite": True, "dataset_schema_version": 2},
+    )
+    assert verify_component(tmp_path, component) == []
+
+    incompatible = Component(
+        id=component.id,
+        artifact_type=component.artifact_type,
+        path=component.path,
+        compression=component.compression,
+        compressed_size=component.compressed_size,
+        compressed_sha256=component.compressed_sha256,
+        final_size=component.final_size,
+        final_sha256=component.final_sha256,
+        parts=component.parts,
+        sources=component.sources,
+        integrity={"sqlite": True, "dataset_schema_version": 3},
+    )
+    assert verify_component(tmp_path, incompatible) == [
+        "lexical: dataset schema version mismatch (expected 3, got '2')"
+    ]
+
+
+def test_dataset_schema_version_manifest_field_must_be_positive() -> None:
+    value = json.loads(manifest_bytes("data-v1.0.0", {"lexical": ("lexicon.db", b"db")}))
+    value["components"][0]["integrity"]["dataset_schema_version"] = 2
+    parsed = parse_manifest(json.dumps(value))
+    assert parsed.components[0].integrity["dataset_schema_version"] == 2
+
+    value["components"][0]["integrity"]["dataset_schema_version"] = 0
+    with pytest.raises(ManifestError, match="must be a positive integer"):
+        parse_manifest(json.dumps(value))
