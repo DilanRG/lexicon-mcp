@@ -40,6 +40,7 @@ def test_monitoring_arithmetic_uses_int64_without_starting_build(tmp_path: Path)
         "peak_private_bytes": 2_147_487_744,
         "peak_working_set_bytes": 4_294_975_488,
         "minimum_free_bytes": 8_589_934_592,
+        "openblas_num_threads": "1",
     }
     assert not unused_state.exists()
 

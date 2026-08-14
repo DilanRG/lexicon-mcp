@@ -50,6 +50,29 @@ function Get-Int64Maximum {
     return [Math]::Max([long]$Left, [long]$Right)
 }
 
+function Set-ChildProcessEnvironmentVariable {
+    param(
+        [System.Diagnostics.ProcessStartInfo]$StartInfo,
+        [string]$Name,
+        [string]$Value
+    )
+
+    # ProcessStartInfo.Environment is available on modern .NET/PowerShell,
+    # while Windows PowerShell 5.1 exposes EnvironmentVariables instead.
+    # Probe the actual property rather than indexing a null compatibility shim.
+    $environmentProperty = $StartInfo.PSObject.Properties['Environment']
+    if ($null -ne $environmentProperty -and $null -ne $environmentProperty.Value) {
+        $environmentProperty.Value[$Name] = $Value
+        return
+    }
+    $legacyProperty = $StartInfo.PSObject.Properties['EnvironmentVariables']
+    if ($null -ne $legacyProperty -and $null -ne $legacyProperty.Value) {
+        $legacyProperty.Value[$Name] = $Value
+        return
+    }
+    throw 'ProcessStartInfo exposes no writable child environment dictionary.'
+}
+
 if ($MonitoringArithmeticSelfTest) {
     $syntheticProcesses = @(
         [pscustomobject]@{
@@ -66,6 +89,12 @@ if ($MonitoringArithmeticSelfTest) {
     [long]$peakPrivateBytes = Get-Int64Maximum ([long]0) $privateBytes
     [long]$peakWorkingSetBytes = Get-Int64Maximum ([long]0) $workingSetBytes
     [long]$minimumFree = Get-Int64Minimum ([long]12884901888) ([long]8589934592)
+    $selfTestStartInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    Set-ChildProcessEnvironmentVariable $selfTestStartInfo 'OPENBLAS_NUM_THREADS' '1'
+    $selfTestEnvironment = $selfTestStartInfo.PSObject.Properties['Environment']
+    if ($null -eq $selfTestEnvironment -or $null -eq $selfTestEnvironment.Value) {
+        $selfTestEnvironment = $selfTestStartInfo.PSObject.Properties['EnvironmentVariables']
+    }
     [ordered]@{
         build_started = $false
         private_bytes = $privateBytes
@@ -73,6 +102,7 @@ if ($MonitoringArithmeticSelfTest) {
         peak_private_bytes = $peakPrivateBytes
         peak_working_set_bytes = $peakWorkingSetBytes
         minimum_free_bytes = $minimumFree
+        openblas_num_threads = [string]$selfTestEnvironment.Value['OPENBLAS_NUM_THREADS']
     } | ConvertTo-Json
     exit 0
 }
@@ -184,7 +214,7 @@ $startInfo.RedirectStandardError = $true
 # NumPy's OpenBLAS default can reserve hundreds of MiB per Python process on
 # Windows. The corpus pipeline only performs single-vector operations, so a
 # large BLAS thread pool wastes memory without accelerating this build.
-$startInfo.EnvironmentVariables['OPENBLAS_NUM_THREADS'] = '1'
+Set-ChildProcessEnvironmentVariable $startInfo 'OPENBLAS_NUM_THREADS' '1'
 # Windows PowerShell 5.1 runs on .NET Framework, whose ProcessStartInfo has no
 # ArgumentList property. These controlled paths contain no quotes; quote every
 # argument so whitespace in an overridden root remains safe.
