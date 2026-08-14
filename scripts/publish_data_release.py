@@ -166,7 +166,24 @@ def _release_or_none(
         value = _gh_api_json(runner, f"repos/{repository}/releases/tags/{tag}")
     except ReleaseError as exc:
         if "HTTP 404" in str(exc) or "release not found" in str(exc).casefold():
-            return None
+            # GitHub's tag endpoint does not expose an unpublished draft.
+            # Fall back to the releases collection so an interrupted staging
+            # run can resume against the existing numeric draft release.
+            releases = _gh_api_json(
+                runner, f"repos/{repository}/releases?per_page=100&page=1"
+            )
+            if not isinstance(releases, list):
+                raise ReleaseError("GitHub releases response must be an array") from None
+            matches = [
+                item
+                for item in releases
+                if isinstance(item, dict) and item.get("tag_name") == tag
+            ]
+            if len(matches) > 1:
+                raise ReleaseError(
+                    f"GitHub returned duplicate releases for tag {tag!r}"
+                ) from None
+            return matches[0] if matches else None
         raise
     if not isinstance(value, dict):
         raise ReleaseError("GitHub release response must be an object")

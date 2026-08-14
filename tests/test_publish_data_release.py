@@ -89,12 +89,19 @@ class FakeGitHub:
                 if self.release is None:
                     raise ReleaseError("gh api failed: HTTP 404: release not found")
                 return json.dumps(self.release)
+            if endpoint.endswith("/releases?per_page=100&page=1"):
+                return json.dumps([] if self.release is None else [self.release])
             if "/releases/17/assets" in endpoint:
                 page = int(endpoint.rsplit("page=", 1)[-1])
                 return json.dumps(list(self.assets.values()) if page == 1 else [])
             raise AssertionError(f"unexpected endpoint: {endpoint}")
         if arguments[:2] == ["release", "create"]:
-            self.release = {"id": 17, "draft": True, "immutable": False}
+            self.release = {
+                "id": 17,
+                "tag_name": "data-v1.0.0",
+                "draft": True,
+                "immutable": False,
+            }
             return ""
         if arguments[:2] == ["release", "upload"]:
             for value in arguments[5:]:
@@ -199,4 +206,9 @@ def test_publish_requires_exact_acceptance_and_confirms_immutability(tmp_path: P
         runner=github,
     )
     assert result["immutable"] is True
-    assert github.release == {"id": 17, "draft": False, "immutable": True}
+    assert github.release == {
+        "id": 17,
+        "tag_name": "data-v1.0.0",
+        "draft": False,
+        "immutable": True,
+    }
