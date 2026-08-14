@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +16,7 @@ from lexicon_mcp.runtime.acceptance import (
     process_mapped_artifact_rss_bytes,
     run_isolated_performance,
 )
+from lexicon_mcp.runtime.evidence import compact_evidence_json
 from lexicon_mcp.runtime.locator import ActiveDataset
 
 
@@ -41,6 +43,12 @@ def _fixture_dataset(tmp_path: Path) -> ActiveDataset:
 def test_percentile_uses_nearest_rank() -> None:
     assert percentile([5.0, 1.0, 4.0, 2.0, 3.0], 0.95) == 5.0
     assert percentile([5.0, 1.0, 4.0, 2.0, 3.0], 0.50) == 3.0
+
+
+def test_compact_evidence_json_is_canonical_unicode_and_finite() -> None:
+    assert compact_evidence_json({"z": 1, "a": "\u732b"}) == '{"a":"\u732b","z":1}'
+    with pytest.raises(ValueError, match="JSON compliant"):
+        compact_evidence_json({"invalid": float("nan")})
 
 
 def test_mapped_artifact_rss_counts_only_resident_semantic_files(tmp_path: Path) -> None:
@@ -131,6 +139,25 @@ def test_performance_report_shape_names_working_set_separately() -> None:
         "semantic_warm_samples": 9,
         "semantic_seed": "cat",
         "semantic_language": "en",
+    }
+    assert report.to_evidence() == json.loads(report.to_json())
+    assert report.to_json() == report.to_json()
+    assert "\n" not in report.to_json()
+    assert report.to_evidence() == {
+        "latency_ms": {
+            "lexical_p95": 1.0,
+            "semantic_cold": 2.0,
+            "semantic_warm_p95": 3.0,
+        },
+        "memory_bytes": {
+            "idle_process_private": 4,
+            "semantic_worker_peak_mapped_artifact_rss_diagnostic": 7,
+            "semantic_worker_peak_private": 5,
+            "semantic_worker_peak_total_working_set": 6,
+        },
+        "report": "performance_acceptance",
+        "samples": {"lexical": 8, "semantic_warm": 9},
+        "semantic_query": {"language": "en", "seed": "cat"},
     }
 
 

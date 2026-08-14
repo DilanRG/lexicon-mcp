@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import socket
 import sqlite3
 import threading
 import time
@@ -14,6 +15,7 @@ from usearch.index import Index
 
 import lexicon_mcp.runtime.semantic as semantic_module
 from lexicon_mcp.pipeline.schema import create_semantic_schema
+from lexicon_mcp.runtime.offline import NetworkDisabledError
 from lexicon_mcp.runtime.semantic import SemanticWorker, _semantic_search_task, _SemanticRequest
 
 
@@ -255,10 +257,45 @@ def test_semantic_worker_initializer_bounds_openblas_threads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("OPENBLAS_NUM_THREADS", "32")
+    guard_observations: list[str] = []
+
+    def observe_guard_installation() -> None:
+        guard_observations.append(os.environ["OPENBLAS_NUM_THREADS"])
+
+    monkeypatch.setattr(
+        semantic_module,
+        "install_network_guard",
+        observe_guard_installation,
+    )
 
     semantic_module._initialize_semantic_worker()
 
     assert os.environ["OPENBLAS_NUM_THREADS"] == "1"
+    assert guard_observations == ["1"]
+
+
+def test_semantic_worker_initializer_blocks_dns_and_socket_connections(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Register the real functions with monkeypatch so the initializer's permanent
+    # process-local assignments are restored when this test ends.
+    monkeypatch.setattr(socket.socket, "connect", socket.socket.connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", socket.socket.connect_ex)
+    monkeypatch.setattr(socket, "create_connection", socket.create_connection)
+    monkeypatch.setattr(socket, "getaddrinfo", socket.getaddrinfo)
+    monkeypatch.setenv("OPENBLAS_NUM_THREADS", "32")
+
+    semantic_module._initialize_semantic_worker()
+
+    assert os.environ["OPENBLAS_NUM_THREADS"] == "1"
+    with pytest.raises(NetworkDisabledError):
+        socket.getaddrinfo("example.invalid", 443)
+    with pytest.raises(NetworkDisabledError):
+        socket.create_connection(("example.invalid", 443))
+    with socket.socket() as client, pytest.raises(NetworkDisabledError):
+        client.connect(("127.0.0.1", 9))
+    with socket.socket() as client, pytest.raises(NetworkDisabledError):
+        client.connect_ex(("127.0.0.1", 9))
 
 
 def test_semantic_worker_idle_teardown_tracks_in_flight_and_respawns(

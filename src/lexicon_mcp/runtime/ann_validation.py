@@ -12,6 +12,7 @@ from typing import Any
 import numpy as np
 
 from ..usearch_compat import open_index_view
+from .evidence import compact_evidence_json
 from .locator import ActiveDataset
 
 DEFAULT_LANGUAGES = ("en", "de", "es", "fr", "it", "pt", "ru", "ja", "ar", "hi")
@@ -76,6 +77,73 @@ class AnnAcceptanceReport:
             if values:
                 report[language] = sum(values) / len(values)
         return report
+
+    def to_evidence(self) -> dict[str, object]:
+        """Return a compact aggregate without embedding 200 neighbour rankings."""
+
+        seed_ids = {item.seed_semantic_id for item in self.results}
+        global_results = tuple(
+            item for item in self.results if item.index_scope == "global"
+        )
+        shard_results = tuple(
+            item for item in self.results if item.index_scope == "language_shard"
+        )
+        per_language: dict[str, object] = {}
+        for language in self.languages:
+            language_global = tuple(
+                item for item in global_results if item.language == language
+            )
+            language_shard = tuple(
+                item for item in shard_results if item.language == language
+            )
+            language_results = (*language_global, *language_shard)
+            per_language[language] = {
+                "comparison_count": len(language_results),
+                "deterministic": all(item.deterministic for item in language_results),
+                "global_recall_at_k": _evidence_metric(language_global),
+                "language_shard_recall_at_k": _evidence_metric(language_shard),
+                "seed_count": len(
+                    {item.seed_semantic_id for item in language_results}
+                ),
+                "strict_language_filtering": all(
+                    item.strict_language_filtering for item in language_shard
+                ),
+            }
+        return {
+            "comparison_count": len(self.results),
+            "global": {
+                "comparison_count": len(global_results),
+                "deterministic": all(item.deterministic for item in global_results),
+                "recall_at_k": self.global_recall_at_k,
+            },
+            "k": self.k,
+            "language_shards": {
+                "comparison_count": len(shard_results),
+                "deterministic": all(item.deterministic for item in shard_results),
+                "recall_at_k": self.shard_recall_at_k,
+                "strict_language_filtering": all(
+                    item.strict_language_filtering for item in shard_results
+                ),
+            },
+            "languages": list(self.languages),
+            "per_language": per_language,
+            "report": "ann_acceptance",
+            "seeds_per_language": self.seeds_per_language,
+            "unique_seed_count": len(seed_ids),
+        }
+
+    def to_json(self) -> str:
+        """Return one deterministic compact JSON evidence record."""
+
+        return compact_evidence_json(self.to_evidence())
+
+
+def _evidence_metric(results: tuple[AnnSeedResult, ...]) -> float:
+    return (
+        sum(item.recall_at_k for item in results) / len(results)
+        if results
+        else 0.0
+    )
 
 
 @dataclass(frozen=True, slots=True)

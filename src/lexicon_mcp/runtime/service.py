@@ -7,7 +7,7 @@ import sqlite3
 import threading
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from .locator import ActiveDataset, DatasetLocator
 from .normalization import (
@@ -35,9 +35,7 @@ RELATIONS = frozenset(
         "related",
     }
 )
-WORDPLAY_MODES = frozenset(
-    {"rhyme", "near_rhyme", "sounds_like", "spelled_like", "prefix"}
-)
+WORDPLAY_MODES = frozenset({"rhyme", "near_rhyme", "sounds_like", "spelled_like", "prefix"})
 SUPPORTED_SCHEMA_VERSION = "2"
 
 _RELATION_CODES = {
@@ -71,6 +69,71 @@ _INVERSE_RELATION_CODES = {
     12: 12,
 }
 _INVERSE_DIRECTION_CODES = {1: 2, 2: 1, 3: 3}
+
+_MAX_QUERY_BUDGET = 100
+_RELATION_SCAN_FLOOR = 256
+_RELATION_SCAN_CEILING = 512
+_RELATION_BATCH_SOURCE_LIMIT = 200
+_T = TypeVar("_T")
+
+
+def _validate_bounded_integer(
+    value: int,
+    *,
+    field: str,
+    minimum: int,
+    maximum: int = _MAX_QUERY_BUDGET,
+) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field} must be an integer")
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{field} must be between {minimum} and {maximum}")
+    return value
+
+
+def _validate_allocation(value: int, *, field: str, limit: int) -> int:
+    if value == -1:
+        raise ValueError(f"{field}=-1 automatic allocation is reserved but unsupported in v1")
+    value = _validate_bounded_integer(value, field=field, minimum=0)
+    if value > limit:
+        raise ValueError(f"{field} must not exceed limit")
+    return value
+
+
+def _validate_fixed_budget(value: int, *, field: str) -> int:
+    """Validate a fixed caller budget that is independent of another limit."""
+
+    if value == -1:
+        raise ValueError(f"{field}=-1 automatic allocation is reserved but unsupported in v1")
+    return _validate_bounded_integer(value, field=field, minimum=0)
+
+
+def _round_robin_allocate(candidate_lists: list[list[_T]], budget: int) -> list[list[_T]]:
+    """Allocate a total budget fairly across ordered candidate groups."""
+
+    selected: list[list[_T]] = [[] for _candidates in candidate_lists]
+    position = 0
+    remaining = budget
+    while remaining > 0:
+        added = False
+        for index, candidates in enumerate(candidate_lists):
+            if position >= len(candidates):
+                continue
+            selected[index].append(candidates[position])
+            remaining -= 1
+            added = True
+            if remaining == 0:
+                break
+        if not added:
+            break
+        position += 1
+    return selected
+
+
+def _relation_scan_limit(limit: int) -> int:
+    """Overfetch enough rows for diversity ranking without unbounded scans."""
+
+    return min(_RELATION_SCAN_CEILING, max(_RELATION_SCAN_FLOOR, limit * 8))
 
 
 def _provenance(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, str | None]:
@@ -219,7 +282,7 @@ class LexiconService:
                 JOIN lexical_entries AS entry ON entry.entry_id = sense.entry_id
                 JOIN lexical_terms AS term ON term.term_id = entry.term_id
                 JOIN provenance ON provenance.provenance_id = entry.provenance_id
-                WHERE {' AND '.join(clauses)}
+                WHERE {" AND ".join(clauses)}
                 ORDER BY CASE WHEN sense.gloss IS NULL THEN 1 ELSE 0 END,
                          sense.sense_id
                 LIMIT ?
@@ -242,8 +305,7 @@ class LexiconService:
             raise RuntimeError(f"unsafe dependent-row key {id_column!r}")
         with self._lock:
             return self._connection.execute(
-                f"SELECT {columns} FROM {table} WHERE {id_column} = ? "
-                "ORDER BY position LIMIT ?",
+                f"SELECT {columns} FROM {table} WHERE {id_column} = ? ORDER BY position LIMIT ?",
                 (identifier, limit),
             ).fetchall()
 
@@ -273,7 +335,7 @@ class LexiconService:
                   ON term.term_id = translation.target_term_id
                 JOIN provenance
                   ON provenance.provenance_id = translation.provenance_id
-                WHERE {' AND '.join(clauses)}
+                WHERE {" AND ".join(clauses)}
                 ORDER BY translation.position, term.language,
                          term.normalized_term, term.term
                 LIMIT ?
@@ -302,33 +364,16 @@ class LexiconService:
                 (sense_id, limit),
             ).fetchall()
 
-    def _sense_result(self, row: sqlite3.Row) -> dict[str, Any]:
+    @staticmethod
+    def _sense_result(
+        row: sqlite3.Row,
+        *,
+        examples: list[str],
+        pronunciations: list[dict[str, Any]],
+        translations: list[dict[str, Any]],
+        truncated_fields: list[str],
+    ) -> dict[str, Any]:
         sense_id = str(row["sense_id"])
-        entry_id = str(row["entry_id"])
-        examples = [
-            str(item["example"])
-            for item in self._dependent_rows("examples", "example, position", sense_id)
-        ]
-        pronunciations = [
-            {"ipa": item["ipa"], "region": item["region"]}
-            for item in self._dependent_rows(
-                "pronunciations",
-                "ipa, region, position",
-                entry_id,
-                id_column="entry_id",
-            )
-        ]
-        translations = [
-            {
-                "term": item["term"],
-                "language": item["target_language"],
-                "part_of_speech": item["part_of_speech"],
-                "sense_id": sense_id,
-                "sense_scope": sense_scope(sense_id),
-                "provenance": _provenance(item),
-            }
-            for item in self._translation_rows(sense_id)
-        ]
         return {
             "sense_id": sense_id,
             "sense_scope": sense_scope(sense_id),
@@ -340,6 +385,7 @@ class LexiconService:
             "pronunciations": pronunciations,
             "etymology": row["etymology"],
             "translations": translations,
+            "truncated_fields": truncated_fields,
             "provenance": _provenance(row),
         }
 
@@ -349,16 +395,102 @@ class LexiconService:
         language: str = "en",
         part_of_speech: str | None = None,
         limit: int = 8,
+        examples_limit: int = 8,
+        pronunciations_limit: int = 8,
+        translations_limit: int = 20,
     ) -> dict[str, Any]:
         original = word.strip() if isinstance(word, str) else word
         key = normalize_key(word)
         language = normalize_language(language)
         part_of_speech = normalize_optional_text(part_of_speech, field="part_of_speech")
         limit = validate_limit(limit)
-        results = [
-            self._sense_result(row)
-            for row in self._sense_rows(key, language, part_of_speech, None, limit)
-        ]
+        examples_limit = _validate_fixed_budget(examples_limit, field="examples_limit")
+        pronunciations_limit = _validate_fixed_budget(
+            pronunciations_limit, field="pronunciations_limit"
+        )
+        translations_limit = _validate_fixed_budget(translations_limit, field="translations_limit")
+        rows = self._sense_rows(key, language, part_of_speech, None, limit)
+
+        example_candidates: list[list[str]] = []
+        pronunciation_candidates: list[list[dict[str, Any]]] = []
+        translation_candidates: list[list[dict[str, Any]]] = []
+        for row in rows:
+            sense_id = str(row["sense_id"])
+            entry_id = str(row["entry_id"])
+            example_candidates.append(
+                [
+                    str(item["example"])
+                    for item in self._dependent_rows(
+                        "examples",
+                        "example, position",
+                        sense_id,
+                        limit=examples_limit + 1,
+                    )
+                ]
+            )
+            pronunciation_candidates.append(
+                [
+                    {"ipa": item["ipa"], "region": item["region"]}
+                    for item in self._dependent_rows(
+                        "pronunciations",
+                        "ipa, region, position",
+                        entry_id,
+                        id_column="entry_id",
+                        limit=pronunciations_limit + 1,
+                    )
+                ]
+            )
+            translation_candidates.append(
+                [
+                    {
+                        "term": item["term"],
+                        "language": item["target_language"],
+                        "part_of_speech": item["part_of_speech"],
+                        "sense_id": sense_id,
+                        "sense_scope": sense_scope(sense_id),
+                        "provenance": _provenance(item),
+                    }
+                    for item in self._translation_rows(sense_id, limit=translations_limit + 1)
+                ]
+            )
+
+        selected_examples = _round_robin_allocate(example_candidates, examples_limit)
+        selected_pronunciations = _round_robin_allocate(
+            pronunciation_candidates, pronunciations_limit
+        )
+        selected_translations = _round_robin_allocate(translation_candidates, translations_limit)
+        results: list[dict[str, Any]] = []
+        for index, row in enumerate(rows):
+            truncated_fields = [
+                field
+                for field, candidates, selected in (
+                    (
+                        "examples",
+                        example_candidates[index],
+                        selected_examples[index],
+                    ),
+                    (
+                        "pronunciations",
+                        pronunciation_candidates[index],
+                        selected_pronunciations[index],
+                    ),
+                    (
+                        "translations",
+                        translation_candidates[index],
+                        selected_translations[index],
+                    ),
+                )
+                if len(candidates) > len(selected)
+            ]
+            results.append(
+                self._sense_result(
+                    row,
+                    examples=selected_examples[index],
+                    pronunciations=selected_pronunciations[index],
+                    translations=selected_translations[index],
+                    truncated_fields=truncated_fields,
+                )
+            )
         return self._response(
             "dictionary_lookup",
             {
@@ -366,6 +498,10 @@ class LexiconService:
                 "normalized_word": key,
                 "language": language,
                 "part_of_speech": part_of_speech,
+                "limit": limit,
+                "examples_limit": examples_limit,
+                "pronunciations_limit": pronunciations_limit,
+                "translations_limit": translations_limit,
             },
             results,
         )
@@ -377,6 +513,8 @@ class LexiconService:
         sense_id: str | None = None,
         part_of_speech: str | None = None,
         limit: int = 20,
+        max_senses: int = 20,
+        unsensed_limit: int = 5,
     ) -> dict[str, Any]:
         original = word.strip() if isinstance(word, str) else word
         key = normalize_key(word)
@@ -384,54 +522,114 @@ class LexiconService:
         part_of_speech = normalize_optional_text(part_of_speech, field="part_of_speech")
         sense_id = self._validate_sense_id(sense_id)
         limit = validate_limit(limit)
-        rows = self._sense_rows(key, language, part_of_speech, sense_id, limit)
-        groups: list[dict[str, Any]] = []
-        remaining = limit
+        max_senses = _validate_bounded_integer(max_senses, field="max_senses", minimum=1)
+        unsensed_limit = _validate_allocation(unsensed_limit, field="unsensed_limit", limit=limit)
+        rows = self._sense_rows(key, language, part_of_speech, sense_id, max_senses)
+
+        group_specs: list[dict[str, Any]] = []
+        strict_support: dict[tuple[str, str], int] = {}
         for row in rows:
-            if remaining <= 0:
-                break
             row_sense_id = str(row["sense_id"])
-            candidates: list[dict[str, Any]] = []
+            candidates: list[tuple[tuple[str, str], dict[str, Any]]] = []
             seen_in_sense: set[tuple[str, str]] = set()
-            for item in self._synonym_rows(row_sense_id, limit=remaining):
+            for item in self._synonym_rows(row_sense_id, limit=_MAX_QUERY_BUDGET):
                 identity = (str(item["normalized_term"]), str(item["language"]))
                 if identity == (key, language) or identity in seen_in_sense:
                     continue
                 seen_in_sense.add(identity)
                 candidates.append(
-                    {
-                        "term": item["term"],
-                        "language": item["language"],
-                        "part_of_speech": item["part_of_speech"],
-                        "sense_id": row_sense_id,
-                        "sense_scope": sense_scope(row_sense_id),
-                        "provenance": _provenance(item),
-                    }
+                    (
+                        identity,
+                        {
+                            "term": item["term"],
+                            "language": item["language"],
+                            "part_of_speech": item["part_of_speech"],
+                            "sense_id": row_sense_id,
+                            "sense_scope": sense_scope(row_sense_id),
+                            "provenance": _provenance(item),
+                        },
+                    )
                 )
-                remaining -= 1
+            for identity in seen_in_sense:
+                strict_support[identity] = strict_support.get(identity, 0) + 1
             if candidates:
-                groups.append(
+                group_specs.append(
                     {
-                        "sense_id": row_sense_id,
                         "sense_scope": sense_scope(row_sense_id),
-                        "word": row["word"],
-                        "language": row["language"],
-                        "part_of_speech": row["part_of_speech"],
-                        "gloss": row["gloss"],
-                        "synonyms": candidates,
-                        "provenance": _provenance(row),
+                        "row": row,
+                        "candidates": candidates,
                     }
                 )
-        if sense_id is None and remaining > 0:
-            # ConceptNet fallback is an independently unsensed association, so
-            # do not suppress it merely because the same display term occurs
-            # in a source-scoped sense group above.
-            fallback = self._relation_synonyms(
-                key, language, part_of_speech, remaining, set()
+
+        candidate_lists = [spec["candidates"] for spec in group_specs]
+        scoped_indexes = [
+            index for index, spec in enumerate(group_specs) if spec["sense_scope"] == "sense"
+        ]
+        native_unsensed_indexes = [
+            index for index, spec in enumerate(group_specs) if spec["sense_scope"] == "unsensed"
+        ]
+
+        unsensed_budget = unsensed_limit
+        native_unsensed = self._allocate_grouped_synonyms(
+            candidate_lists, native_unsensed_indexes, unsensed_budget
+        )
+        native_unsensed_count = sum(len(items) for items in native_unsensed.values())
+
+        relation_candidates: list[dict[str, Any]] = []
+        if sense_id is None and part_of_speech is None and native_unsensed_count < unsensed_budget:
+            relation_candidates = self._unsensed_relation_synonym_candidates(
+                key, language, strict_support
             )
-            if fallback:
-                groups.append(fallback)
-        return self._response(
+        relation_slots = min(unsensed_budget - native_unsensed_count, len(relation_candidates))
+        scoped_budget = limit - native_unsensed_count - relation_slots
+        scoped = self._allocate_grouped_synonyms(candidate_lists, scoped_indexes, scoped_budget)
+
+        selected_identities = {
+            identity
+            for allocation in (scoped, native_unsensed)
+            for items in allocation.values()
+            for identity, _candidate in items
+        }
+        ranked_relation_candidates = self._rank_unsensed_relation_synonyms(
+            relation_candidates, selected_identities
+        )[:relation_slots]
+
+        groups: list[dict[str, Any]] = []
+        for index, spec in enumerate(group_specs):
+            selected = [
+                *scoped.get(index, ()),
+                *native_unsensed.get(index, ()),
+            ]
+            if not selected:
+                continue
+            row = spec["row"]
+            row_sense_id = str(row["sense_id"])
+            groups.append(
+                {
+                    "sense_id": row_sense_id,
+                    "sense_scope": spec["sense_scope"],
+                    "word": row["word"],
+                    "language": row["language"],
+                    "part_of_speech": row["part_of_speech"],
+                    "gloss": row["gloss"],
+                    "synonyms": [candidate for _identity, candidate in selected],
+                    "provenance": _provenance(row),
+                }
+            )
+        if ranked_relation_candidates:
+            groups.append(
+                {
+                    "sense_id": None,
+                    "sense_scope": "unsensed",
+                    "word": key,
+                    "language": language,
+                    "part_of_speech": None,
+                    "gloss": None,
+                    "synonyms": ranked_relation_candidates,
+                    "provenance": ranked_relation_candidates[0]["provenance"],
+                }
+            )
+        response = self._response(
             "dictionary_synonyms",
             {
                 "word": original,
@@ -439,9 +637,41 @@ class LexiconService:
                 "language": language,
                 "sense_id": sense_id,
                 "part_of_speech": part_of_speech,
+                "limit": limit,
+                "max_senses": max_senses,
+                "unsensed_limit": unsensed_limit,
             },
             groups,
         )
+        response["candidate_count"] = sum(len(group["synonyms"]) for group in groups)
+        return response
+
+    @staticmethod
+    def _allocate_grouped_synonyms(
+        candidate_lists: list[list[tuple[tuple[str, str], dict[str, Any]]]],
+        group_indexes: list[int],
+        budget: int,
+    ) -> dict[int, list[tuple[tuple[str, str], dict[str, Any]]]]:
+        """Allocate one candidate per sense group before taking variants."""
+
+        selected: dict[int, list[tuple[tuple[str, str], dict[str, Any]]]] = {}
+        position = 0
+        remaining = budget
+        while remaining > 0:
+            added = False
+            for index in group_indexes:
+                candidates = candidate_lists[index]
+                if position >= len(candidates):
+                    continue
+                selected.setdefault(index, []).append(candidates[position])
+                remaining -= 1
+                added = True
+                if remaining == 0:
+                    break
+            if not added:
+                break
+            position += 1
+        return selected
 
     def _relation_rows(
         self,
@@ -485,60 +715,124 @@ class LexiconService:
         reverse_parameters.append(limit)
 
         select_forward = f"""
-            SELECT source.term AS source_term,
-                   source.normalized_term AS source_normalized,
-                   source.language AS source_language,
-                   relation.source_sense_id,
-                   target.term AS target_term,
-                   target.normalized_term AS target_normalized,
-                   target.language AS target_language,
-                   relation.target_sense_id,
-                   relation.direction_code,
-                   provenance.source, provenance.source_license,
-                   provenance.source_url
-            FROM relations AS relation
-            JOIN lexical_terms AS source
-              ON source.term_id = relation.source_term_id
-            JOIN lexical_terms AS target
-              ON target.term_id = relation.target_term_id
-            JOIN provenance
-              ON provenance.provenance_id = relation.provenance_id
-            WHERE {' AND '.join(forward_clauses)}
-            ORDER BY target.language, target.normalized_term, target.term,
-                     relation.target_sense_id
+            WITH candidates AS (
+                SELECT source.term_id AS source_term_id,
+                       source.term AS source_term,
+                       source.normalized_term AS source_normalized,
+                       source.language AS source_language,
+                       relation.source_sense_id,
+                       target.term_id AS target_term_id,
+                       target.term AS target_term,
+                       target.normalized_term AS target_normalized,
+                       target.language AS target_language,
+                       relation.target_sense_id,
+                       relation.direction_code,
+                       provenance.provenance_id,
+                       provenance.source, provenance.source_license,
+                       provenance.source_url,
+                       (SELECT COUNT(*)
+                          FROM lexical_entries AS target_entry
+                         WHERE target_entry.term_id = target.term_id
+                       ) AS target_entry_count,
+                       (SELECT COUNT(*)
+                          FROM senses AS target_sense
+                          JOIN lexical_entries AS target_sense_entry
+                            ON target_sense_entry.entry_id = target_sense.entry_id
+                         WHERE target_sense_entry.term_id = target.term_id
+                       ) AS target_sense_count,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY target.term_id
+                           ORDER BY CASE
+                                        WHEN relation.source_sense_id IS NULL
+                                         AND relation.target_sense_id IS NULL THEN 1
+                                        ELSE 0
+                                    END,
+                                    relation.source_sense_id,
+                                    relation.target_sense_id,
+                                    provenance.provenance_id,
+                                    relation.direction_code
+                       ) AS target_variant_rank,
+                       1 AS query_orientation
+                FROM relations AS relation
+                JOIN lexical_terms AS source
+                  ON source.term_id = relation.source_term_id
+                JOIN lexical_terms AS target
+                  ON target.term_id = relation.target_term_id
+                JOIN provenance
+                  ON provenance.provenance_id = relation.provenance_id
+                WHERE {" AND ".join(forward_clauses)}
+            )
+            SELECT * FROM candidates
+            ORDER BY target_variant_rank,
+                     target_sense_count DESC, target_entry_count DESC,
+                     (LENGTH(target_normalized) -
+                      LENGTH(REPLACE(target_normalized, ' ', ''))),
+                     LENGTH(target_normalized), target_language,
+                     target_normalized, target_term, target_sense_id,
+                     provenance_id, direction_code
             LIMIT ?
         """
         select_reverse = f"""
-            SELECT target.term AS source_term,
-                   target.normalized_term AS source_normalized,
-                   target.language AS source_language,
-                   relation.target_sense_id AS source_sense_id,
-                   source.term AS target_term,
-                   source.normalized_term AS target_normalized,
-                   source.language AS target_language,
-                   relation.source_sense_id AS target_sense_id,
-                   relation.direction_code,
-                   provenance.source, provenance.source_license,
-                   provenance.source_url
-            FROM relations AS relation
-            JOIN lexical_terms AS source
-              ON source.term_id = relation.source_term_id
-            JOIN lexical_terms AS target
-              ON target.term_id = relation.target_term_id
-            JOIN provenance
-              ON provenance.provenance_id = relation.provenance_id
-            WHERE {' AND '.join(reverse_clauses)}
-            ORDER BY source.language, source.normalized_term, source.term,
-                     relation.source_sense_id
+            WITH candidates AS (
+                SELECT target.term_id AS source_term_id,
+                       target.term AS source_term,
+                       target.normalized_term AS source_normalized,
+                       target.language AS source_language,
+                       relation.target_sense_id AS source_sense_id,
+                       source.term_id AS target_term_id,
+                       source.term AS target_term,
+                       source.normalized_term AS target_normalized,
+                       source.language AS target_language,
+                       relation.source_sense_id AS target_sense_id,
+                       relation.direction_code,
+                       provenance.provenance_id,
+                       provenance.source, provenance.source_license,
+                       provenance.source_url,
+                       (SELECT COUNT(*)
+                          FROM lexical_entries AS target_entry
+                         WHERE target_entry.term_id = source.term_id
+                       ) AS target_entry_count,
+                       (SELECT COUNT(*)
+                          FROM senses AS target_sense
+                          JOIN lexical_entries AS target_sense_entry
+                            ON target_sense_entry.entry_id = target_sense.entry_id
+                         WHERE target_sense_entry.term_id = source.term_id
+                       ) AS target_sense_count,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY source.term_id
+                           ORDER BY CASE
+                                        WHEN relation.source_sense_id IS NULL
+                                         AND relation.target_sense_id IS NULL THEN 1
+                                        ELSE 0
+                                    END,
+                                    relation.target_sense_id,
+                                    relation.source_sense_id,
+                                    provenance.provenance_id,
+                                    relation.direction_code
+                       ) AS target_variant_rank,
+                       2 AS query_orientation
+                FROM relations AS relation
+                JOIN lexical_terms AS source
+                  ON source.term_id = relation.source_term_id
+                JOIN lexical_terms AS target
+                  ON target.term_id = relation.target_term_id
+                JOIN provenance
+                  ON provenance.provenance_id = relation.provenance_id
+                WHERE {" AND ".join(reverse_clauses)}
+            )
+            SELECT * FROM candidates
+            ORDER BY target_variant_rank,
+                     target_sense_count DESC, target_entry_count DESC,
+                     (LENGTH(target_normalized) -
+                      LENGTH(REPLACE(target_normalized, ' ', ''))),
+                     LENGTH(target_normalized), target_language,
+                     target_normalized, target_term, target_sense_id,
+                     provenance_id, direction_code
             LIMIT ?
         """
         with self._lock:
-            forward = self._connection.execute(
-                select_forward, forward_parameters
-            ).fetchall()
-            reverse = self._connection.execute(
-                select_reverse, reverse_parameters
-            ).fetchall()
+            forward = self._connection.execute(select_forward, forward_parameters).fetchall()
+            reverse = self._connection.execute(select_reverse, reverse_parameters).fetchall()
 
         oriented: list[dict[str, Any]] = []
         for row in forward:
@@ -548,50 +842,617 @@ class LexiconService:
         for row in reverse:
             item = dict(row)
             item["relation_code"] = relation_code
-            item["direction_code"] = _INVERSE_DIRECTION_CODES[
-                int(item["direction_code"])
-            ]
+            item["direction_code"] = _INVERSE_DIRECTION_CODES[int(item["direction_code"])]
             oriented.append(item)
-        oriented.sort(
+        return self._rank_oriented_relation_rows(oriented, limit=limit)
+
+    @staticmethod
+    def _relation_row_rank_key(item: Mapping[str, Any]) -> tuple[Any, ...]:
+        normalized = str(item["target_normalized"])
+        return (
+            int(item.get("target_variant_rank", 1)),
+            -int(item.get("target_sense_count", 0)),
+            -int(item.get("target_entry_count", 0)),
+            normalized.count(" "),
+            len(normalized),
+            str(item["target_language"]),
+            normalized,
+            str(item["target_term"]),
+            str(item["source_sense_id"] or ""),
+            str(item["target_sense_id"] or ""),
+            int(item["direction_code"]),
+            str(item["source"]),
+        )
+
+    def _rank_oriented_relation_rows(
+        self, oriented: list[dict[str, Any]], *, limit: int
+    ) -> list[dict[str, Any]]:
+        buckets: dict[tuple[int, int], list[dict[str, Any]]] = {}
+        for item in oriented:
+            bucket_key = (
+                int(item["provenance_id"]),
+                int(item["query_orientation"]),
+            )
+            buckets.setdefault(bucket_key, []).append(item)
+        for bucket_rows in buckets.values():
+            bucket_rows.sort(key=self._relation_row_rank_key)
+
+        # Relation sources and physical orientations have complementary
+        # coverage. Round-robin prevents one dense source/orientation from
+        # consuming the bounded scan before another can contribute a target.
+        ranked: list[dict[str, Any]] = []
+        position = 0
+        bucket_keys = sorted(buckets)
+        while len(ranked) < limit:
+            added = False
+            for bucket_key in bucket_keys:
+                bucket_rows = buckets[bucket_key]
+                if position < len(bucket_rows):
+                    ranked.append(bucket_rows[position])
+                    added = True
+                    if len(ranked) == limit:
+                        break
+            if not added:
+                break
+            position += 1
+        return ranked
+
+    def _relation_rows_many(
+        self,
+        sources: list[tuple[str, str]],
+        relation_code: int,
+        *,
+        target_language: str | None,
+        branch_limit: int,
+    ) -> list[dict[str, Any]]:
+        """Return bounded per-source second hops with a constant number of queries."""
+
+        unique_sources = sorted(set(sources))
+        if not unique_sources:
+            return []
+
+        by_source: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for offset in range(0, len(unique_sources), _RELATION_BATCH_SOURCE_LIMIT):
+            batch = unique_sources[offset : offset + _RELATION_BATCH_SOURCE_LIMIT]
+            for item in self._batched_relation_rows(
+                batch,
+                relation_code,
+                target_language=target_language,
+                per_orientation_limit=branch_limit,
+            ):
+                identity = (
+                    str(item["source_normalized"]),
+                    str(item["source_language"]),
+                )
+                by_source.setdefault(identity, []).append(item)
+
+        ranked: list[dict[str, Any]] = []
+        for source in unique_sources:
+            ranked.extend(
+                self._rank_oriented_relation_rows(
+                    by_source.get(source, []),
+                    limit=branch_limit,
+                )
+            )
+        return ranked
+
+    def _batched_relation_rows(
+        self,
+        sources: list[tuple[str, str]],
+        relation_code: int,
+        *,
+        target_language: str | None,
+        per_orientation_limit: int,
+    ) -> list[dict[str, Any]]:
+        """Fetch both physical orientations for many normalized source terms."""
+
+        requested_values = ", ".join("(?, ?)" for _source in sources)
+        requested_parameters: list[Any] = [
+            value for source in sources for value in source
+        ]
+
+        def select_orientation(*, reverse: bool) -> tuple[str, list[Any]]:
+            if reverse:
+                physical_source = "target"
+                physical_target = "source"
+                source_sense = "relation.target_sense_id"
+                target_sense = "relation.source_sense_id"
+                query_relation_code = _INVERSE_RELATION_CODES[relation_code]
+                query_orientation = 2
+            else:
+                physical_source = "source"
+                physical_target = "target"
+                source_sense = "relation.source_sense_id"
+                target_sense = "relation.target_sense_id"
+                query_relation_code = relation_code
+                query_orientation = 1
+
+            target_clause = ""
+            parameters = [*requested_parameters, query_relation_code]
+            if target_language is not None:
+                target_clause = f"AND {physical_target}.language = ?"
+                parameters.append(target_language)
+            prefetch_limit = min(128, max(32, per_orientation_limit * 4))
+            parameters.append(prefetch_limit)
+            sql = f"""
+                WITH requested(normalized_term, language) AS (
+                    VALUES {requested_values}
+                ),
+                candidates AS (
+                    SELECT {physical_source}.term_id AS source_term_id,
+                           {physical_source}.term AS source_term,
+                           {physical_source}.normalized_term AS source_normalized,
+                           {physical_source}.language AS source_language,
+                           {source_sense} AS source_sense_id,
+                           {physical_target}.term_id AS target_term_id,
+                           {physical_target}.term AS target_term,
+                           {physical_target}.normalized_term AS target_normalized,
+                           {physical_target}.language AS target_language,
+                           {target_sense} AS target_sense_id,
+                           relation.direction_code,
+                           provenance.provenance_id,
+                           provenance.source, provenance.source_license,
+                           provenance.source_url,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY {physical_source}.normalized_term,
+                                            {physical_source}.language
+                               ORDER BY CASE
+                                            WHEN relation.source_sense_id IS NULL
+                                             AND relation.target_sense_id IS NULL THEN 1
+                                            ELSE 0
+                                        END,
+                                        CASE WHEN {target_sense} IS NULL THEN 1 ELSE 0 END,
+                                        (LENGTH({physical_target}.normalized_term) -
+                                         LENGTH(REPLACE(
+                                             {physical_target}.normalized_term, ' ', ''
+                                         ))),
+                                        LENGTH({physical_target}.normalized_term),
+                                        {physical_target}.language,
+                                        {physical_target}.normalized_term,
+                                        {physical_target}.term,
+                                        {source_sense}, {target_sense},
+                                        provenance.provenance_id,
+                                        relation.direction_code
+                           ) AS source_prefetch_rank,
+                           {query_orientation} AS query_orientation
+                    FROM requested
+                    JOIN lexical_terms AS {physical_source}
+                      ON {physical_source}.normalized_term = requested.normalized_term
+                     AND {physical_source}.language = requested.language
+                    JOIN relations AS relation
+                      ON relation.{physical_source}_term_id = {physical_source}.term_id
+                     AND relation.relation_code = ?
+                    JOIN lexical_terms AS {physical_target}
+                      ON {physical_target}.term_id = relation.{physical_target}_term_id
+                    JOIN provenance
+                      ON provenance.provenance_id = relation.provenance_id
+                    WHERE 1 = 1 {target_clause}
+                ),
+                bounded AS MATERIALIZED (
+                    SELECT * FROM candidates WHERE source_prefetch_rank <= ?
+                )
+                SELECT bounded.*,
+                       (SELECT COUNT(*)
+                          FROM lexical_entries AS target_entry
+                         WHERE target_entry.term_id = bounded.target_term_id
+                       ) AS target_entry_count,
+                       (SELECT COUNT(*)
+                          FROM senses AS target_sense_row
+                          JOIN lexical_entries AS target_sense_entry
+                            ON target_sense_entry.entry_id = target_sense_row.entry_id
+                         WHERE target_sense_entry.term_id = bounded.target_term_id
+                       ) AS target_sense_count
+                FROM bounded
+                ORDER BY source_language, source_normalized, source_prefetch_rank
+            """
+            return sql, parameters
+
+        oriented: list[dict[str, Any]] = []
+        with self._lock:
+            for reverse in (False, True):
+                sql, parameters = select_orientation(reverse=reverse)
+                rows = self._connection.execute(sql, parameters).fetchall()
+                orientation_rows: list[dict[str, Any]] = []
+                for row in rows:
+                    item = dict(row)
+                    item["relation_code"] = relation_code
+                    if reverse:
+                        item["direction_code"] = _INVERSE_DIRECTION_CODES[
+                            int(item["direction_code"])
+                        ]
+                    orientation_rows.append(item)
+
+                variants: dict[tuple[str, str, int], list[dict[str, Any]]] = {}
+                for item in orientation_rows:
+                    identity = (
+                        str(item["source_normalized"]),
+                        str(item["source_language"]),
+                        int(item["target_term_id"]),
+                    )
+                    variants.setdefault(identity, []).append(item)
+                for variant_rows in variants.values():
+                    variant_rows.sort(
+                        key=lambda item: (
+                            1
+                            if item["source_sense_id"] is None
+                            and item["target_sense_id"] is None
+                            else 0,
+                            str(item["source_sense_id"] or ""),
+                            str(item["target_sense_id"] or ""),
+                            int(item["provenance_id"]),
+                            int(item["direction_code"]),
+                        )
+                    )
+                    for rank, item in enumerate(variant_rows, start=1):
+                        item["target_variant_rank"] = rank
+                oriented.extend(orientation_rows)
+        return oriented
+
+    @staticmethod
+    def _relation_path_is_scoped(first: Mapping[str, Any], second: Mapping[str, Any]) -> bool:
+        """Require exact sense continuity or a wholly unsensed two-edge path."""
+
+        sense_ids = (
+            first["source_sense_id"],
+            first["target_sense_id"],
+            second["source_sense_id"],
+            second["target_sense_id"],
+        )
+        if all(sense_id is None for sense_id in sense_ids):
+            return bool(first["target_term_id"] == second["source_term_id"])
+        return all(sense_id is not None for sense_id in sense_ids) and (
+            first["target_sense_id"] == second["source_sense_id"]
+        )
+
+    def _transitive_frontier_rows(
+        self,
+        rows: list[dict[str, Any]],
+        relation_code: int,
+        *,
+        budget: int,
+    ) -> list[dict[str, Any]]:
+        """Select a bounded, sense/source-diverse set of first-hop edges."""
+
+        preferred_direction = 1 if relation_code == _RELATION_CODES["hypernym"] else 2
+        diverse_rows = self._target_diverse_relation_rows(
+            sorted(
+                rows,
+                key=lambda row: (
+                    0 if int(row["direction_code"]) == preferred_direction else 1,
+                    self._relation_row_rank_key(row),
+                ),
+            )
+        )
+        scopes_by_target: dict[tuple[str, str], set[bool]] = {}
+        for row in diverse_rows:
+            identity = (
+                str(row["target_normalized"]),
+                str(row["target_language"]),
+            )
+            scopes_by_target.setdefault(identity, set()).add(
+                row["source_sense_id"] is not None
+            )
+
+        buckets: dict[tuple[int, int, str], list[dict[str, Any]]] = {}
+        for row in diverse_rows:
+            bucket_key = (
+                int(row["provenance_id"]),
+                int(row["query_orientation"]),
+                str(row["source_sense_id"] or ""),
+            )
+            buckets.setdefault(bucket_key, []).append(row)
+
+        def frontier_key(row: Mapping[str, Any]) -> tuple[Any, ...]:
+            target = (
+                str(row["target_normalized"]),
+                str(row["target_language"]),
+            )
+            normalized = target[0]
+            return (
+                0 if len(scopes_by_target[target]) > 1 else 1,
+                0 if row["target_sense_id"] is not None else 1,
+                -int(row.get("target_sense_count", 0)),
+                -int(row.get("target_entry_count", 0)),
+                int(row.get("target_variant_rank", 1)),
+                normalized.count(" "),
+                len(normalized),
+                str(row["target_language"]),
+                normalized,
+                str(row["target_term"]),
+                str(row["target_sense_id"] or ""),
+            )
+
+        for bucket_rows in buckets.values():
+            bucket_rows.sort(key=frontier_key)
+
+        selected: list[dict[str, Any]] = []
+
+        def take_round_robin(
+            candidate_buckets: dict[tuple[int, int, str], list[dict[str, Any]]],
+        ) -> None:
+            position = 0
+            bucket_keys = sorted(candidate_buckets)
+            while len(selected) < budget:
+                added = False
+                for bucket_key in bucket_keys:
+                    bucket_rows = candidate_buckets[bucket_key]
+                    if position < len(bucket_rows):
+                        selected.append(bucket_rows[position])
+                        added = True
+                        if len(selected) == budget:
+                            break
+                if not added:
+                    break
+                position += 1
+
+        # Cross-scope corroboration is high-value evidence and must not be
+        # crowded out by the many source senses of a polysemous headword.
+        corroborated = {
+            bucket_key: [
+                row
+                for row in bucket_rows
+                if len(
+                    scopes_by_target[
+                        (
+                            str(row["target_normalized"]),
+                            str(row["target_language"]),
+                        )
+                    ]
+                )
+                > 1
+            ]
+            for bucket_key, bucket_rows in buckets.items()
+        }
+        take_round_robin(corroborated)
+        selected_row_ids = {id(row) for row in selected}
+        remaining = {
+            bucket_key: [row for row in bucket_rows if id(row) not in selected_row_ids]
+            for bucket_key, bucket_rows in buckets.items()
+        }
+        take_round_robin(remaining)
+        return selected
+
+    def _transitive_relation_rows(
+        self,
+        word: str,
+        language: str,
+        relation_code: int,
+        *,
+        target_language: str | None,
+        source_sense_id: str | None,
+        limit: int,
+        first_edges: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Expand one exact, homogeneous hierarchy hop to distance two."""
+
+        if relation_code not in {
+            _RELATION_CODES["hypernym"],
+            _RELATION_CODES["hyponym"],
+        }:
+            return []
+        # Scan a fixed overfetch, then expand a smaller frontier tied to the
+        # caller's explicit transitive allocation. Sense/provenance round-robin
+        # prevents one polysemous source or dense graph source from dominating.
+        frontier_scan_limit = 256
+        if first_edges is None:
+            first_edges = self._relation_rows(
+                word,
+                language,
+                relation_code,
+                target_language=None,
+                source_sense_id=source_sense_id,
+                limit=frontier_scan_limit,
+            )
+        else:
+            first_edges = first_edges[:frontier_scan_limit]
+        first_edges = self._transitive_frontier_rows(
+            first_edges,
+            relation_code,
+            budget=16 if limit <= 5 else min(64, limit * 4),
+        )
+        second_edges = self._relation_rows_many(
+            [
+                (str(edge["target_normalized"]), str(edge["target_language"]))
+                for edge in first_edges
+            ],
+            relation_code,
+            target_language=target_language,
+            branch_limit=max(16, min(32, limit * 2)),
+        )
+        by_source: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for edge in second_edges:
+            identity = (
+                str(edge["source_normalized"]),
+                str(edge["source_language"]),
+            )
+            by_source.setdefault(identity, []).append(edge)
+
+        candidates: list[dict[str, Any]] = []
+        for first in first_edges:
+            intermediate = (
+                str(first["target_normalized"]),
+                str(first["target_language"]),
+            )
+            for second in by_source.get(intermediate, ()):
+                if first["provenance_id"] != second["provenance_id"]:
+                    continue
+                if first["direction_code"] != second["direction_code"]:
+                    continue
+                if not self._relation_path_is_scoped(first, second):
+                    continue
+                if (
+                    str(second["target_normalized"]),
+                    str(second["target_language"]),
+                ) == (word, language):
+                    continue
+                item = dict(second)
+                item["source_term_id"] = first["source_term_id"]
+                item["source_term"] = first["source_term"]
+                item["source_normalized"] = first["source_normalized"]
+                item["source_language"] = first["source_language"]
+                item["source_sense_id"] = first["source_sense_id"]
+                item["relation_code"] = relation_code
+                item["path_rows"] = (first, second)
+                candidates.append(item)
+
+        preferred_direction = 1 if relation_code == _RELATION_CODES["hypernym"] else 2
+        sensed_signatures = {
+            tuple(
+                (
+                    str(edge["source_normalized"]),
+                    str(edge["source_language"]),
+                    str(edge["target_normalized"]),
+                    str(edge["target_language"]),
+                )
+                for edge in item["path_rows"]
+            )
+            for item in candidates
+            if item["source_sense_id"] is not None
+        }
+        for item in candidates:
+            signature = tuple(
+                (
+                    str(edge["source_normalized"]),
+                    str(edge["source_language"]),
+                    str(edge["target_normalized"]),
+                    str(edge["target_language"]),
+                )
+                for edge in item["path_rows"]
+            )
+            item["scope_priority"] = (
+                0
+                if item["source_sense_id"] is None and signature in sensed_signatures
+                else 1
+                if item["source_sense_id"] is not None
+                else 2
+            )
+        candidates.sort(
             key=lambda item: (
+                int(item["scope_priority"]),
+                -int(item.get("target_sense_count", 0)),
+                -int(item.get("target_entry_count", 0)),
                 str(item["target_language"]),
                 str(item["target_normalized"]),
                 str(item["target_term"]),
                 str(item["target_sense_id"] or ""),
+                0 if int(item["direction_code"]) == preferred_direction else 1,
                 int(item["direction_code"]),
                 str(item["source"]),
+                tuple(
+                    (
+                        str(edge["source_normalized"]),
+                        str(edge["source_sense_id"] or ""),
+                        str(edge["target_normalized"]),
+                        str(edge["target_sense_id"] or ""),
+                    )
+                    for edge in item["path_rows"]
+                ),
             )
         )
-        return oriented[:limit]
+        return candidates
 
-    def _relation_synonyms(
+    def _unsensed_relation_synonym_candidates(
         self,
         word: str,
         language: str,
-        part_of_speech: str | None,
-        limit: int,
-        seen: set[tuple[str, str]],
-    ) -> dict[str, Any] | None:
-        if part_of_speech is not None:
-            # Relations carry no POS. A requested POS must never receive unscoped fallback data.
-            return None
+        strict_support: Mapping[tuple[str, str], int],
+    ) -> list[dict[str, Any]]:
+        """Collect same-language, wholly-unsensed relation candidates."""
+
         rows = self._relation_rows(
             word,
             language,
             _RELATION_CODES["synonym"],
-            target_language=None,
+            target_language=language,
             source_sense_id=None,
-            limit=limit * 2,
+            limit=_RELATION_SCAN_CEILING,
         )
-        candidates: list[dict[str, Any]] = []
+        grouped: dict[tuple[str, str], dict[str, Any]] = {}
         for row in rows:
-            if row["source_sense_id"] is not None:
+            if row["source_sense_id"] is not None or row["target_sense_id"] is not None:
                 continue
             identity = (str(row["target_normalized"]), str(row["target_language"]))
-            if identity == (word, language) or identity in seen:
+            if identity == (word, language):
                 continue
-            seen.add(identity)
-            candidates.append(
+            candidate = grouped.get(identity)
+            if candidate is None:
+                grouped[identity] = {
+                    "identity": identity,
+                    "row": row,
+                    "orientations": {int(row["query_orientation"])},
+                    "strict_support": strict_support.get(identity, 0),
+                    "lexical_affinity": (
+                        identity[0].startswith(word) or word.startswith(identity[0])
+                    ),
+                }
+                continue
+            candidate["orientations"].add(int(row["query_orientation"]))
+            if self._relation_row_rank_key(row) < self._relation_row_rank_key(candidate["row"]):
+                candidate["row"] = row
+        return list(grouped.values())
+
+    def _rank_unsensed_relation_synonyms(
+        self,
+        candidates: list[dict[str, Any]],
+        selected_strict: set[tuple[str, str]],
+    ) -> list[dict[str, Any]]:
+        """Rank corroborated additions, then balance one-way orientations."""
+
+        def candidate_key(candidate: Mapping[str, Any]) -> tuple[Any, ...]:
+            row = candidate["row"]
+            target_sense_count = int(row.get("target_sense_count", 0))
+            support = int(candidate["strict_support"])
+            return (
+                0 if target_sense_count > 0 else 1,
+                0 if candidate["lexical_affinity"] else 1,
+                0 if support > 0 else 1,
+                -target_sense_count,
+                -support,
+                *self._relation_row_rank_key(row),
+            )
+
+        ranked: list[dict[str, Any]] = []
+        for duplicates_strict in (False, True):
+            partition = [
+                candidate
+                for candidate in candidates
+                if (candidate["identity"] in selected_strict) is duplicates_strict
+            ]
+            corroborated = [
+                candidate for candidate in partition if len(candidate["orientations"]) > 1
+            ]
+            corroborated.sort(key=candidate_key)
+            ranked.extend(corroborated)
+
+            one_way_buckets: dict[tuple[int, int], list[dict[str, Any]]] = {}
+            for candidate in partition:
+                if len(candidate["orientations"]) > 1:
+                    continue
+                row = candidate["row"]
+                bucket_key = (
+                    next(iter(candidate["orientations"])),
+                    int(row["provenance_id"]),
+                )
+                one_way_buckets.setdefault(bucket_key, []).append(candidate)
+            for bucket_rows in one_way_buckets.values():
+                bucket_rows.sort(key=candidate_key)
+            position = 0
+            bucket_keys = sorted(one_way_buckets)
+            while True:
+                added = False
+                for bucket_key in bucket_keys:
+                    bucket_rows = one_way_buckets[bucket_key]
+                    if position < len(bucket_rows):
+                        ranked.append(bucket_rows[position])
+                        added = True
+                if not added:
+                    break
+                position += 1
+
+        results: list[dict[str, Any]] = []
+        for candidate in ranked:
+            row = candidate["row"]
+            results.append(
                 {
                     "term": row["target_term"],
                     "language": row["target_language"],
@@ -601,20 +1462,7 @@ class LexiconService:
                     "provenance": _provenance(row),
                 }
             )
-            if len(candidates) == limit:
-                break
-        if not candidates:
-            return None
-        return {
-            "sense_id": None,
-            "sense_scope": "unsensed",
-            "word": word,
-            "language": language,
-            "part_of_speech": None,
-            "gloss": None,
-            "synonyms": candidates,
-            "provenance": candidates[0]["provenance"],
-        }
+        return results
 
     def dictionary_translate(
         self,
@@ -624,6 +1472,7 @@ class LexiconService:
         sense_id: str | None = None,
         part_of_speech: str | None = None,
         limit: int = 20,
+        max_senses: int = 100,
     ) -> dict[str, Any]:
         original = word.strip() if isinstance(word, str) else word
         key = normalize_key(word)
@@ -632,26 +1481,23 @@ class LexiconService:
         sense_id = self._validate_sense_id(sense_id)
         part_of_speech = normalize_optional_text(part_of_speech, field="part_of_speech")
         limit = validate_limit(limit)
-        rows = self._sense_rows(key, source_language, part_of_speech, sense_id, limit)
-        groups: list[dict[str, Any]] = []
-        remaining = limit
-        seen: set[tuple[str, str, str]] = set()
+        max_senses = _validate_bounded_integer(max_senses, field="max_senses", minimum=1)
+        rows = self._sense_rows(key, source_language, part_of_speech, sense_id, max_senses)
+        group_specs: list[tuple[sqlite3.Row, list[dict[str, Any]]]] = []
         for row in rows:
-            if remaining <= 0:
-                break
             row_sense_id = str(row["sense_id"])
             translations: list[dict[str, Any]] = []
+            seen_in_sense: set[tuple[str, str]] = set()
             for item in self._translation_rows(
                 row_sense_id, target_language=target_language, limit=limit
             ):
                 identity = (
-                    row_sense_id,
                     str(item["normalized_term"]),
                     str(item["target_language"]),
                 )
-                if identity in seen:
+                if identity in seen_in_sense:
                     continue
-                seen.add(identity)
+                seen_in_sense.add(identity)
                 translations.append(
                     {
                         "term": item["term"],
@@ -662,23 +1508,30 @@ class LexiconService:
                         "provenance": _provenance(item),
                     }
                 )
-                remaining -= 1
-                if remaining == 0:
-                    break
             if translations:
-                groups.append(
-                    {
-                        "sense_id": row_sense_id,
-                        "sense_scope": sense_scope(row_sense_id),
-                        "word": row["word"],
-                        "source_language": row["language"],
-                        "part_of_speech": row["part_of_speech"],
-                        "gloss": row["gloss"],
-                        "translations": translations,
-                        "provenance": _provenance(row),
-                    }
-                )
-        return self._response(
+                group_specs.append((row, translations))
+
+        allocated = _round_robin_allocate(
+            [translations for _row, translations in group_specs], limit
+        )
+        groups: list[dict[str, Any]] = []
+        for (row, _candidates), translations in zip(group_specs, allocated, strict=True):
+            if not translations:
+                continue
+            row_sense_id = str(row["sense_id"])
+            groups.append(
+                {
+                    "sense_id": row_sense_id,
+                    "sense_scope": sense_scope(row_sense_id),
+                    "word": row["word"],
+                    "source_language": row["language"],
+                    "part_of_speech": row["part_of_speech"],
+                    "gloss": row["gloss"],
+                    "translations": translations,
+                    "provenance": _provenance(row),
+                }
+            )
+        response = self._response(
             "dictionary_translate",
             {
                 "word": original,
@@ -687,9 +1540,13 @@ class LexiconService:
                 "target_language": target_language,
                 "sense_id": sense_id,
                 "part_of_speech": part_of_speech,
+                "limit": limit,
+                "max_senses": max_senses,
             },
             groups,
         )
+        response["candidate_count"] = sum(len(group["translations"]) for group in groups)
+        return response
 
     def dictionary_relations(
         self,
@@ -699,6 +1556,8 @@ class LexiconService:
         target_language: str | None = None,
         sense_id: str | None = None,
         limit: int = 20,
+        max_depth: int = 2,
+        transitive_limit: int = 5,
     ) -> dict[str, Any]:
         original = word.strip() if isinstance(word, str) else word
         key = normalize_key(word)
@@ -712,26 +1571,63 @@ class LexiconService:
             raise ValueError(f"relation must be one of: {', '.join(sorted(RELATIONS))}")
         sense_id = self._validate_sense_id(sense_id)
         limit = validate_limit(limit)
-        results: list[dict[str, Any]] = []
-        rows = self._relation_rows(
+        max_depth = _validate_bounded_integer(max_depth, field="max_depth", minimum=1, maximum=2)
+        transitive_limit = _validate_allocation(
+            transitive_limit, field="transitive_limit", limit=limit
+        )
+
+        direct_frontier = self._relation_rows(
             key,
             language,
             _RELATION_CODES[relation],
             target_language=target_language,
             source_sense_id=sense_id,
-            limit=limit * 2,
+            limit=_relation_scan_limit(limit),
         )
-        seen: set[tuple[str, str, str | None, str | None]] = set()
-        for row in rows:
-            identity = (
-                str(row["target_normalized"]),
-                str(row["target_language"]),
-                row["source_sense_id"],
-                row["target_sense_id"],
+        direct_rows = [dict(row) for row in direct_frontier]
+        for row in direct_rows:
+            edge = dict(row)
+            row["relation_scope"] = "direct"
+            row["distance"] = 1
+            row["path_rows"] = (edge,)
+            row["scope_priority"] = 1 if row["source_sense_id"] is not None else 2
+        direct_rows = self._target_diverse_relation_rows(direct_rows)
+
+        transitive_rows: list[dict[str, Any]] = []
+        supports_transitive = relation in {"hypernym", "hyponym"}
+        transitive_budget = transitive_limit if max_depth == 2 and supports_transitive else 0
+        if max_depth == 2 and supports_transitive and transitive_budget > 0:
+            # With no final-language filter, the direct overfetch is exactly the
+            # first-hop hierarchy frontier. Reuse it rather than issuing the
+            # same high-degree query twice. A cross-lingual final filter still
+            # needs an unfiltered first hop and is fetched inside the helper.
+            transitive_frontier = direct_frontier if target_language is None else None
+            transitive_rows = self._transitive_relation_rows(
+                key,
+                language,
+                _RELATION_CODES[relation],
+                target_language=target_language,
+                source_sense_id=sense_id,
+                limit=transitive_budget,
+                first_edges=transitive_frontier,
             )
-            if identity in seen:
-                continue
-            seen.add(identity)
+            for row in transitive_rows:
+                row["relation_scope"] = "transitive"
+                row["distance"] = 2
+
+            direct_identities = {self._relation_identity(row) for row in direct_rows}
+            transitive_rows = self._target_diverse_relation_rows(
+                transitive_rows, seen=direct_identities
+            )
+
+        selected_transitive = transitive_rows[:transitive_budget]
+        # The caller's transitive allocation is reserved only when truthful
+        # paths exist. Any unused allocation returns to direct results.
+        selected_direct = direct_rows[: limit - len(selected_transitive)]
+        ordered_rows = [*selected_direct, *selected_transitive]
+
+        results: list[dict[str, Any]] = []
+        for row in ordered_rows:
             source_id = row["source_sense_id"]
             relation_code = int(row["relation_code"])
             direction_code = int(row["direction_code"])
@@ -740,6 +1636,26 @@ class LexiconService:
                 direction_name = _DIRECTION_NAMES[direction_code]
             except KeyError as exc:  # artifact corruption, not model input
                 raise RuntimeError("Relation artifact contains an unknown code") from exc
+            path: list[dict[str, Any]] = []
+            for edge in row["path_rows"]:
+                try:
+                    edge_relation = _RELATION_NAMES[int(edge["relation_code"])]
+                    edge_direction = _DIRECTION_NAMES[int(edge["direction_code"])]
+                except KeyError as exc:  # artifact corruption, not model input
+                    raise RuntimeError("Relation artifact contains an unknown code") from exc
+                path.append(
+                    {
+                        "source_term": edge["source_term"],
+                        "source_language": edge["source_language"],
+                        "source_sense_id": edge["source_sense_id"],
+                        "relation": edge_relation,
+                        "target_term": edge["target_term"],
+                        "target_language": edge["target_language"],
+                        "target_sense_id": edge["target_sense_id"],
+                        "direction": edge_direction,
+                        "provenance": _provenance(edge),
+                    }
+                )
             results.append(
                 {
                     "source_term": row["source_term"],
@@ -751,11 +1667,12 @@ class LexiconService:
                     "target_language": row["target_language"],
                     "target_sense_id": row["target_sense_id"],
                     "direction": direction_name,
+                    "relation_scope": row["relation_scope"],
+                    "distance": row["distance"],
+                    "path": path,
                     "provenance": _provenance(row),
                 }
             )
-            if len(results) == limit:
-                break
         return self._response(
             "dictionary_relations",
             {
@@ -765,9 +1682,55 @@ class LexiconService:
                 "relation": relation,
                 "target_language": target_language,
                 "sense_id": sense_id,
+                "limit": limit,
+                "max_depth": max_depth,
+                "transitive_limit": transitive_limit,
             },
             results,
         )
+
+    @staticmethod
+    def _relation_identity(
+        row: Mapping[str, Any],
+    ) -> tuple[str, str, str | None, str | None]:
+        return (
+            str(row["target_normalized"]),
+            str(row["target_language"]),
+            row["source_sense_id"],
+            row["target_sense_id"],
+        )
+
+    def _target_diverse_relation_rows(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        seen: set[tuple[str, str, str | None, str | None]] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return one row per target before additional sense variants."""
+
+        exact_seen = set() if seen is None else set(seen)
+        unique_rows: list[dict[str, Any]] = []
+        for row in rows:
+            identity = self._relation_identity(row)
+            if identity in exact_seen:
+                continue
+            exact_seen.add(identity)
+            unique_rows.append(row)
+
+        target_seen: set[tuple[str, str]] = set()
+        primary_rows: list[dict[str, Any]] = []
+        sense_variants: list[dict[str, Any]] = []
+        for row in unique_rows:
+            target_identity = (
+                str(row["target_language"]),
+                str(row["target_normalized"]),
+            )
+            if target_identity in target_seen:
+                sense_variants.append(row)
+            else:
+                target_seen.add(target_identity)
+                primary_rows.append(row)
+        return [*primary_rows, *sense_variants]
 
     def dictionary_semantic_neighbors(
         self,
@@ -802,6 +1765,7 @@ class LexiconService:
                 "normalized_word": key,
                 "source_language": source_language,
                 "target_language": target_language,
+                "limit": limit,
                 "min_similarity": min_similarity,
             },
             results,
@@ -809,9 +1773,7 @@ class LexiconService:
         response["available"] = self._semantic.available
         return response
 
-    def dictionary_wordplay(
-        self, mode: str, text: str, limit: int = 20
-    ) -> dict[str, Any]:
+    def dictionary_wordplay(self, mode: str, text: str, limit: int = 20) -> dict[str, Any]:
         if not isinstance(mode, str) or mode not in WORDPLAY_MODES:
             raise ValueError(f"mode must be one of: {', '.join(sorted(WORDPLAY_MODES))}")
         original = text.strip() if isinstance(text, str) else text
@@ -820,7 +1782,13 @@ class LexiconService:
         results = self._wordplay.search(mode, key, limit=limit)
         return self._response(
             "dictionary_wordplay",
-            {"text": original, "normalized_text": key, "language": "en", "mode": mode},
+            {
+                "text": original,
+                "normalized_text": key,
+                "language": "en",
+                "mode": mode,
+                "limit": limit,
+            },
             results,
         )
 

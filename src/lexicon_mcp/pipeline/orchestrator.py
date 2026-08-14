@@ -53,7 +53,11 @@ FULL_CORPUS_FLOORS: dict[str, dict[str, int]] = {
     "conceptnet": {
         "source_assertions": 20_000_000,
         "assertions": 18_000_000,
-        "relations": 18_000_000,
+        # ConceptNet 5.7 produces 18,501,416 accepted assertions but
+        # 17,927,524 physical rows after the schema intentionally collapses
+        # URI-tail variants and the SimilarTo/RelatedTo public relation alias.
+        # Keep this floor against physical rows with a 2.38% truncation margin.
+        "relations": 17_500_000,
     },
     "numberbatch": {"expected_rows": 9_000_000, "terms": 9_000_000},
     "cmudict": {"entries": 130_000},

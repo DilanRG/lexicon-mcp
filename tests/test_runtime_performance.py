@@ -18,6 +18,7 @@ def test_full_corpus_latency_and_private_memory_gates() -> None:
     except AcceptanceDatasetUnavailable as exc:
         pytest.skip(str(exc))
     report = run_isolated_performance(dataset)
+    print(report.to_json(), flush=True)
     assert report.lexical_p95_ms <= 150, report
     assert report.semantic_cold_ms <= 2_000, report
     assert report.semantic_warm_p95_ms <= 500, report

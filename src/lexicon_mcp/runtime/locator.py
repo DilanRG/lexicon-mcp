@@ -41,7 +41,9 @@ class DatasetLocator:
         except FileNotFoundError as exc:
             raise RuntimeError(
                 f"No active lexicon dataset at {activation_path}. "
-                "Install one explicitly with lexicon-data install."
+                "Install one explicitly with: "
+                "lexicon-data install --profile full --version data-v1.0.0. "
+                f"LEXICON_DATA_DIR selects the dataset root (currently {self.root})."
             ) from exc
         except (OSError, json.JSONDecodeError) as exc:
             raise RuntimeError(

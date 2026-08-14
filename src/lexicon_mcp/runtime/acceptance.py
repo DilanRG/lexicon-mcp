@@ -14,6 +14,7 @@ from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any
 
+from .evidence import compact_evidence_json
 from .locator import ActiveDataset, DatasetLocator
 from .offline import deny_network
 from .service import LexiconService
@@ -109,6 +110,43 @@ class PerformanceReport:
     semantic_warm_samples: int
     semantic_seed: str
     semantic_language: str
+
+    def to_evidence(self) -> dict[str, object]:
+        """Return every measurement with non-overlapping memory labels."""
+
+        return {
+            "latency_ms": {
+                "lexical_p95": self.lexical_p95_ms,
+                "semantic_cold": self.semantic_cold_ms,
+                "semantic_warm_p95": self.semantic_warm_p95_ms,
+            },
+            "memory_bytes": {
+                "idle_process_private": self.idle_private_bytes,
+                "semantic_worker_peak_mapped_artifact_rss_diagnostic": (
+                    self.semantic_worker_peak_mapped_artifact_rss_bytes
+                ),
+                "semantic_worker_peak_private": (
+                    self.semantic_worker_peak_private_bytes
+                ),
+                "semantic_worker_peak_total_working_set": (
+                    self.semantic_worker_peak_working_set_bytes
+                ),
+            },
+            "report": "performance_acceptance",
+            "samples": {
+                "lexical": self.lexical_samples,
+                "semantic_warm": self.semantic_warm_samples,
+            },
+            "semantic_query": {
+                "language": self.semantic_language,
+                "seed": self.semantic_seed,
+            },
+        }
+
+    def to_json(self) -> str:
+        """Return one deterministic compact JSON evidence record."""
+
+        return compact_evidence_json(self.to_evidence())
 
 
 def _semantic_seed(directory: Path) -> tuple[str, str]:
@@ -273,6 +311,10 @@ def _performance_worker(
                 lambda: service.dictionary_synonyms("important", "en"),
                 lambda: service.dictionary_translate("bank", "en", "de"),
                 lambda: service.dictionary_relations("dog", "hypernym", "en"),
+                lambda: service.dictionary_relations("thing", "hyponym", "en"),
+                lambda: service.dictionary_relations("object", "hyponym", "en"),
+                lambda: service.dictionary_relations("animal", "hyponym", "en"),
+                lambda: service.dictionary_relations("person", "hyponym", "en"),
                 lambda: service.dictionary_wordplay("rhyme", "cat"),
             )
             lexical_timings: list[float] = []

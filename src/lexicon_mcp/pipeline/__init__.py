@@ -6,6 +6,7 @@ runtime artifacts.  Downloading source corpora is an orchestration concern and
 never happens here.
 """
 
+from .notice_amendment import amend_promoted_dataset_notices
 from .orchestrator import (
     BuildInputs,
     build_full_corpus,
@@ -14,6 +15,7 @@ from .orchestrator import (
 
 __all__ = [
     "BuildInputs",
+    "amend_promoted_dataset_notices",
     "build_full_corpus",
     "recover_full_corpus_from_semantic_partial",
 ]

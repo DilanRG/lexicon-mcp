@@ -20,6 +20,39 @@ The server exposes exactly six tools:
 5. `dictionary_semantic_neighbors`
 6. `dictionary_wordplay`
 
+Relation results label direct edges as `relation_scope="direct"`, `distance=1`.
+Hypernym and hyponym queries can additionally return a bounded, homogeneous
+two-edge expansion labelled `relation_scope="transitive"`, `distance=2`; its
+`path` contains both directed edges with their exact sense scope and provenance.
+
+`dictionary_lookup` uses `limit` for returned senses and has independent total
+response budgets for examples, pronunciations, and translations. Their defaults
+are `8`, `8`, and `20`; each is shared round-robin across the returned senses and
+`0` disables that detail class. Every sense reports `truncated_fields`, so a fixed
+budget never silently presents a partial detail list as complete.
+
+`dictionary_translate` inspects up to `max_senses=100` source-native senses by
+default, independently of its total translation-candidate `limit`. Translation
+candidates are distributed round-robin across matching source-sense groups.
+Grouped synonym and translation responses retain `count` for the number of groups
+and also report `candidate_count` for their nested candidates.
+
+`dictionary_synonyms` accepts `max_senses` (the number of source-native lexical
+senses inspected) and `unsensed_limit`; `dictionary_relations` accepts `max_depth`
+(one or two relation-graph hops) and `transitive_limit`. In both tools, `limit` is
+the total returned-candidate cap. An allocation of `0` disables the broader class,
+a positive value requests an explicit bounded allocation, and the default is `5`.
+Allocations cannot exceed `limit`; automatic allocation is reserved for a future
+release. The sentinel `-1` is reserved for future benchmark-tuned automatic
+allocation and is not accepted in v1; `0` disables the allocated class. Unused
+broader allocation is returned to sense-scoped or direct candidates.
+
+For semantic neighbours, omitting `target_language` searches the global
+multilingual index; setting it to the source tag produces monolingual results,
+and another tag requests cross-lingual results. English `near_rhyme` wordplay is
+fixed to exactly one ARPAbet-token insertion, deletion, or substitution in v1;
+there is no automatic or caller-configurable edit distance.
+
 Dataset installation, verification, repair, and rollback are deliberately CLI-only.
 
 ## Local development
@@ -145,6 +178,50 @@ corpus with networking denied:
 uv run --frozen pytest -m full_corpus -ra
 uv run --frozen pytest -m ann -ra
 uv run --frozen pytest -m performance -ra
+```
+
+The Windows live-stack gate has a separate, explicit runner. It refuses to touch
+services unless `--execute-live` is present, always performs exactly ten cycles,
+and leaves append-only JSONL evidence plus a final JSON report:
+
+```powershell
+uv run --frozen --project E:\AI\lexicon-mcp python `
+  E:\AI\lexicon-mcp\scripts\run_live_acceptance.py `
+  --execute-live `
+  --base-report E:\AI\state\lexicon-mcp-build\acceptance\corpus-gates.json
+```
+
+Each cycle proves the old MCPO root and children exited, obtains exclusive handles
+to every active dataset artifact while stopped, starts through the normal
+`E:\AI\scripts` entrypoints, checks router/Open WebUI/MCPO health, validates the
+exact six-operation Lexicon OpenAPI surface, invokes a lightweight Lexicon lookup
+and Calculator in every cycle, and finishes with `active_models=[]`. In the first
+post-restart cycle it also invokes and validates all six Lexicon tools through MCPO:
+`bank` lookup selects unique Wiktionary river and financial senses by source and
+gloss, then passes each exact sense ID into a separate German translation call. The
+river call must return `Ufer` and the financial call must return `Bank`; acceptance
+does not depend on either term appearing in lookup's bounded embedded-translation
+page. The lookup itself uses a total `translations_limit=3`, proves the aggregate
+budget is respected, verifies every returned translation remains attached to its
+source sense, and requires per-sense `truncated_fields` evidence. Synonyms, directed
+relations, language-filtered finite-cosine semantic neighbours, and query-excluding
+wordplay are checked against pinned corpus anchors. The full cross-tool flow,
+request/result hashes, both selected sense IDs, and per-tool assertions are written
+to both JSONL events and the final report.
+
+Recursive directory notifications plus baseline, per-cycle, and final inventories
+reject dataset or project-venv rewrites, including short-lived transient files.
+Full content fingerprints are calculated before and after the run. The runner checks
+Open WebUI health only: it does **not** claim that an ordinary chat prompt selected
+or invoked a tool. That UI-level prompt evidence must be captured separately during
+live acceptance. A fixture replay is available for safe runner validation, but its
+report deliberately records `live_stack_ok=false`, labels all six-tool calls as
+`fixture-replay`, and cannot satisfy publication:
+
+```powershell
+uv run --frozen --project E:\AI\lexicon-mcp python `
+  E:\AI\lexicon-mcp\scripts\run_live_acceptance.py `
+  --dry-run-fixture E:\AI\lexicon-mcp\tests\fixtures\live_acceptance\happy.json
 ```
 
 `scripts/publish_data_release.py --stage` creates or resumes a draft and verifies every

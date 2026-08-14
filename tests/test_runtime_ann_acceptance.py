@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -72,6 +73,34 @@ def test_ann_validator_uses_pipeline_fixture_read_only(
         assert result.ann_semantic_ids == result.exact_semantic_ids
         assert result.recall_at_k == 1.0
 
+    evidence = report.to_evidence()
+    assert evidence == json.loads(report.to_json())
+    assert report.to_json() == report.to_json()
+    assert "\n" not in report.to_json()
+    assert evidence["comparison_count"] == 2
+    assert evidence["unique_seed_count"] == 1
+    assert evidence["global"] == {
+        "comparison_count": 1,
+        "deterministic": True,
+        "recall_at_k": 1.0,
+    }
+    assert evidence["language_shards"] == {
+        "comparison_count": 1,
+        "deterministic": True,
+        "recall_at_k": 1.0,
+        "strict_language_filtering": True,
+    }
+    assert evidence["per_language"] == {
+        "en": {
+            "comparison_count": 2,
+            "deterministic": True,
+            "global_recall_at_k": 1.0,
+            "language_shard_recall_at_k": 1.0,
+            "seed_count": 1,
+            "strict_language_filtering": True,
+        }
+    }
+
 
 @pytest.mark.full_corpus
 @pytest.mark.ann
@@ -83,9 +112,15 @@ def test_numberbatch_ann_recall_and_language_shards_offline() -> None:
 
     with deny_network():
         report = validate_ann_acceptance(dataset)
+    print(report.to_json(), flush=True)
 
     assert report.languages == DEFAULT_LANGUAGES
     assert len(report.results) == 200
+    seed_scopes: dict[int, set[str]] = {}
+    for result in report.results:
+        seed_scopes.setdefault(result.seed_semantic_id, set()).add(result.index_scope)
+    assert len(seed_scopes) == 100
+    assert all(scopes == {"global", "language_shard"} for scopes in seed_scopes.values())
     assert all(
         sum(result.language == language for result in report.results) == 20
         for language in DEFAULT_LANGUAGES
@@ -113,6 +148,18 @@ def test_numberbatch_ann_recall_and_language_shards_offline() -> None:
         len(result.exact_terms)
         == len(set(zip(result.exact_languages, result.exact_terms, strict=True)))
         for result in report.results
+    )
+    evidence = report.to_evidence()
+    assert evidence["comparison_count"] == 200
+    assert evidence["unique_seed_count"] == 100
+    assert evidence["global"]["comparison_count"] == 100
+    assert evidence["language_shards"]["comparison_count"] == 100
+    assert all(
+        language_report["seed_count"] == 10
+        and language_report["comparison_count"] == 20
+        and language_report["deterministic"] is True
+        and language_report["strict_language_filtering"] is True
+        for language_report in evidence["per_language"].values()
     )
     assert report.global_recall_at_k >= 0.90, {
         "global_recall_at_20": report.global_recall_at_k,

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from ..usearch_compat import open_index_view
-from .offline import deny_network
+from .offline import deny_network, install_network_guard
 
 
 class SemanticSearch(Protocol):
@@ -52,9 +52,10 @@ _WORKER_IDLE_SECONDS = 180.0
 
 
 def _initialize_semantic_worker() -> None:
-    """Bound OpenBLAS before the worker imports NumPy."""
+    """Bound OpenBLAS and permanently deny networking in the worker process."""
 
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    install_network_guard()
 
 
 def _sqlite_ro(path: Path) -> sqlite3.Connection:

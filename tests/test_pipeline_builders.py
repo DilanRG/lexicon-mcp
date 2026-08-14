@@ -16,7 +16,9 @@ import lexicon_mcp.pipeline.orchestrator as orchestrator
 from lexicon_mcp.data.manifest import parse_manifest
 from lexicon_mcp.pipeline import BuildInputs, build_full_corpus
 from lexicon_mcp.pipeline.common import normalize_term, stable_id
+from lexicon_mcp.pipeline.conceptnet import build_conceptnet
 from lexicon_mcp.pipeline.manifest import package_dataset
+from lexicon_mcp.pipeline.schema import create_lexical_schema
 
 FIXTURES = Path(__file__).parent / "fixtures" / "build_inputs"
 
@@ -516,6 +518,78 @@ def test_wiktextract_synonym_floor_uses_deduplicated_physical_rows() -> None:
     assert failures == [
         "wiktextract.synonyms: observed 3499999, required at least 3500000"
     ]
+
+
+def test_conceptnet_relation_floor_uses_deduplicated_physical_rows() -> None:
+    stage_counts = {
+        stage: dict(metrics)
+        for stage, metrics in orchestrator.FULL_CORPUS_FLOORS.items()
+    }
+    stage_counts["conceptnet"].update(
+        {
+            "source_assertions": 34_074_917,
+            "assertions": 18_501_416,
+            "relations": 17_927_524,
+        }
+    )
+
+    report, failures = orchestrator.evaluate_corpus_floors(stage_counts)
+
+    assert report["conceptnet"]["relations"] == {
+        "observed": 17_927_524,
+        "minimum": 17_500_000,
+        "passed": True,
+    }
+    assert failures == []
+
+    stage_counts["conceptnet"]["relations"] = 17_499_999
+    report, failures = orchestrator.evaluate_corpus_floors(stage_counts)
+
+    assert report["conceptnet"]["relations"] == {
+        "observed": 17_499_999,
+        "minimum": 17_500_000,
+        "passed": False,
+    }
+    assert failures == [
+        "conceptnet.relations: observed 17499999, required at least 17500000"
+    ]
+
+
+def test_conceptnet_counts_uri_tail_and_relation_alias_collapses(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "conceptnet.tsv"
+    source.write_text(
+        "\n".join(
+            (
+                "a1\t/r/RelatedTo\t/c/en/bank/n\t/c/en/money",
+                "a2\t/r/RelatedTo\t/c/en/bank/v\t/c/en/money",
+                "a3\t/r/SimilarTo\t/c/en/bank\t/c/en/money",
+                "a4\t/r/Synonym\t/c/en/bank/n\t/c/en/bank/v",
+                "a5\t/r/ExternalURL\t/c/en/bank\t/c/en/example",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    connection = sqlite3.connect(":memory:")
+    create_lexical_schema(connection, "fixture-v1")
+
+    counts = build_conceptnet(connection, source)
+
+    assert counts == {
+        "source_assertions": 5,
+        "assertions": 4,
+        "relations": 2,
+        "skipped": 1,
+        "malformed": 0,
+    }
+    rows = connection.execute(
+        "SELECT relation_code,source_term_id=target_term_id FROM relations "
+        "ORDER BY relation_code"
+    ).fetchall()
+    assert rows == [(1, 1), (12, 0)]
+    connection.close()
 
 
 def test_resource_projection_fails_before_output_mutation(

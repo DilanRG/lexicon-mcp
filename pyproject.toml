@@ -9,6 +9,7 @@ description = "Offline multilingual dictionary, thesaurus, relations, semantic-n
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE", "DATA_LICENSES.md"]
 authors = [{ name = "DilanRG" }]
 dependencies = [
   "mcp>=1.29,<2",

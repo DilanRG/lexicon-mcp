@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "dataset": {
+    "version": "data-v1.0.0",
+    "path": "E:\\fixture\\data\\versions\\data-v1.0.0",
+    "manifest_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "transformation_commit": "1111111111111111111111111111111111111111",
+    "manifest_size": 4096
+  }
+}

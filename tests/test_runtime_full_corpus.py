@@ -20,50 +20,151 @@ def _dataset_or_skip() -> Any:
         pytest.skip(str(exc))
 
 
+def _assert_conceptnet_relation(
+    response: dict[str, Any],
+    *,
+    source: str,
+    relation: str,
+    target: str,
+    direction: str,
+) -> None:
+    matches = [
+        item
+        for item in response["results"]
+        if str(item["target_term"]).casefold() == target.casefold()
+        and item["provenance"]["source"] == "ConceptNet 5.7"
+        and item["sense_scope"] == "unsensed"
+    ]
+    assert len(matches) == 1, (source, relation, target, response)
+    item = matches[0]
+    assert str(item["source_term"]).casefold() == source.casefold()
+    assert item["source_language"] == item["target_language"] == "en"
+    assert item["source_sense_id"] is None
+    assert item["target_sense_id"] is None
+    assert item["relation"] == relation
+    assert item["direction"] == direction
+    assert item["relation_scope"] == "direct"
+    assert item["distance"] == 1
+    assert len(item["path"]) == 1
+    edge = item["path"][0]
+    assert (
+        str(edge["source_term"]).casefold(),
+        edge["relation"],
+        str(edge["target_term"]).casefold(),
+        edge["direction"],
+        edge["provenance"],
+    ) == (
+        source.casefold(),
+        relation,
+        target.casefold(),
+        direction,
+        item["provenance"],
+    )
+
+
+def _assert_transitive_hierarchy_relation(
+    response: dict[str, Any],
+    *,
+    source: str,
+    relation: str,
+    target: str,
+    direction: str,
+    intermediate: str,
+    provenance_source: str,
+    source_sense_id: str | None,
+    intermediate_sense_id: str | None,
+    target_sense_id: str | None,
+) -> None:
+    matches = [
+        item
+        for item in response["results"]
+        if str(item["target_term"]).casefold() == target.casefold()
+        and item["relation_scope"] == "transitive"
+        and item["distance"] == 2
+        and item["provenance"]["source"] == provenance_source
+        and item["source_sense_id"] == source_sense_id
+        and item["target_sense_id"] == target_sense_id
+    ]
+    assert matches, (source, relation, target, response)
+    item = matches[0]
+    assert str(item["source_term"]).casefold() == source.casefold()
+    assert item["source_language"] == item["target_language"] == "en"
+    assert item["relation"] == relation
+    assert item["direction"] == direction
+    assert len(item["path"]) == 2
+    first, second = item["path"]
+    assert str(first["source_term"]).casefold() == source.casefold()
+    assert str(first["target_term"]).casefold() == intermediate.casefold()
+    assert str(second["source_term"]).casefold() == intermediate.casefold()
+    assert str(second["target_term"]).casefold() == target.casefold()
+    assert first["target_language"] == second["source_language"] == "en"
+    assert all(edge["relation"] == relation for edge in item["path"])
+    assert all(edge["direction"] == direction for edge in item["path"])
+    assert {edge["provenance"]["source"] for edge in item["path"]} == {provenance_source}
+    assert all(edge["provenance"] == item["provenance"] for edge in item["path"])
+    assert (
+        first["source_sense_id"],
+        first["target_sense_id"],
+        second["source_sense_id"],
+        second["target_sense_id"],
+    ) == (
+        source_sense_id,
+        intermediate_sense_id,
+        intermediate_sense_id,
+        target_sense_id,
+    )
+
+
 @pytest.mark.full_corpus
 def test_required_full_corpus_anchors_offline() -> None:
     dataset = _dataset_or_skip()
     with LexiconService.from_active_dataset(dataset) as service, deny_network():
-        bank = service.dictionary_lookup("bank", "en", limit=100)
+        bank = service.dictionary_lookup(
+            "bank",
+            "en",
+            limit=100,
+            examples_limit=8,
+            pronunciations_limit=8,
+            translations_limit=20,
+        )
         glosses = [str(item["gloss"] or "").casefold() for item in bank["results"]]
         assert any("financial" in gloss for gloss in glosses)
         assert any("river" in gloss or "water" in gloss for gloss in glosses)
-        lookup_translations = {
-            item["term"]
-            for sense in bank["results"]
-            for item in sense["translations"]
-            if item["language"] == "de"
-        }
-        assert {"Bank", "Ufer"} <= lookup_translations
+        assert sum(len(sense["examples"]) for sense in bank["results"]) <= 8
+        assert sum(len(sense["pronunciations"]) for sense in bank["results"]) <= 8
+        assert sum(len(sense["translations"]) for sense in bank["results"]) <= 20
+        assert any(sense["translations"] for sense in bank["results"])
+        assert any("translations" in sense["truncated_fields"] for sense in bank["results"])
 
-        translations = service.dictionary_translate("bank", "en", "de", limit=100)
+        translations = service.dictionary_translate("bank", "en", "de")
+        assert translations["query"]["limit"] == 20
+        assert translations["query"]["max_senses"] == 100
+        assert translations["candidate_count"] <= 20
         bank_groups = [
             group
             for group in translations["results"]
             if any(item["term"] == "Bank" for item in group["translations"])
+            and any(
+                marker in str(group["gloss"] or "").casefold()
+                for marker in ("financial", "institution")
+            )
         ]
         ufer_groups = [
             group
             for group in translations["results"]
             if any(item["term"] == "Ufer" for item in group["translations"])
+            and any(
+                marker in str(group["gloss"] or "").casefold()
+                for marker in ("river", "water", "edge", "lake")
+            )
         ]
-        assert len(bank_groups) == len(ufer_groups) == 1
+        assert bank_groups and len(ufer_groups) == 1
         assert bank_groups[0]["sense_id"] != ufer_groups[0]["sense_id"]
         assert bank_groups[0]["sense_scope"] == ufer_groups[0]["sense_scope"] == "sense"
-        assert any(
-            marker in str(bank_groups[0]["gloss"] or "").casefold()
-            for marker in ("financial", "institution")
-        )
-        assert any(
-            marker in str(ufer_groups[0]["gloss"] or "").casefold()
-            for marker in ("river", "water", "edge", "lake")
-        )
 
-        lead = service.dictionary_lookup("lead", "en", limit=100)
+        lead = service.dictionary_lookup("lead", "en", limit=100, pronunciations_limit=100)
         pronunciations = {
-            str(item["ipa"])
-            for sense in lead["results"]
-            for item in sense["pronunciations"]
+            str(item["ipa"]) for sense in lead["results"] for item in sense["pronunciations"]
         }
         assert any("lɛd" in ipa for ipa in pronunciations)
         assert any("li\u02d0d" in ipa or "li:d" in ipa for ipa in pronunciations)
@@ -87,21 +188,152 @@ def test_required_full_corpus_anchors_offline() -> None:
             assert all(item["part_of_speech"] for item in lookup["results"])
             assert any(item["gloss"] for item in lookup["results"])
 
-        relations = (
-            ("hot", "antonym", "cold"),
-            ("dog", "hypernym", "animal"),
-            ("dog", "capable_of", "bark"),
-            ("poodle", "hypernym", "dog"),
-            ("car", "meronym", "wheel"),
-            ("knife", "used_for", "cutting"),
-            ("book", "at_location", "library"),
+        direct_relations = (
+            ("hot", "antonym", "cold", "symmetric"),
+            ("dog", "capable_of", "bark", "outbound"),
+            ("poodle", "hypernym", "dog", "outbound"),
+            ("car", "meronym", "wheel", "inbound"),
+            ("knife", "used_for", "cutting", "outbound"),
+            ("book", "at_location", "library", "outbound"),
         )
-        for word, relation, target in relations:
-            response = service.dictionary_relations(word, relation, "en", limit=100)
-            assert any(
-                str(item["target_term"]).casefold() == target for item in response["results"]
-            ), (word, relation, response)
-            assert all(item["direction"] for item in response["results"])
+        for word, relation, target, direction in direct_relations:
+            response = service.dictionary_relations(word, relation, "en")
+            _assert_conceptnet_relation(
+                response,
+                source=word,
+                relation=relation,
+                target=target,
+                direction=direction,
+            )
+
+        dog_hypernyms = service.dictionary_relations(
+            "dog", "hypernym", "en", limit=100, max_depth=2, transitive_limit=20
+        )
+        _assert_transitive_hierarchy_relation(
+            dog_hypernyms,
+            source="dog",
+            relation="hypernym",
+            target="animal",
+            direction="outbound",
+            intermediate="domestic animal",
+            provenance_source="ConceptNet 5.7",
+            source_sense_id=None,
+            intermediate_sense_id=None,
+            target_sense_id=None,
+        )
+        dog_sense = "oewn:oewn-dog__1.05.00.."
+        domestic_animal_sense = "oewn:oewn-domestic_animal__1.05.00.."
+        animal_sense = "oewn:oewn-animal__1.03.00.."
+        sensed_dog_hypernyms = service.dictionary_relations(
+            "dog",
+            "hypernym",
+            "en",
+            sense_id=dog_sense,
+            limit=100,
+            max_depth=2,
+            transitive_limit=20,
+        )
+        _assert_transitive_hierarchy_relation(
+            sensed_dog_hypernyms,
+            source="dog",
+            relation="hypernym",
+            target="animal",
+            direction="outbound",
+            intermediate="domestic animal",
+            provenance_source="Open English WordNet",
+            source_sense_id=dog_sense,
+            intermediate_sense_id=domestic_animal_sense,
+            target_sense_id=animal_sense,
+        )
+        sensed_animal_hyponyms = service.dictionary_relations(
+            "animal",
+            "hyponym",
+            "en",
+            sense_id=animal_sense,
+            limit=100,
+            max_depth=2,
+            transitive_limit=20,
+        )
+        _assert_transitive_hierarchy_relation(
+            sensed_animal_hyponyms,
+            source="animal",
+            relation="hyponym",
+            target="dog",
+            direction="inbound",
+            intermediate="domestic animal",
+            provenance_source="Open English WordNet",
+            source_sense_id=animal_sense,
+            intermediate_sense_id=domestic_animal_sense,
+            target_sense_id=dog_sense,
+        )
+
+        # These reverse queries prove that one stored assertion is exposed
+        # from its target with the same logical relation and inverted direction.
+        inverse_relations = (
+            ("cold", "antonym", "hot", "symmetric"),
+            ("bark", "capable_of", "dog", "inbound"),
+            ("wheel", "holonym", "car", "outbound"),
+            ("cutting", "used_for", "knife", "inbound"),
+            ("library", "at_location", "book", "inbound"),
+        )
+        for word, relation, target, direction in inverse_relations:
+            response = service.dictionary_relations(word, relation, "en")
+            _assert_conceptnet_relation(
+                response,
+                source=word,
+                relation=relation,
+                target=target,
+                direction=direction,
+            )
+
+        dog_synonyms = service.dictionary_synonyms("dog", "en")
+        dog_candidates = [
+            candidate for group in dog_synonyms["results"] for candidate in group["synonyms"]
+        ]
+        assert len(dog_candidates) <= 20
+        assert {candidate["language"] for candidate in dog_candidates} == {"en"}
+        assert any(
+            str(group["gloss"] or "").casefold() == "animal" and group["sense_scope"] == "sense"
+            for group in dog_synonyms["results"]
+        )
+        dog_unsensed = [
+            candidate
+            for group in dog_synonyms["results"]
+            if group["sense_scope"] == "unsensed"
+            for candidate in group["synonyms"]
+        ]
+        assert len(dog_unsensed) <= 5
+        assert {
+            "canine",
+            "cur",
+            "doggy",
+            "hound",
+            "pooch",
+        } <= {str(candidate["term"]).casefold() for candidate in dog_unsensed}
+
+        important = service.dictionary_synonyms("important", "en")
+        assert any(
+            group["sense_scope"] == "unsensed"
+            and {"significant", "key"}
+            <= {str(candidate["term"]).casefold() for candidate in group["synonyms"]}
+            for group in important["results"]
+        )
+        for word in ("important", "bright", "bank"):
+            for small_limit in (1, 2, 3, 5):
+                small = service.dictionary_synonyms(word, "en", limit=small_limit, unsensed_limit=0)
+                scoped_count = sum(
+                    len(group["synonyms"])
+                    for group in small["results"]
+                    if group["sense_scope"] == "sense"
+                )
+                unsensed_count = sum(
+                    len(group["synonyms"])
+                    for group in small["results"]
+                    if group["sense_scope"] == "unsensed"
+                )
+                assert scoped_count + unsensed_count <= small_limit
+                assert scoped_count >= min(small_limit, 4)
+                assert unsensed_count == 0
 
         assert any(
             item["term"].casefold() == "bat"
