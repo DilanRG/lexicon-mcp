@@ -5,6 +5,7 @@ import json
 import sqlite3
 from contextlib import closing
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -460,7 +461,17 @@ def test_corrupt_semantic_index_forces_numberbatch_rebuild(
     assert len(Index.restore(output / "semantic" / "indexes" / "global.usearch")) == 10
 
 
-def test_full_corpus_floors_reject_fixture_without_guessing_counts(tmp_path: Path) -> None:
+def test_full_corpus_floors_reject_fixture_without_guessing_counts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The clean GitHub Windows runner exposes ~35 GiB on its temporary drive,
+    # below the production 80 GiB peak preflight. This unit test is about the
+    # corpus floor report, so isolate it from host disk capacity.
+    monkeypatch.setattr(
+        orchestrator.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(free=100 * 1024**3),
+    )
     with pytest.raises(RuntimeError, match=r"wiktextract\.entries.*numberbatch\.terms"):
         build_full_corpus(
             BuildInputs(
