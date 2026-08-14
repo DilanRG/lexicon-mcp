@@ -1,8 +1,17 @@
 from __future__ import annotations
 
+import json
+import os
+import queue
+import socket
 import sqlite3
+import subprocess
+import sys
+import threading
+from collections.abc import Callable
 from pathlib import Path
 
+import anyio
 import pytest
 from mcp.server.fastmcp.exceptions import ToolError
 
@@ -11,6 +20,7 @@ from lexicon_mcp.pipeline.schema import (
     create_lexical_query_indexes,
     create_lexical_schema,
 )
+from lexicon_mcp.runtime.offline import NetworkDisabledError
 from lexicon_mcp.runtime.service import LexiconService
 from lexicon_mcp.server import create_mcp
 
@@ -152,22 +162,82 @@ async def test_mcp_similarity_accepts_integer_json_numbers_but_rejects_bool(
         )
 
 
-def test_server_main_installs_network_guard_before_stdio_run(
+def test_server_main_creates_event_loop_before_guard_and_denies_external_network(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[str] = []
+    original_run = anyio.run
 
-    monkeypatch.setattr(
-        server_module,
-        "install_network_guard",
-        lambda: events.append("network_guard"),
-    )
+    def install_guard() -> None:
+        events.append("network_guard")
 
-    def run(*, transport: str) -> None:
-        events.append(f"run:{transport}")
+        def blocked(*_args: object, **_kwargs: object) -> object:
+            raise NetworkDisabledError("blocked by test guard")
 
-    monkeypatch.setattr(server_module.mcp, "run", run)
+        monkeypatch.setattr(socket, "create_connection", blocked)
 
+    async def run_stdio_async() -> None:
+        events.append("run_stdio_async")
+        with pytest.raises(NetworkDisabledError, match="blocked by test guard"):
+            socket.create_connection(("example.com", 443))
+
+    def run_with_event_loop(function: Callable[..., object], *args: object) -> None:
+        events.append("event_loop")
+        original_run(function, *args)
+
+    monkeypatch.setattr(server_module, "install_network_guard", install_guard)
+    monkeypatch.setattr(server_module.mcp, "run_stdio_async", run_stdio_async)
+    monkeypatch.setattr(anyio, "run", run_with_event_loop)
     server_module.main()
 
-    assert events == ["network_guard", "run:stdio"]
+    assert events == ["event_loop", "network_guard", "run_stdio_async"]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="exercises the Windows Proactor loop")
+def test_windows_stdio_server_initializes_under_permanent_network_guard() -> None:
+    """The guarded server must start after Proactor has made its local socketpair."""
+
+    request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "lexicon-stdio-test", "version": "1"},
+        },
+    }
+    environment = os.environ.copy()
+    environment.pop("LEXICON_DATA_DIR", None)
+    process = subprocess.Popen(
+        [sys.executable, "-m", "lexicon_mcp.server"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        cwd=Path.cwd(),
+        env=environment,
+    )
+    assert process.stdin is not None
+    assert process.stdout is not None
+    process.stdin.write(json.dumps(request) + "\n")
+    process.stdin.flush()
+
+    lines: queue.Queue[str] = queue.Queue(maxsize=1)
+    threading.Thread(target=lambda: lines.put(process.stdout.readline()), daemon=True).start()
+    try:
+        line = lines.get(timeout=10)
+    except queue.Empty:
+        process.terminate()
+        _stdout, stderr = process.communicate(timeout=5)
+        pytest.fail(f"guarded stdio server did not initialize:\n{stderr}")
+    else:
+        process.terminate()
+        _stdout, stderr = process.communicate(timeout=5)
+
+    assert line, stderr
+    response = json.loads(line)
+    assert response["id"] == 1
+    assert "result" in response
+    assert "NetworkDisabledError" not in stderr

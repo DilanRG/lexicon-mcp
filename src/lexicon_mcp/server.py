@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 from typing import Annotated, Any, Literal
 
+import anyio
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
@@ -289,9 +290,23 @@ def create_mcp(service: LexiconService | None = None) -> FastMCP:
 mcp = create_mcp()
 
 
-def main() -> None:
+async def _run_stdio_offline() -> None:
+    """Serve stdio only after AnyIO has created its local event-loop plumbing.
+
+    Windows' ProactorEventLoop creates an internal loopback socketpair during
+    loop construction.  Installing the process-wide socket guard before that
+    would mistake the runtime's local plumbing for an external connection and
+    prevent the server from starting.  ``anyio.run`` constructs the loop before
+    this coroutine is entered; from here onward every application-initiated
+    network connection remains denied.
+    """
+
     install_network_guard()
-    mcp.run(transport="stdio")
+    await mcp.run_stdio_async()
+
+
+def main() -> None:
+    anyio.run(_run_stdio_offline)
 
 
 if __name__ == "__main__":
