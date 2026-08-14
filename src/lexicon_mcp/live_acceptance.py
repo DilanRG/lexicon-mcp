@@ -2342,7 +2342,7 @@ class FixtureHost:
 
     def run_script(self, path: Path, *, timeout_seconds: float) -> CommandObservation:
         del timeout_seconds
-        name = path.name.casefold()
+        name = PureWindowsPath(str(path)).name.casefold()
         self._script_calls.append(name)
         if "stop" in name:
             self._running = False

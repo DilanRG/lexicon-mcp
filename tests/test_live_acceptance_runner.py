@@ -5,7 +5,7 @@ import os
 import time
 from collections import Counter
 from collections.abc import Sequence
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 import pytest
@@ -368,12 +368,11 @@ def test_failed_stack_restoration_does_not_replace_original_failure(
                 raise OriginalFailure("primary acceptance failure")
             raise AssertionError("exclusive_open unexpectedly retried")
 
-        def run_script(
-            self, path: Path, *, timeout_seconds: float
-        ) -> CommandObservation:
-            if "start" not in path.name.casefold():
+        def run_script(self, path: Path, *, timeout_seconds: float) -> CommandObservation:
+            name = PureWindowsPath(str(path)).name.casefold()
+            if "start" not in name:
                 return super().run_script(path, timeout_seconds=timeout_seconds)
-            self._script_calls.append(path.name.casefold())
+            self._script_calls.append(name)
             empty = "e3b0c44298fc1c149afbf4c8996fb924"
             return CommandObservation(
                 str(path),
