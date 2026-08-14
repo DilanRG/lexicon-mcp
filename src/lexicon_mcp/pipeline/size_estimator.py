@@ -22,6 +22,10 @@ class FullCorpusShape:
     wiktextract_senses: int = 12_999_262
     wiktextract_examples: int = 1_535_987
     wiktextract_translations: int = 3_564_851
+    # Raw source-list items, retained only as a conservative sizing input. The
+    # importer stores 3,688,516 rows after source-sense-scoped duplicate,
+    # self-link, and invalid-term filtering; never use this raw count as a
+    # physical corpus floor.
     wiktextract_synonyms: int = 7_481_661
     wiktextract_antonyms: int = 164_003
     # Sound objects include audio/rhyme metadata; the builder stores only the

@@ -4,22 +4,123 @@ param(
     [string]$Sources = 'E:\AI\state\lexicon-mcp-build\sources',
     [string]$BuildState = 'E:\AI\state\lexicon-mcp-build',
     [string]$Output = 'E:\AI\state\lexicon-mcp-build\built\data-v1.0.0',
-    [string]$DatasetVersion = 'data-v1.0.0'
+    [string]$DatasetVersion = 'data-v1.0.0',
+    [switch]$RecoverPartial,
+    [string]$OriginalBuildCommit = '',
+    [string]$RecoveryCommit = '',
+    [string]$ExpectedLexiconSha256 = '79a87f063bce33ae1f1ccc68f49c45762a57c9377c7eb4f14181a4305ab9dd3b',
+    [string]$ExpectedGlobalIndexSha256 = 'b6596a46e24d86ae6c04b4a48e19adda96faf9f8bff1b151aa4f395c0938f0c4',
+    [string]$ExpectedGlobalVectorsSha256 = '211aeebc9c53b1c79156beca25ca9e2622c4a13229f55293c0801185f13b73bb',
+    [switch]$MonitoringArithmeticSelfTest
 )
 
 $ErrorActionPreference = 'Stop'
+
+function Get-Int64MetricTotal {
+    param(
+        [object[]]$Processes,
+        [string]$PropertyName
+    )
+
+    [long]$total = 0
+    foreach ($trackedProcess in $Processes) {
+        if ($null -ne $trackedProcess) {
+            [long]$value = [long]$trackedProcess.$PropertyName
+            $total = [long]($total + $value)
+        }
+    }
+    return [long]$total
+}
+
+function Get-Int64Minimum {
+    param(
+        [long]$Left,
+        [long]$Right
+    )
+
+    return [Math]::Min([long]$Left, [long]$Right)
+}
+
+function Get-Int64Maximum {
+    param(
+        [long]$Left,
+        [long]$Right
+    )
+
+    return [Math]::Max([long]$Left, [long]$Right)
+}
+
+if ($MonitoringArithmeticSelfTest) {
+    $syntheticProcesses = @(
+        [pscustomobject]@{
+            PrivateMemorySize64 = [long]2147483648
+            WorkingSet64 = [long]4294967296
+        },
+        [pscustomobject]@{
+            PrivateMemorySize64 = [long]4096
+            WorkingSet64 = [long]8192
+        }
+    )
+    [long]$privateBytes = Get-Int64MetricTotal $syntheticProcesses 'PrivateMemorySize64'
+    [long]$workingSetBytes = Get-Int64MetricTotal $syntheticProcesses 'WorkingSet64'
+    [long]$peakPrivateBytes = Get-Int64Maximum ([long]0) $privateBytes
+    [long]$peakWorkingSetBytes = Get-Int64Maximum ([long]0) $workingSetBytes
+    [long]$minimumFree = Get-Int64Minimum ([long]12884901888) ([long]8589934592)
+    [ordered]@{
+        build_started = $false
+        private_bytes = $privateBytes
+        working_set_bytes = $workingSetBytes
+        peak_private_bytes = $peakPrivateBytes
+        peak_working_set_bytes = $peakWorkingSetBytes
+        minimum_free_bytes = $minimumFree
+    } | ConvertTo-Json
+    exit 0
+}
+
 $projectPath = [System.IO.Path]::GetFullPath($Project)
 $sourcePath = [System.IO.Path]::GetFullPath($Sources)
 $statePath = [System.IO.Path]::GetFullPath($BuildState)
 $outputPath = [System.IO.Path]::GetFullPath($Output)
+$operation = if ($RecoverPartial) { 'recovery' } else { 'build' }
+if ($RecoverPartial) {
+    if ($OriginalBuildCommit -notmatch '^[0-9a-f]{40}$') {
+        throw 'Recovery requires -OriginalBuildCommit as lowercase 40-hex.'
+    }
+    if ($RecoveryCommit -notmatch '^[0-9a-f]{40}$') {
+        throw 'Recovery requires -RecoveryCommit as lowercase 40-hex.'
+    }
+    foreach ($shaAnchor in @(
+        $ExpectedLexiconSha256,
+        $ExpectedGlobalIndexSha256,
+        $ExpectedGlobalVectorsSha256
+    )) {
+        if ($shaAnchor -notmatch '^[0-9a-f]{64}$') {
+            throw 'Recovery SHA-256 anchors must be lowercase 64-hex.'
+        }
+    }
+} else {
+    $datasetPartial = $outputPath + '.partial'
+    $semanticPartial = Join-Path $datasetPartial 'semantic.partial'
+    $completedSemantic = Join-Path $datasetPartial 'semantic'
+    if (
+        [System.IO.Directory]::Exists($semanticPartial) -or
+        [System.IO.Directory]::Exists($completedSemantic)
+    ) {
+        throw (
+            'A post-global semantic build is already staged. Refusing the normal ' +
+            'build path; rerun this wrapper with -RecoverPartial and exact commit provenance.'
+        )
+    }
+}
 $logDirectory = Join-Path $statePath 'logs'
 [System.IO.Directory]::CreateDirectory($logDirectory) | Out-Null
 
 $stamp = Get-Date -Format 'yyyyMMddTHHmmss'
-$stdoutPath = Join-Path $logDirectory "full-build-$stamp.stdout.log"
-$stderrPath = Join-Path $logDirectory "full-build-$stamp.stderr.log"
-$telemetryPath = Join-Path $logDirectory "full-build-$stamp.telemetry.jsonl"
-$summaryPath = Join-Path $logDirectory "full-build-$stamp.summary.json"
+$logPrefix = "full-$operation-$stamp"
+$stdoutPath = Join-Path $logDirectory "$logPrefix.stdout.log"
+$stderrPath = Join-Path $logDirectory "$logPrefix.stderr.log"
+$telemetryPath = Join-Path $logDirectory "$logPrefix.telemetry.jsonl"
+$summaryPath = Join-Path $logDirectory "$logPrefix.summary.json"
 
 $pythonPath = Join-Path $projectPath '.venv\Scripts\python.exe'
 if (-not [System.IO.File]::Exists($pythonPath)) {
@@ -37,8 +138,13 @@ $basePythonPath = [System.IO.Path]::GetFullPath((Join-Path $basePythonHome 'pyth
 if (-not [System.IO.File]::Exists($basePythonPath)) {
     throw "Frozen environment base Python is missing: $basePythonPath"
 }
+$entrypoint = if ($RecoverPartial) {
+    Join-Path $projectPath 'scripts\recover_full_corpus.py'
+} else {
+    Join-Path $projectPath 'scripts\build_full_corpus.py'
+}
 $arguments = @(
-    (Join-Path $projectPath 'scripts\build_full_corpus.py'),
+    $entrypoint,
     '--oewn', (Join-Path $sourcePath 'oewn-2025.xml.gz'),
     '--wiktextract', (Join-Path $sourcePath 'wiktextract-en-2026-08-12.jsonl.gz'),
     '--conceptnet', (Join-Path $sourcePath 'conceptnet-assertions-5.7.0.csv.gz'),
@@ -50,14 +156,23 @@ $arguments = @(
     '--build-state', $statePath,
     '--dataset-version', $DatasetVersion
 )
+if ($RecoverPartial) {
+    $arguments += @(
+        '--original-build-commit', $OriginalBuildCommit,
+        '--recovery-commit', $RecoveryCommit,
+        '--expected-lexicon-sha256', $ExpectedLexiconSha256,
+        '--expected-global-index-sha256', $ExpectedGlobalIndexSha256,
+        '--expected-global-vectors-sha256', $ExpectedGlobalVectorsSha256
+    )
+}
 
 $driveRoot = [System.IO.Path]::GetPathRoot($outputPath)
 $drive = [System.IO.DriveInfo]::new($driveRoot)
 $startedAt = [DateTimeOffset]::Now
-$baselineFree = $drive.AvailableFreeSpace
-$minimumFree = $baselineFree
-$peakPrivateBytes = 0
-$peakWorkingSetBytes = 0
+[long]$baselineFree = [long]$drive.AvailableFreeSpace
+[long]$minimumFree = [long]$baselineFree
+[long]$peakPrivateBytes = 0
+[long]$peakWorkingSetBytes = 0
 
 $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
 $startInfo.FileName = $pythonPath
@@ -66,6 +181,10 @@ $startInfo.UseShellExecute = $false
 $startInfo.CreateNoWindow = $true
 $startInfo.RedirectStandardOutput = $true
 $startInfo.RedirectStandardError = $true
+# NumPy's OpenBLAS default can reserve hundreds of MiB per Python process on
+# Windows. The corpus pipeline only performs single-vector operations, so a
+# large BLAS thread pool wastes memory without accelerating this build.
+$startInfo.EnvironmentVariables['OPENBLAS_NUM_THREADS'] = '1'
 # Windows PowerShell 5.1 runs on .NET Framework, whose ProcessStartInfo has no
 # ArgumentList property. These controlled paths contain no quotes; quote every
 # argument so whitespace in an overridden root remains safe.
@@ -123,66 +242,180 @@ function Get-BuildProcesses {
 
 $stdoutTask = $process.StandardOutput.ReadToEndAsync()
 $stderrTask = $process.StandardError.ReadToEndAsync()
+$monitoringError = $null
+$childPreserved = $false
 
-while (-not $process.WaitForExit(15000)) {
-    $trackedProcesses = @(Get-BuildProcesses)
-    foreach ($trackedProcess in $trackedProcesses) {
-        $trackedProcess.Refresh()
+function Add-MonitoringError {
+    param([string]$Message)
+
+    if ([string]::IsNullOrWhiteSpace($script:monitoringError)) {
+        $script:monitoringError = $Message
+    } else {
+        $script:monitoringError = $script:monitoringError + [Environment]::NewLine + $Message
     }
-    $privateBytes = ($trackedProcesses | Measure-Object PrivateMemorySize64 -Sum).Sum
-    $workingSetBytes = ($trackedProcesses | Measure-Object WorkingSet64 -Sum).Sum
-    $drive = [System.IO.DriveInfo]::new($driveRoot)
-    $free = $drive.AvailableFreeSpace
-    $minimumFree = [Math]::Min($minimumFree, $free)
-    $peakPrivateBytes = [Math]::Max($peakPrivateBytes, $privateBytes)
-    $peakWorkingSetBytes = [Math]::Max($peakWorkingSetBytes, $workingSetBytes)
-    [pscustomobject]@{
-        timestamp = [DateTimeOffset]::Now.ToString('o')
-        available_free_bytes = $free
-        peak_volume_bytes_consumed = $baselineFree - $minimumFree
-        private_bytes = $privateBytes
-        working_set_bytes = $workingSetBytes
-        launcher_pid = $process.Id
-        worker_pid = $workerProcessId
-    } | ConvertTo-Json -Compress | Add-Content -LiteralPath $telemetryPath -Encoding utf8
 }
-$process.WaitForExit()
+
+try {
+    while (-not $process.WaitForExit(15000)) {
+        $trackedProcesses = @(Get-BuildProcesses)
+        foreach ($trackedProcess in $trackedProcesses) {
+            $trackedProcess.Refresh()
+        }
+        [long]$privateBytes = Get-Int64MetricTotal $trackedProcesses 'PrivateMemorySize64'
+        [long]$workingSetBytes = Get-Int64MetricTotal $trackedProcesses 'WorkingSet64'
+        $drive = [System.IO.DriveInfo]::new($driveRoot)
+        [long]$free = [long]$drive.AvailableFreeSpace
+        $minimumFree = Get-Int64Minimum $minimumFree $free
+        $peakPrivateBytes = Get-Int64Maximum $peakPrivateBytes $privateBytes
+        $peakWorkingSetBytes = Get-Int64Maximum $peakWorkingSetBytes $workingSetBytes
+        [long]$peakVolumeBytesConsumed = [long]($baselineFree - $minimumFree)
+        [pscustomobject]@{
+            timestamp = [DateTimeOffset]::Now.ToString('o')
+            available_free_bytes = $free
+            peak_volume_bytes_consumed = $peakVolumeBytesConsumed
+            private_bytes = $privateBytes
+            working_set_bytes = $workingSetBytes
+            launcher_pid = $process.Id
+            worker_pid = $workerProcessId
+        } | ConvertTo-Json -Compress | Add-Content -LiteralPath $telemetryPath -Encoding utf8
+    }
+} catch {
+    Add-MonitoringError ("Build monitoring failed; preserving and waiting for the child: " + $_.Exception)
+} finally {
+    try {
+        if (-not $process.HasExited) {
+            # A telemetry failure must not orphan or discard an otherwise valid
+            # multi-hour build. Keep supervising the launcher until completion.
+            $process.WaitForExit()
+        }
+    } catch {
+        Add-MonitoringError ("Could not wait for the build launcher: " + $_.Exception)
+    }
+    try {
+        # The Windows venv launcher can hand work to the base interpreter.
+        # Discover it even if monitoring failed before the first sample.
+        $null = @(Get-BuildProcesses)
+    } catch {
+        Add-MonitoringError ("Could not discover the build worker: " + $_.Exception)
+    }
+    if ($null -ne $workerProcessId) {
+        try {
+            $workerProcess = [System.Diagnostics.Process]::GetProcessById($workerProcessId)
+            if (-not $workerProcess.HasExited) {
+                $workerProcess.WaitForExit()
+            }
+        } catch [System.ArgumentException] {
+            # The worker exited between discovery and the final wait.
+        } catch {
+            Add-MonitoringError ("Could not wait for the build worker: " + $_.Exception)
+        }
+    }
+}
+
 try {
     $trackedProcesses = @(Get-BuildProcesses)
     foreach ($trackedProcess in $trackedProcesses) {
         $trackedProcess.Refresh()
     }
-    $privateBytes = ($trackedProcesses | Measure-Object PrivateMemorySize64 -Sum).Sum
-    $workingSetBytes = ($trackedProcesses | Measure-Object WorkingSet64 -Sum).Sum
-    $peakPrivateBytes = [Math]::Max($peakPrivateBytes, $privateBytes)
-    $peakWorkingSetBytes = [Math]::Max($peakWorkingSetBytes, $workingSetBytes)
+    [long]$privateBytes = Get-Int64MetricTotal $trackedProcesses 'PrivateMemorySize64'
+    [long]$workingSetBytes = Get-Int64MetricTotal $trackedProcesses 'WorkingSet64'
+    $peakPrivateBytes = Get-Int64Maximum $peakPrivateBytes $privateBytes
+    $peakWorkingSetBytes = Get-Int64Maximum $peakWorkingSetBytes $workingSetBytes
 } catch [System.InvalidOperationException], [System.ArgumentException] {
     # The final in-loop sample remains authoritative after a fast process exit.
+} catch {
+    Add-MonitoringError ("Could not collect the final process sample: " + $_.Exception)
 }
-[System.IO.File]::WriteAllText($stdoutPath, $stdoutTask.Result)
-[System.IO.File]::WriteAllText($stderrPath, $stderrTask.Result)
 
-$drive = [System.IO.DriveInfo]::new($driveRoot)
-$minimumFree = [Math]::Min($minimumFree, $drive.AvailableFreeSpace)
+$launcherStillRunning = $false
+try {
+    $launcherStillRunning = -not $process.HasExited
+} catch {
+    $launcherStillRunning = $true
+    Add-MonitoringError ("Could not determine launcher state: " + $_.Exception)
+}
+$workerStillRunning = $false
+if ($null -ne $workerProcessId) {
+    try {
+        $workerStillRunning = -not (
+            [System.Diagnostics.Process]::GetProcessById($workerProcessId).HasExited
+        )
+    } catch [System.ArgumentException] {
+        $workerStillRunning = $false
+    } catch {
+        $workerStillRunning = $true
+        Add-MonitoringError ("Could not determine worker state: " + $_.Exception)
+    }
+}
+$childPreserved = $launcherStillRunning -or $workerStillRunning
+
+if (-not $childPreserved) {
+    try {
+        [System.IO.File]::WriteAllText($stdoutPath, $stdoutTask.Result)
+        [System.IO.File]::WriteAllText($stderrPath, $stderrTask.Result)
+    } catch {
+        Add-MonitoringError ("Could not write redirected build output: " + $_.Exception)
+    }
+}
+
+try {
+    $drive = [System.IO.DriveInfo]::new($driveRoot)
+    [long]$finalFree = [long]$drive.AvailableFreeSpace
+    $minimumFree = Get-Int64Minimum $minimumFree $finalFree
+} catch {
+    Add-MonitoringError ("Could not collect the final free-space sample: " + $_.Exception)
+}
+[long]$peakVolumeBytesConsumed = [long]($baselineFree - $minimumFree)
+$processExitCode = $null
+if (-not $launcherStillRunning) {
+    try {
+        $processExitCode = [int]$process.ExitCode
+    } catch {
+        Add-MonitoringError ("Could not read the build exit code: " + $_.Exception)
+    }
+}
 $summary = [ordered]@{
+    operation = $operation
     dataset_version = $DatasetVersion
     output = $outputPath
     started_at = $startedAt.ToString('o')
     finished_at = [DateTimeOffset]::Now.ToString('o')
-    exit_code = $process.ExitCode
+    exit_code = $processExitCode
     baseline_free_bytes = $baselineFree
     minimum_free_bytes = $minimumFree
-    peak_volume_bytes_consumed = $baselineFree - $minimumFree
+    peak_volume_bytes_consumed = $peakVolumeBytesConsumed
     peak_private_bytes = $peakPrivateBytes
     peak_working_set_bytes = $peakWorkingSetBytes
+    monitoring_error = $monitoringError
+    child_preserved = $childPreserved
+    launcher_pid = $process.Id
+    worker_pid = $workerProcessId
     stdout_log = $stdoutPath
     stderr_log = $stderrPath
     telemetry_log = $telemetryPath
 }
-$summary | ConvertTo-Json | Set-Content -LiteralPath $summaryPath -Encoding utf8
-$summary | ConvertTo-Json
+$summaryJson = $summary | ConvertTo-Json
+try {
+    $summaryJson | Set-Content -LiteralPath $summaryPath -Encoding utf8
+} catch {
+    [Console]::Error.WriteLine("Could not write build summary ${summaryPath}: $($_.Exception)")
+}
+[Console]::Out.WriteLine($summaryJson)
 
-if ($process.ExitCode -ne 0) {
-    Write-Error "Full-corpus build failed with exit code $($process.ExitCode). See $stderrPath"
-    exit $process.ExitCode
+if ($childPreserved) {
+    [Console]::Error.WriteLine(
+        "The monitoring wrapper stopped, but the build child was preserved. " +
+        "Launcher PID: $($process.Id); worker PID: $workerProcessId"
+    )
+    exit 1
+}
+if ($null -ne $monitoringError) {
+    [Console]::Error.WriteLine($monitoringError)
+    exit 1
+}
+if ($processExitCode -ne 0) {
+    [Console]::Error.WriteLine(
+        "Full-corpus $operation failed with exit code $processExitCode. See $stderrPath"
+    )
+    exit $processExitCode
 }

@@ -5,14 +5,16 @@ from __future__ import annotations
 import atexit
 import math
 import multiprocessing
+import os
 import sqlite3
 import threading
 from collections import OrderedDict
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from ..usearch_compat import open_index_view
 from .offline import deny_network
 
 
@@ -46,6 +48,13 @@ class _SemanticRequest:
 _INDEX_CACHE: OrderedDict[str, Any] = OrderedDict()
 _INDEX_CACHE_SIZE = 4
 _SUPPORTED_SCHEMA_VERSION = "2"
+_WORKER_IDLE_SECONDS = 180.0
+
+
+def _initialize_semantic_worker() -> None:
+    """Bound OpenBLAS before the worker imports NumPy."""
+
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
 
 def _sqlite_ro(path: Path) -> sqlite3.Connection:
@@ -56,24 +65,37 @@ def _sqlite_ro(path: Path) -> sqlite3.Connection:
     return connection
 
 
-def _load_index(path: Path, expansion_search: int) -> Any:
+def _load_index(
+    path: Path,
+    dimensions: int,
+    connectivity: int,
+    expansion_add: int,
+    expansion_search: int,
+    expected_count: int,
+) -> Any:
     key = str(path.resolve())
     index = _INDEX_CACHE.pop(key, None)
     if index is not None:
+        if len(index) != expected_count:
+            index.reset()
+            raise RuntimeError(f"Cached semantic index count mismatch: {path}")
         index.expansion_search = expansion_search
         _INDEX_CACHE[key] = index
         return index
-    try:
-        from usearch.index import Index
-    except ImportError as exc:  # pragma: no cover - packaging guarantees the dependency
-        raise RuntimeError("USearch is unavailable; semantic search cannot run") from exc
-    index = Index.restore(key, view=True)
-    if index is None:  # pragma: no cover - USearch raises for ordinary restore failures
-        raise RuntimeError(f"USearch could not restore semantic index: {path}")
-    index.expansion_search = expansion_search
+    index = open_index_view(
+        path,
+        dimensions=dimensions,
+        metric="cos",
+        dtype="i8",
+        connectivity=connectivity,
+        expansion_add=expansion_add,
+        expansion_search=expansion_search,
+        expected_count=expected_count,
+    )
     _INDEX_CACHE[key] = index
     while len(_INDEX_CACHE) > _INDEX_CACHE_SIZE:
-        _INDEX_CACHE.popitem(last=False)
+        _evicted_path, evicted = _INDEX_CACHE.popitem(last=False)
+        evicted.reset()
     return index
 
 
@@ -112,11 +134,13 @@ def _semantic_search_task_offline(request: _SemanticRequest) -> list[dict[str, A
         if metadata.get("index_metric") != "cos" or metadata.get("index_dtype") != "i8":
             raise RuntimeError("Semantic indexes must use cosine/i8 storage")
         try:
+            connectivity = int(metadata.get("connectivity", "16"))
+            expansion_add = int(metadata.get("expansion_add", "256"))
             expansion_search = int(metadata.get("expansion_search", "512"))
         except (TypeError, ValueError) as exc:
-            raise RuntimeError("Semantic metadata has no valid expansion_search") from exc
-        if expansion_search < 512:
-            raise RuntimeError("Semantic expansion_search must be at least 512")
+            raise RuntimeError("Semantic metadata has no valid USearch schema") from exc
+        if connectivity != 16 or expansion_add != 256 or expansion_search < 512:
+            raise RuntimeError("Semantic metadata has an unsupported USearch schema")
         vector_relative = metadata.get("vector_file", "vectors/global.f16")
         vector_path = (directory / vector_relative).resolve()
         if not vector_path.is_relative_to(directory.resolve()) or not vector_path.is_file():
@@ -156,21 +180,41 @@ def _semantic_search_task_offline(request: _SemanticRequest) -> list[dict[str, A
 
         if request.target_language:
             shard = connection.execute(
-                "SELECT index_file FROM semantic_languages WHERE language = ?",
+                """
+                SELECT index_file, term_count
+                FROM semantic_languages
+                WHERE language = ?
+                """,
                 (request.target_language,),
             ).fetchone()
             if shard is None:
                 return []
             index_path = (directory / str(shard["index_file"])).resolve()
+            try:
+                expected_count = int(shard["term_count"])
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "Semantic index term count must be an integer"
+                ) from exc
         else:
             index_path = (
                 directory / metadata.get("global_index", "indexes/global.usearch")
             ).resolve()
+            expected_count = row_count
+        if expected_count < 0:
+            raise RuntimeError("Semantic index term count must be non-negative")
         if not index_path.is_relative_to(directory.resolve()):
             raise RuntimeError("Semantic index path escapes its artifact directory")
         if not index_path.is_file():
             return []
-        index = _load_index(index_path, expansion_search)
+        index = _load_index(
+            index_path,
+            dimensions,
+            connectivity,
+            expansion_add,
+            expansion_search,
+            expected_count,
+        )
         overfetch = min(max(200, request.limit * 10, request.limit + 1), 500)
         matches = index.search(query_vector, overfetch)
         keys = [int(key) for key in matches.keys]
@@ -252,10 +296,22 @@ def _semantic_search_task_offline(request: _SemanticRequest) -> list[dict[str, A
 class SemanticWorker:
     """Own exactly one lazily-created worker process per MCP server process."""
 
-    def __init__(self, directory: Path, dataset_version: str) -> None:
+    def __init__(
+        self,
+        directory: Path,
+        dataset_version: str,
+        *,
+        _idle_timeout_seconds: float = _WORKER_IDLE_SECONDS,
+    ) -> None:
+        if not math.isfinite(_idle_timeout_seconds) or _idle_timeout_seconds <= 0:
+            raise ValueError("semantic worker idle timeout must be finite and positive")
         self.directory = directory.resolve()
         self.dataset_version = dataset_version
+        self._idle_timeout_seconds = _idle_timeout_seconds
         self._executor: ProcessPoolExecutor | None = None
+        self._in_flight: set[Future[list[dict[str, Any]]]] = set()
+        self._idle_timer: threading.Timer | None = None
+        self._closed = False
         self._lock = threading.Lock()
         atexit.register(self.close)
 
@@ -267,12 +323,58 @@ class SemanticWorker:
             and (self.directory / "vectors" / "global.f16").is_file()
         )
 
-    def _pool(self) -> ProcessPoolExecutor:
+    def _pool_locked(self) -> ProcessPoolExecutor:
+        if self._closed:
+            raise RuntimeError("semantic worker is closed")
+        if self._executor is None:
+            context = multiprocessing.get_context("spawn")
+            self._executor = ProcessPoolExecutor(
+                max_workers=1,
+                mp_context=context,
+                initializer=_initialize_semantic_worker,
+            )
+        return self._executor
+
+    def _cancel_idle_timer_locked(self) -> None:
+        timer, self._idle_timer = self._idle_timer, None
+        if timer is not None:
+            timer.cancel()
+
+    def _schedule_idle_teardown_locked(self, executor: ProcessPoolExecutor) -> None:
+        self._cancel_idle_timer_locked()
+        timer = threading.Timer(
+            self._idle_timeout_seconds,
+            self._retire_idle_executor,
+            args=(executor,),
+        )
+        timer.daemon = True
+        self._idle_timer = timer
+        timer.start()
+
+    def _future_done(self, future: Future[list[dict[str, Any]]]) -> None:
         with self._lock:
-            if self._executor is None:
-                context = multiprocessing.get_context("spawn")
-                self._executor = ProcessPoolExecutor(max_workers=1, mp_context=context)
-            return self._executor
+            self._in_flight.discard(future)
+            executor = self._executor
+            if self._closed or executor is None or self._in_flight:
+                return
+            self._schedule_idle_teardown_locked(executor)
+
+    def _retire_idle_executor(self, executor: ProcessPoolExecutor) -> None:
+        current = threading.current_thread()
+        with self._lock:
+            if (
+                self._idle_timer is not current
+                or self._closed
+                or self._executor is not executor
+                or self._in_flight
+            ):
+                return
+            self._idle_timer = None
+            # Hold the worker lock until process teardown completes. A concurrent
+            # close or query then cannot lose the retiring process handle or
+            # briefly overlap it with a replacement worker.
+            executor.shutdown(wait=True, cancel_futures=True)
+            self._executor = None
 
     def search(
         self,
@@ -293,13 +395,23 @@ class SemanticWorker:
             limit,
             min_similarity,
         )
-        return self._pool().submit(_semantic_search_task, request).result(timeout=30)
+        with self._lock:
+            self._cancel_idle_timer_locked()
+            executor = self._pool_locked()
+            future = executor.submit(_semantic_search_task, request)
+            self._in_flight.add(future)
+        future.add_done_callback(self._future_done)
+        return future.result(timeout=30)
 
     def close(self) -> None:
         with self._lock:
+            self._closed = True
+            self._cancel_idle_timer_locked()
             executor, self._executor = self._executor, None
         if executor is not None:
             executor.shutdown(wait=True, cancel_futures=True)
+        with self._lock:
+            self._in_flight.clear()
 
 
 class UnavailableSemanticSearch:

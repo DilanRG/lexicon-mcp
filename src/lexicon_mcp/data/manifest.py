@@ -18,6 +18,16 @@ _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _TABLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_SEMANTIC_INDEX_SCHEMA_KEYS = frozenset(
+    {
+        "semantic_dimensions",
+        "semantic_metric",
+        "semantic_dtype",
+        "semantic_connectivity",
+        "semantic_expansion_add",
+        "semantic_expansion_search",
+    }
+)
 
 
 class ManifestError(ValueError):
@@ -203,9 +213,9 @@ def _parse_sources(value: Any) -> tuple[Source, ...]:
     return tuple(parsed)
 
 
-def _parse_integrity(value: Any, field: str) -> dict[str, Any]:
+def _parse_integrity(value: Any, field: str, *, artifact_type: str) -> dict[str, Any]:
     if value is None:
-        return {}
+        value = {}
     if not isinstance(value, dict):
         raise ManifestError(f"{field} must be an object")
     allowed = {
@@ -214,6 +224,7 @@ def _parse_integrity(value: Any, field: str) -> dict[str, Any]:
         "semantic_mapping",
         "semantic_mapping_table",
         "semantic_table",
+        *_SEMANTIC_INDEX_SCHEMA_KEYS,
         "dataset_schema_version",
         "archive_member",
     }
@@ -225,6 +236,49 @@ def _parse_integrity(value: Any, field: str) -> dict[str, Any]:
         raise ManifestError(f"{field}.sqlite must be boolean")
     if "semantic_count" in result:
         result["semantic_count"] = _size(result["semantic_count"], f"{field}.semantic_count")
+    if artifact_type == "semantic_index" and "semantic_count" not in result:
+        raise ManifestError(f"{field}.semantic_count is required for semantic_index")
+    if artifact_type == "semantic_index" and result["semantic_count"] < 1:
+        raise ManifestError(f"{field}.semantic_count must be a positive integer")
+    present_schema = _SEMANTIC_INDEX_SCHEMA_KEYS.intersection(result)
+    if present_schema and present_schema != _SEMANTIC_INDEX_SCHEMA_KEYS:
+        missing = sorted(_SEMANTIC_INDEX_SCHEMA_KEYS - present_schema)
+        raise ManifestError(f"{field} has an incomplete semantic index schema; missing {missing}")
+    if artifact_type == "semantic_index" and present_schema != _SEMANTIC_INDEX_SCHEMA_KEYS:
+        raise ManifestError(f"{field} requires a complete semantic index schema")
+    if artifact_type != "semantic_index" and present_schema:
+        raise ManifestError(f"{field} semantic index schema requires artifact_type semantic_index")
+    if present_schema:
+        dimensions = _size(result["semantic_dimensions"], f"{field}.semantic_dimensions")
+        if dimensions < 1:
+            raise ManifestError(f"{field}.semantic_dimensions must be a positive integer")
+        result["semantic_dimensions"] = dimensions
+        metric = _string(result["semantic_metric"], f"{field}.semantic_metric")
+        if metric != "cos":
+            raise ManifestError(f"{field}.semantic_metric must be cos")
+        result["semantic_metric"] = metric
+        dtype = _string(result["semantic_dtype"], f"{field}.semantic_dtype")
+        if dtype != "i8":
+            raise ManifestError(f"{field}.semantic_dtype must be i8")
+        result["semantic_dtype"] = dtype
+        connectivity = _size(
+            result["semantic_connectivity"], f"{field}.semantic_connectivity"
+        )
+        if connectivity != 16:
+            raise ManifestError(f"{field}.semantic_connectivity must be 16")
+        result["semantic_connectivity"] = connectivity
+        expansion_add = _size(
+            result["semantic_expansion_add"], f"{field}.semantic_expansion_add"
+        )
+        if expansion_add != 256:
+            raise ManifestError(f"{field}.semantic_expansion_add must be 256")
+        result["semantic_expansion_add"] = expansion_add
+        expansion_search = _size(
+            result["semantic_expansion_search"], f"{field}.semantic_expansion_search"
+        )
+        if expansion_search < 512:
+            raise ManifestError(f"{field}.semantic_expansion_search must be at least 512")
+        result["semantic_expansion_search"] = expansion_search
     if "dataset_schema_version" in result:
         schema_version = _size(
             result["dataset_schema_version"], f"{field}.dataset_schema_version"
@@ -330,10 +384,15 @@ def _parse_components(value: Any, source_ids: set[str]) -> tuple[Component, ...]
                 raise ManifestError(f"{field} references unknown source {source_id!r}")
             if source_id not in refs:
                 refs.append(source_id)
+        artifact_type = _string(item.get("artifact_type"), f"{field}.artifact_type")
+        if (artifact_type == "semantic_index") != (path.suffix.lower() == ".usearch"):
+            raise ManifestError(
+                f"{field} .usearch paths and artifact_type semantic_index must match"
+            )
         parsed.append(
             Component(
                 id=component_id,
-                artifact_type=_string(item.get("artifact_type"), f"{field}.artifact_type"),
+                artifact_type=artifact_type,
                 path=path,
                 compression=compression,
                 compressed_size=compressed_size,
@@ -342,7 +401,11 @@ def _parse_components(value: Any, source_ids: set[str]) -> tuple[Component, ...]
                 final_sha256=final_sha,
                 parts=tuple(parts),
                 sources=tuple(refs),
-                integrity=_parse_integrity(item.get("integrity"), f"{field}.integrity"),
+                integrity=_parse_integrity(
+                    item.get("integrity"),
+                    f"{field}.integrity",
+                    artifact_type=artifact_type,
+                ),
             )
         )
     return tuple(parsed)

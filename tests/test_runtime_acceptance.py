@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 from pathlib import Path
+from types import SimpleNamespace
 
-import psutil
+import psutil  # type: ignore[import-untyped]
+import pytest
 
 from lexicon_mcp.pipeline import BuildInputs, build_full_corpus
+from lexicon_mcp.runtime import acceptance
 from lexicon_mcp.runtime.acceptance import (
+    PerformanceReport,
     percentile,
     process_mapped_artifact_rss_bytes,
     run_isolated_performance,
@@ -60,6 +65,75 @@ def test_mapped_artifact_rss_counts_only_resident_semantic_files(tmp_path: Path)
             ) > 0
 
 
+def test_semantic_child_sampling_tracks_independent_peaks(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    parent = SimpleNamespace(
+        children=lambda recursive: (
+            SimpleNamespace(pid=101),
+            SimpleNamespace(pid=202),
+        )
+    )
+    monkeypatch.setattr(
+        acceptance, "process_private_bytes", lambda pid: {101: 110, 202: 120}[pid]
+    )
+    monkeypatch.setattr(
+        acceptance,
+        "process_working_set_bytes",
+        lambda pid: {101: 1_450, 202: 1_400}[pid],
+    )
+    monkeypatch.setattr(
+        acceptance,
+        "process_mapped_artifact_rss_bytes",
+        lambda pid, directory: {101: 3_830, 202: 3_900}[pid],
+    )
+
+    private_peak = [115]
+    working_set_peak = [1_000]
+    mapped_peak = [4_000]
+    acceptance._sample_semantic_children(
+        parent,
+        private_peak,
+        working_set_peak,
+        mapped_peak,
+        tmp_path,
+    )
+
+    assert private_peak == [120]
+    assert working_set_peak == [1_450]
+    assert mapped_peak == [4_000]
+
+
+def test_performance_report_shape_names_working_set_separately() -> None:
+    report = PerformanceReport(
+        lexical_p95_ms=1.0,
+        semantic_cold_ms=2.0,
+        semantic_warm_p95_ms=3.0,
+        idle_private_bytes=4,
+        semantic_worker_peak_private_bytes=5,
+        semantic_worker_peak_working_set_bytes=6,
+        semantic_worker_peak_mapped_artifact_rss_bytes=7,
+        lexical_samples=8,
+        semantic_warm_samples=9,
+        semantic_seed="cat",
+        semantic_language="en",
+    )
+
+    assert asdict(report) == {
+        "lexical_p95_ms": 1.0,
+        "semantic_cold_ms": 2.0,
+        "semantic_warm_p95_ms": 3.0,
+        "idle_private_bytes": 4,
+        "semantic_worker_peak_private_bytes": 5,
+        "semantic_worker_peak_working_set_bytes": 6,
+        "semantic_worker_peak_mapped_artifact_rss_bytes": 7,
+        "lexical_samples": 8,
+        "semantic_warm_samples": 9,
+        "semantic_seed": "cat",
+        "semantic_language": "en",
+    }
+
+
 def test_isolated_performance_helper_runs_on_pipeline_fixture(tmp_path: Path) -> None:
     report = run_isolated_performance(
         _fixture_dataset(tmp_path),
@@ -73,4 +147,5 @@ def test_isolated_performance_helper_runs_on_pipeline_fixture(tmp_path: Path) ->
     assert report.semantic_language == "en"
     assert report.idle_private_bytes > 0
     assert report.semantic_worker_peak_private_bytes > 0
+    assert report.semantic_worker_peak_working_set_bytes > 0
     assert report.semantic_worker_peak_mapped_artifact_rss_bytes > 0

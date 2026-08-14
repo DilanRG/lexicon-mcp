@@ -25,6 +25,14 @@ _REQUIRED_NOTICES = {
 }
 
 _COMPRESSION_READ_SIZE = 8 * 1024 * 1024
+_SEMANTIC_METADATA_KEYS = (
+    "dimensions",
+    "index_metric",
+    "index_dtype",
+    "connectivity",
+    "expansion_add",
+    "expansion_search",
+)
 
 
 @dataclass(frozen=True)
@@ -257,20 +265,59 @@ def _component_type(relative: str) -> str:
     return "metadata"
 
 
-def _semantic_counts(dataset_root: Path) -> tuple[int, dict[str, int]]:
+def _semantic_counts(
+    dataset_root: Path,
+) -> tuple[int, dict[str, int], dict[str, int | str]]:
     mapping = dataset_root / "semantic" / "mapping.sqlite3"
     if not mapping.exists():
-        return 0, {}
+        return 0, {}, {}
     connection = sqlite3.connect(f"file:{mapping.as_posix()}?mode=ro", uri=True)
-    total = connection.execute("SELECT COUNT(*) FROM semantic_terms").fetchone()[0]
-    indexes = {
-        f"semantic/{index_file}": int(term_count)
-        for index_file, term_count in connection.execute(
-            "SELECT index_file,term_count FROM semantic_languages"
+    try:
+        total = connection.execute("SELECT COUNT(*) FROM semantic_terms").fetchone()[0]
+        indexes = {
+            f"semantic/{index_file}": int(term_count)
+            for index_file, term_count in connection.execute(
+                "SELECT index_file,term_count FROM semantic_languages"
+            )
+        }
+        placeholders = ",".join("?" for _key in _SEMANTIC_METADATA_KEYS)
+        metadata = dict(
+            connection.execute(
+                f"SELECT key,value FROM metadata WHERE key IN ({placeholders})",
+                _SEMANTIC_METADATA_KEYS,
+            )
         )
+    finally:
+        connection.close()
+    if int(total) < 1:
+        raise ValueError("semantic mapping must contain at least one term")
+    if any(count < 1 for count in indexes.values()):
+        raise ValueError("semantic language index counts must be positive")
+    missing = sorted(set(_SEMANTIC_METADATA_KEYS) - set(metadata))
+    if missing:
+        raise ValueError(f"semantic mapping metadata is incomplete; missing {missing}")
+    try:
+        dimensions = int(metadata["dimensions"])
+        connectivity = int(metadata["connectivity"])
+        expansion_add = int(metadata["expansion_add"])
+        expansion_search = int(metadata["expansion_search"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("semantic mapping has non-integer USearch metadata") from exc
+    if dimensions < 1:
+        raise ValueError("semantic mapping dimensions must be positive")
+    if metadata["index_metric"] != "cos" or metadata["index_dtype"] != "i8":
+        raise ValueError("semantic mapping must declare cosine/i8 indexes")
+    if connectivity != 16 or expansion_add != 256 or expansion_search < 512:
+        raise ValueError("semantic mapping has an unsupported USearch schema")
+    schema: dict[str, int | str] = {
+        "semantic_dimensions": dimensions,
+        "semantic_metric": "cos",
+        "semantic_dtype": "i8",
+        "semantic_connectivity": connectivity,
+        "semantic_expansion_add": expansion_add,
+        "semantic_expansion_search": expansion_search,
     }
-    connection.close()
-    return int(total), indexes
+    return int(total), indexes, schema
 
 
 def package_dataset(
@@ -306,7 +353,7 @@ def package_dataset(
         missing_notices.insert(0, "DATA_LICENSES.md")
     if missing_notices:
         raise ValueError(f"dataset is missing required notices: {', '.join(missing_notices)}")
-    total_semantic, index_counts = _semantic_counts(dataset_root)
+    total_semantic, index_counts, semantic_schema = _semantic_counts(dataset_root)
     lock_path = dataset_root / "sources.lock.json"
     lock = json.loads(lock_path.read_text(encoding="utf-8")) if lock_path.exists() else {}
     available_ids = sorted(item["id"] for item in lock.get("sources", []))
@@ -363,6 +410,11 @@ def package_dataset(
                     }
                 )
             if artifact_type == "semantic_index":
+                if not semantic_schema:
+                    raise ValueError(
+                        f"semantic index has no pinned schema metadata: {relative}"
+                    )
+                integrity.update(semantic_schema)
                 if relative.endswith("/global.usearch"):
                     integrity.update(
                         {
@@ -372,7 +424,11 @@ def package_dataset(
                         }
                     )
                 else:
-                    integrity["semantic_count"] = index_counts.get(relative, 0)
+                    if relative not in index_counts:
+                        raise ValueError(
+                            f"semantic index has no mapping count metadata: {relative}"
+                        )
+                    integrity["semantic_count"] = index_counts[relative]
             if relative == "lexicon.sqlite3":
                 component_sources = [
                     item

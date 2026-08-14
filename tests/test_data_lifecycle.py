@@ -30,6 +30,33 @@ def digest(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def semantic_index_integrity(*, dimensions: int, count: int) -> dict[str, Any]:
+    return {
+        "semantic_count": count,
+        "semantic_dimensions": dimensions,
+        "semantic_metric": "cos",
+        "semantic_dtype": "i8",
+        "semantic_connectivity": 16,
+        "semantic_expansion_add": 256,
+        "semantic_expansion_search": 512,
+    }
+
+
+def forbid_usearch_path_introspection(monkeypatch: pytest.MonkeyPatch) -> None:
+    original_metadata = Index.metadata
+
+    def metadata(source: object, *args: object, **kwargs: object) -> object:
+        if isinstance(source, (str, Path)):
+            raise AssertionError("USearch path metadata must not be used")
+        return original_metadata(source, *args, **kwargs)
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("USearch path metadata/restore must not be used")
+
+    monkeypatch.setattr(Index, "metadata", staticmethod(metadata))
+    monkeypatch.setattr(Index, "restore", staticmethod(forbidden))
+
+
 def sqlite_payload(tmp_path: Path, name: str, values: list[str]) -> bytes:
     path = tmp_path / name
     connection = sqlite3.connect(path)
@@ -528,12 +555,15 @@ def test_manifest_requires_complete_reproducibility_metadata(tmp_path: Path) -> 
         parse_manifest(json.dumps(value))
 
 
-def test_usearch_226_semantic_count_uses_present_vectors(tmp_path: Path) -> None:
+def test_usearch_226_semantic_count_uses_large_file_safe_view(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     path = tmp_path / "global.usearch"
     index = Index(ndim=2, metric="cos", dtype="i8")
     index.add(np.asarray([1, 2], dtype=np.uint64), np.asarray([[1, 0], [0, 1]], dtype=np.float32))
     index.save(str(path))
-    del index
+    index.reset()
+    forbid_usearch_path_introspection(monkeypatch)
     component = Component(
         id="semantic-global",
         artifact_type="semantic_index",
@@ -545,10 +575,123 @@ def test_usearch_226_semantic_count_uses_present_vectors(tmp_path: Path) -> None
         final_sha256=digest(path.read_bytes()),
         parts=(),
         sources=("numberbatch",),
-        integrity={"semantic_count": 2},
+        integrity=semantic_index_integrity(dimensions=2, count=2),
     )
 
     assert default_semantic_count(path, component) == 2
+    path.unlink()
+    assert not path.exists()
+
+
+def test_manifest_requires_complete_strict_semantic_index_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    forbid_usearch_path_introspection(monkeypatch)
+    value = json.loads(
+        manifest_bytes("data-v1.0.0", {"semantic": ("semantic/global.usearch", b"index")})
+    )
+    component = value["components"][0]
+    component["artifact_type"] = "semantic_index"
+    component["integrity"] = semantic_index_integrity(dimensions=300, count=1)
+
+    parsed = parse_manifest(json.dumps(value))
+
+    assert parsed.components[0].integrity == semantic_index_integrity(
+        dimensions=300, count=1
+    )
+    missing_count = json.loads(json.dumps(value))
+    del missing_count["components"][0]["integrity"]["semantic_count"]
+    with pytest.raises(ManifestError, match="semantic_count is required"):
+        parse_manifest(json.dumps(missing_count))
+    for missing in (
+        "semantic_dimensions",
+        "semantic_metric",
+        "semantic_dtype",
+        "semantic_connectivity",
+        "semantic_expansion_add",
+        "semantic_expansion_search",
+    ):
+        invalid = json.loads(json.dumps(value))
+        del invalid["components"][0]["integrity"][missing]
+        with pytest.raises(ManifestError, match="incomplete semantic index schema"):
+            parse_manifest(json.dumps(invalid))
+
+    invalid_values: tuple[tuple[str, object, str], ...] = (
+        ("semantic_count", 0, "must be a positive integer"),
+        ("semantic_dimensions", 0, "must be a positive integer"),
+        ("semantic_metric", "l2sq", "must be cos"),
+        ("semantic_dtype", "f32", "must be i8"),
+        ("semantic_connectivity", 15, "must be 16"),
+        ("semantic_expansion_add", 128, "must be 256"),
+        ("semantic_expansion_search", 511, "must be at least 512"),
+    )
+    for field, bad_value, message in invalid_values:
+        invalid = json.loads(json.dumps(value))
+        invalid["components"][0]["integrity"][field] = bad_value
+        with pytest.raises(ManifestError, match=message):
+            parse_manifest(json.dumps(invalid))
+
+
+def test_install_and_verify_semantic_index_avoid_path_introspection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    index_path = tmp_path / "global.usearch"
+    index = Index(
+        ndim=2,
+        metric="cos",
+        dtype="i8",
+        connectivity=16,
+        expansion_add=256,
+        expansion_search=512,
+    )
+    index.add(
+        np.asarray([1, 2], dtype=np.uint64),
+        np.asarray([[1, 0], [0, 1]], dtype=np.float32),
+    )
+    index.save(str(index_path))
+    index.reset()
+    index_payload = index_path.read_bytes()
+
+    mapping_path = tmp_path / "mapping.sqlite3"
+    with sqlite3.connect(mapping_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO metadata VALUES ('schema_version', '2');
+            CREATE TABLE semantic_terms (semantic_id INTEGER PRIMARY KEY);
+            INSERT INTO semantic_terms VALUES (1);
+            INSERT INTO semantic_terms VALUES (2);
+            """
+        )
+    mapping_payload = mapping_path.read_bytes()
+    components = {
+        "semantic-mapping": ("semantic/mapping.sqlite3", mapping_payload),
+        "semantic-global": ("semantic/indexes/global.usearch", index_payload),
+    }
+    value = json.loads(manifest_bytes("data-v1.0.0", components))
+    mapping_component, index_component = value["components"]
+    mapping_component["artifact_type"] = "semantic_mapping"
+    mapping_component["integrity"] = {
+        "sqlite": True,
+        "dataset_schema_version": 2,
+        "semantic_count": 2,
+        "semantic_mapping_table": "semantic_terms",
+    }
+    index_component["artifact_type"] = "semantic_index"
+    index_component["integrity"] = {
+        **semantic_index_integrity(dimensions=2, count=2),
+        "semantic_mapping": "semantic/mapping.sqlite3",
+        "semantic_mapping_table": "semantic_terms",
+    }
+    manifest = parse_manifest(json.dumps(value))
+    forbid_usearch_path_introspection(monkeypatch)
+    manager = lifecycle(tmp_path / "data", transport_for(components))
+
+    result = manager.install(manifest, profile="full", version="data-v1.0.0")
+    report = manager.verify()
+
+    assert result["action"] == "installed"
+    assert report["ok"] is True
 
 
 def test_sqlite_dataset_schema_version_integrity_is_enforced(tmp_path: Path) -> None:

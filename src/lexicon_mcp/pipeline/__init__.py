@@ -6,7 +6,14 @@ runtime artifacts.  Downloading source corpora is an orchestration concern and
 never happens here.
 """
 
-from .orchestrator import BuildInputs, build_full_corpus
+from .orchestrator import (
+    BuildInputs,
+    build_full_corpus,
+    recover_full_corpus_from_semantic_partial,
+)
 
-__all__ = ["BuildInputs", "build_full_corpus"]
-
+__all__ = [
+    "BuildInputs",
+    "build_full_corpus",
+    "recover_full_corpus_from_semantic_partial",
+]

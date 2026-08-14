@@ -78,13 +78,32 @@ def process_private_bytes(pid: int | None = None) -> int:
     return int(unique if unique is not None else full.rss)
 
 
+def process_working_set_bytes(pid: int | None = None) -> int:
+    """Return the process resident set (the Windows total working set)."""
+
+    try:
+        import psutil
+    except ImportError as exc:  # pragma: no cover - acceptance extra guarantees it
+        raise RuntimeError("psutil is required for performance acceptance") from exc
+    process = psutil.Process(pid or os.getpid())
+    return max(0, int(process.memory_info().rss))
+
+
 @dataclass(frozen=True, slots=True)
 class PerformanceReport:
+    """Acceptance timings plus independent process-memory observations.
+
+    The mapped-artifact RSS diagnostic is not additive with the worker working
+    set. In particular, Windows can report the entire mmap region for a file
+    even when only part of that region is in the process working set.
+    """
+
     lexical_p95_ms: float
     semantic_cold_ms: float
     semantic_warm_p95_ms: float
     idle_private_bytes: int
     semantic_worker_peak_private_bytes: int
+    semantic_worker_peak_working_set_bytes: int
     semantic_worker_peak_mapped_artifact_rss_bytes: int
     lexical_samples: int
     semantic_warm_samples: int
@@ -130,7 +149,11 @@ def _semantic_seed(directory: Path) -> tuple[str, str]:
 def process_mapped_artifact_rss_bytes(
     pid: int, semantic_directory: str | Path
 ) -> int:
-    """Return resident pages mapped from semantic dataset artifacts only."""
+    """Sum OS-reported RSS for mappings of semantic dataset artifacts.
+
+    This is a mapping diagnostic, not a process working-set measurement. Some
+    Windows versions report the whole mapped region as RSS here.
+    """
 
     try:
         import psutil
@@ -176,6 +199,7 @@ def _semantic_artifact_rss_by_name(pid: int) -> int:
 def _sample_semantic_children(
     parent: Any,
     private_peak: list[int],
+    working_set_peak: list[int],
     mapped_peak: list[int],
     semantic_directory: Path,
 ) -> None:
@@ -190,6 +214,9 @@ def _sample_semantic_children(
     for child in children:
         try:
             private_peak[0] = max(private_peak[0], process_private_bytes(child.pid))
+            working_set_peak[0] = max(
+                working_set_peak[0], process_working_set_bytes(child.pid)
+            )
             mapped = process_mapped_artifact_rss_bytes(child.pid, semantic_directory)
             if mapped == 0:
                 # USearch mmap views retain the pre-promotion staging path on
@@ -205,6 +232,7 @@ def _sample_semantic_children(
 def _monitor_semantic_children(
     stop: threading.Event,
     private_peak: list[int],
+    working_set_peak: list[int],
     mapped_peak: list[int],
     semantic_directory: Path,
 ) -> None:
@@ -215,10 +243,12 @@ def _monitor_semantic_children(
     parent = psutil.Process(os.getpid())
     while not stop.wait(0.02):
         _sample_semantic_children(
-            parent, private_peak, mapped_peak, semantic_directory
+            parent, private_peak, working_set_peak, mapped_peak, semantic_directory
         )
     # Capture persistent mmap views once more after the final warm query.
-    _sample_semantic_children(parent, private_peak, mapped_peak, semantic_directory)
+    _sample_semantic_children(
+        parent, private_peak, working_set_peak, mapped_peak, semantic_directory
+    )
 
 
 def _performance_worker(
@@ -254,12 +284,14 @@ def _performance_worker(
             seed, language = _semantic_seed(Path(semantic_directory))
             stop = threading.Event()
             child_private_peak = [0]
+            child_working_set_peak = [0]
             child_mapped_peak = [0]
             monitor = threading.Thread(
                 target=_monitor_semantic_children,
                 args=(
                     stop,
                     child_private_peak,
+                    child_working_set_peak,
                     child_mapped_peak,
                     Path(semantic_directory).resolve(),
                 ),
@@ -287,6 +319,7 @@ def _performance_worker(
                 semantic_warm_p95_ms=percentile(warm_timings, 0.95),
                 idle_private_bytes=idle_private,
                 semantic_worker_peak_private_bytes=child_private_peak[0],
+                semantic_worker_peak_working_set_bytes=child_working_set_peak[0],
                 semantic_worker_peak_mapped_artifact_rss_bytes=child_mapped_peak[0],
                 lexical_samples=len(lexical_timings),
                 semantic_warm_samples=len(warm_timings),

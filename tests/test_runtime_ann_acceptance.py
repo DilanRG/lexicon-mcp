@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
+from typing import Any
 
 import pytest
+from usearch.index import Index
 
 from lexicon_mcp.pipeline import BuildInputs, build_full_corpus
 from lexicon_mcp.runtime.acceptance import (
@@ -15,7 +18,10 @@ from lexicon_mcp.runtime.normalization import normalize_key
 from lexicon_mcp.runtime.offline import deny_network
 
 
-def test_ann_validator_uses_pipeline_fixture_read_only(tmp_path: Path) -> None:
+def test_ann_validator_uses_pipeline_fixture_read_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     fixtures = Path(__file__).parent / "fixtures" / "build_inputs"
     output = tmp_path / "dataset"
     build_full_corpus(
@@ -34,6 +40,18 @@ def test_ann_validator_uses_pipeline_fixture_read_only(tmp_path: Path) -> None:
     )
     dataset = ActiveDataset(tmp_path, "fixture-v1", output, {"profile": "full"})
 
+    original_metadata = Index.metadata
+
+    def mmap_metadata_only(path_or_buffer: Any) -> Any:
+        if isinstance(path_or_buffer, (str, os.PathLike)):
+            raise AssertionError("large indexes must not use path metadata")
+        return original_metadata(path_or_buffer)
+
+    def forbidden_restore(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("large indexes must not use USearch restore")
+
+    monkeypatch.setattr(Index, "metadata", staticmethod(mmap_metadata_only))
+    monkeypatch.setattr(Index, "restore", staticmethod(forbidden_restore))
     report = validate_ann_acceptance(
         dataset, languages=("en",), seeds_per_language=1, k=2, chunk_size=2
     )

@@ -337,7 +337,7 @@ def test_interrupted_build_reuses_existing_notices_directory(
     assert (output / "notices" / "DATA_LICENSES.md").is_file()
 
 
-def test_changed_pipeline_identity_invalidates_semantic_checkpoint(
+def test_changed_pipeline_identity_invalidates_lexical_checkpoints_before_semantic(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     inputs = BuildInputs(
@@ -349,34 +349,32 @@ def test_changed_pipeline_identity_invalidates_semantic_checkpoint(
         notices_dir=FIXTURES / "notices",
     )
     output = tmp_path / "semantic-checkpoint"
-    real_replace = orchestrator.os.replace
-
-    def interrupt_final_promotion(source: object, destination: object) -> None:
-        if Path(destination) == output:
-            raise RuntimeError("simulated final promotion interruption")
-        real_replace(source, destination)
-
-    monkeypatch.setattr(orchestrator.os, "replace", interrupt_final_promotion)
-    with pytest.raises(RuntimeError, match="final promotion interruption"):
-        build_full_corpus(inputs, output, tmp_path / "state", dataset_version="fixture-v1")
-    monkeypatch.setattr(orchestrator.os, "replace", real_replace)
-
-    calls = 0
     real_numberbatch = orchestrator.build_numberbatch
 
-    def counted_numberbatch(*args: object, **kwargs: object) -> dict[str, object]:
+    def interrupt_numberbatch(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise RuntimeError("simulated pre-semantic interruption")
+
+    monkeypatch.setattr(orchestrator, "build_numberbatch", interrupt_numberbatch)
+    with pytest.raises(RuntimeError, match="pre-semantic interruption"):
+        build_full_corpus(inputs, output, tmp_path / "state", dataset_version="fixture-v1")
+    monkeypatch.setattr(orchestrator, "build_numberbatch", real_numberbatch)
+
+    calls = 0
+    real_oewn = orchestrator.build_oewn
+
+    def counted_oewn(*args: object, **kwargs: object) -> dict[str, int]:
         nonlocal calls
         calls += 1
-        return real_numberbatch(*args, **kwargs)
+        return real_oewn(*args, **kwargs)
 
-    monkeypatch.setattr(orchestrator, "build_numberbatch", counted_numberbatch)
-    monkeypatch.setattr(orchestrator, "_pipeline_identity", lambda: "changed-pipeline")
+    monkeypatch.setattr(orchestrator, "build_oewn", counted_oewn)
+    monkeypatch.setattr(orchestrator, "_pipeline_identity", lambda: "f" * 64)
     build_full_corpus(inputs, output, tmp_path / "state", dataset_version="fixture-v1")
 
     assert calls == 1
 
 
-def test_truncated_lexical_rows_cannot_be_resumed_from_external_markers(
+def test_truncated_lexical_rows_cannot_be_resumed_before_semantic_creation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     inputs = BuildInputs(
@@ -388,17 +386,15 @@ def test_truncated_lexical_rows_cannot_be_resumed_from_external_markers(
         notices_dir=FIXTURES / "notices",
     )
     output = tmp_path / "lexical-checkpoint"
-    real_replace = orchestrator.os.replace
+    real_numberbatch = orchestrator.build_numberbatch
 
-    def interrupt_final_promotion(source: object, destination: object) -> None:
-        if Path(destination) == output:
-            raise RuntimeError("simulated final promotion interruption")
-        real_replace(source, destination)
+    def interrupt_numberbatch(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise RuntimeError("simulated pre-semantic interruption")
 
-    monkeypatch.setattr(orchestrator.os, "replace", interrupt_final_promotion)
-    with pytest.raises(RuntimeError, match="final promotion interruption"):
+    monkeypatch.setattr(orchestrator, "build_numberbatch", interrupt_numberbatch)
+    with pytest.raises(RuntimeError, match="pre-semantic interruption"):
         build_full_corpus(inputs, output, tmp_path / "state", dataset_version="fixture-v1")
-    monkeypatch.setattr(orchestrator.os, "replace", real_replace)
+    monkeypatch.setattr(orchestrator, "build_numberbatch", real_numberbatch)
 
     partial = output.with_name(output.name + ".partial")
     with closing(sqlite3.connect(partial / "lexicon.sqlite3")) as connection:
@@ -421,7 +417,7 @@ def test_truncated_lexical_rows_cannot_be_resumed_from_external_markers(
         assert connection.execute("SELECT COUNT(*) FROM senses").fetchone()[0] > 0
 
 
-def test_corrupt_semantic_index_forces_numberbatch_rebuild(
+def test_normal_build_never_replaces_corrupt_preserved_semantic_index(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     inputs = BuildInputs(
@@ -456,9 +452,12 @@ def test_corrupt_semantic_index_forces_numberbatch_rebuild(
         return real_numberbatch(*args, **kwargs)
 
     monkeypatch.setattr(orchestrator, "build_numberbatch", counted_numberbatch)
-    build_full_corpus(inputs, output, tmp_path / "state", dataset_version="fixture-v1")
-    assert calls == 1
-    assert len(Index.restore(output / "semantic" / "indexes" / "global.usearch")) == 10
+    with pytest.raises(FileExistsError, match="validated recovery command"):
+        build_full_corpus(
+            inputs, output, tmp_path / "state", dataset_version="fixture-v1"
+        )
+    assert calls == 0
+    assert (partial / "semantic" / "indexes" / "global.usearch").read_bytes() == b"corrupt"
 
 
 def test_full_corpus_floors_reject_fixture_without_guessing_counts(
@@ -488,6 +487,35 @@ def test_full_corpus_floors_reject_fixture_without_guessing_counts(
             retrieved_at="2026-01-01T00:00:00Z",
             enforce_corpus_floors=True,
         )
+
+
+def test_wiktextract_synonym_floor_uses_deduplicated_physical_rows() -> None:
+    stage_counts = {
+        stage: dict(metrics)
+        for stage, metrics in orchestrator.FULL_CORPUS_FLOORS.items()
+    }
+    stage_counts["wiktextract"]["synonyms"] = 3_688_516
+
+    report, failures = orchestrator.evaluate_corpus_floors(stage_counts)
+
+    assert report["wiktextract"]["synonyms"] == {
+        "observed": 3_688_516,
+        "minimum": 3_500_000,
+        "passed": True,
+    }
+    assert failures == []
+
+    stage_counts["wiktextract"]["synonyms"] = 3_499_999
+    report, failures = orchestrator.evaluate_corpus_floors(stage_counts)
+
+    assert report["wiktextract"]["synonyms"] == {
+        "observed": 3_499_999,
+        "minimum": 3_500_000,
+        "passed": False,
+    }
+    assert failures == [
+        "wiktextract.synonyms: observed 3499999, required at least 3500000"
+    ]
 
 
 def test_resource_projection_fails_before_output_mutation(
@@ -541,8 +569,16 @@ def test_measured_installed_size_gate_blocks_promotion(
     assert not output.exists()
 
 
-def test_release_parts_reconstruct_every_component(tmp_path: Path) -> None:
+def test_release_parts_reconstruct_every_component_without_usearch_path_introspection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     root = _build(tmp_path)
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("packaging must not use USearch path metadata/restore")
+
+    monkeypatch.setattr(Index, "metadata", staticmethod(forbidden))
+    monkeypatch.setattr(Index, "restore", staticmethod(forbidden))
     package = tmp_path / "release"
     manifest = package_dataset(
         root,
@@ -580,6 +616,22 @@ def test_release_parts_reconstruct_every_component(tmp_path: Path) -> None:
     )
     assert global_index["artifact_type"] == "semantic_index"
     assert global_index["integrity"]["semantic_count"] == 10
+    semantic_indexes = [
+        item for item in manifest["components"] if item["artifact_type"] == "semantic_index"
+    ]
+    assert semantic_indexes
+    assert all(
+        {
+            "semantic_dimensions": 4,
+            "semantic_metric": "cos",
+            "semantic_dtype": "i8",
+            "semantic_connectivity": 16,
+            "semantic_expansion_add": 256,
+            "semantic_expansion_search": 512,
+        }.items()
+        <= item["integrity"].items()
+        for item in semantic_indexes
+    )
     assert json.loads((package / "manifest.json").read_text(encoding="utf-8")) == manifest
     parsed = parse_manifest((package / "manifest.json").read_bytes())
     assert parsed.dataset_version == "fixture-v1"

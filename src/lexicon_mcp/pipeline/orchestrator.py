@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import json
 import os
 import re
@@ -11,6 +12,8 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from lexicon_mcp.data.locking import InstallationLock
 
 from .cmudict import build_cmudict
 from .common import (
@@ -24,7 +27,11 @@ from .common import (
 from .conceptnet import SOURCE as CONCEPTNET_SOURCE
 from .conceptnet import build_conceptnet
 from .manifest import source_record, write_sources_lock
-from .numberbatch import build_numberbatch, verify_saved_index
+from .numberbatch import (
+    build_numberbatch,
+    resume_numberbatch_partial,
+    verify_saved_index,
+)
 from .oewn import SOURCE as OEWN_SOURCE
 from .oewn import build_oewn
 from .schema import create_lexical_query_indexes, create_lexical_schema
@@ -39,7 +46,7 @@ FULL_CORPUS_FLOORS: dict[str, dict[str, int]] = {
         "entries": 10_000_000,
         "senses": 12_000_000,
         "translations": 3_000_000,
-        "synonyms": 7_000_000,
+        "synonyms": 3_500_000,
         "pronunciations": 6_000_000,
         "language_codes": 4_000,
     },
@@ -68,6 +75,11 @@ def _pipeline_identity() -> str:
         digest.update(path.name.encode())
         digest.update(b"\0")
         digest.update(path.read_bytes())
+        digest.update(b"\0")
+    compatibility = directory.parent / "usearch_compat.py"
+    if compatibility.is_file():
+        digest.update(b"../usearch_compat.py\0")
+        digest.update(compatibility.read_bytes())
         digest.update(b"\0")
     return digest.hexdigest()
 
@@ -444,12 +456,38 @@ def _verified_semantic_counts(
         )
         if terms < 1 or dimensions < 1 or mapped_terms != terms:
             raise RuntimeError("semantic mapping term/dimension counts are invalid")
+        language_rows = connection.execute(
+            """SELECT language,index_file,term_count
+            FROM semantic_languages ORDER BY language"""
+        ).fetchall()
         languages = {
+            str(row["language"]): int(row["term_count"]) for row in language_rows
+        }
+        derived_languages = {
             str(row["language"]): int(row["term_count"])
             for row in connection.execute(
-                "SELECT language,term_count FROM semantic_languages ORDER BY language"
+                """SELECT t.language,COUNT(*) AS term_count
+                FROM semantic_terms s JOIN lexical_terms t ON t.term_id=s.term_id
+                GROUP BY t.language ORDER BY t.language"""
             )
         }
+        if languages != derived_languages or sum(languages.values()) != terms:
+            raise RuntimeError(
+                "semantic language rows do not exactly partition the global terms"
+            )
+        try:
+            metadata_language_count = int(metadata.get("language_count", "-1"))
+        except ValueError as exc:
+            raise RuntimeError(
+                "semantic metadata language_count is not an integer"
+            ) from exc
+        if metadata_language_count != len(languages):
+            raise RuntimeError("semantic metadata language_count is not exact")
+        if metadata.get("language_index_dir") != "indexes/languages":
+            raise RuntimeError("semantic metadata language index directory is invalid")
+        index_files = [str(row["index_file"]) for row in language_rows]
+        if len(index_files) != len(set(index_files)):
+            raise RuntimeError("semantic language index paths are not unique")
         vector_path = (root / metadata["vector_file"]).resolve()
         global_path = (root / metadata["global_index"]).resolve()
         if not vector_path.is_relative_to(root) or not global_path.is_relative_to(root):
@@ -457,14 +495,16 @@ def _verified_semantic_counts(
         expected_vector_bytes = terms * dimensions * 2
         if vector_path.stat().st_size != expected_vector_bytes:
             raise RuntimeError("semantic vector byte count does not match mapping metadata")
-        verify_saved_index(global_path, terms)
-        for row in connection.execute(
-            "SELECT language,index_file,term_count FROM semantic_languages ORDER BY language"
-        ):
+        verify_saved_index(global_path, terms, dimensions)
+        for row in language_rows:
+            language = str(row["language"])
+            expected_relative = f"indexes/languages/{language.replace('-', '_')}.usearch"
+            if str(row["index_file"]) != expected_relative:
+                raise RuntimeError("semantic language index path is not canonical")
             index_path = (root / str(row["index_file"])).resolve()
             if not index_path.is_relative_to(root):
                 raise RuntimeError("semantic language index path escapes its artifact root")
-            verify_saved_index(index_path, int(row["term_count"]))
+            verify_saved_index(index_path, int(row["term_count"]), dimensions)
     finally:
         connection.close()
     return {"terms": terms, "dimensions": dimensions, "languages": languages}
@@ -530,6 +570,17 @@ def build_full_corpus(
     size_projection = assert_size_targets()
     if output_dir.exists():
         raise FileExistsError(f"refusing to replace existing output: {output_dir}")
+    partial = output_dir.with_name(output_dir.name + ".partial")
+    preserved_semantic = [
+        path
+        for path in (partial / "semantic.partial", partial / "semantic")
+        if path.exists()
+    ]
+    if preserved_semantic:
+        raise FileExistsError(
+            "refusing normal build over preserved semantic state; use the validated "
+            f"recovery command: {[str(path) for path in preserved_semantic]!r}"
+        )
     records, fingerprints = _source_records(inputs, retrieved_at)
     if enforce_corpus_floors:
         disk_root = output_dir.parent
@@ -542,7 +593,6 @@ def build_full_corpus(
                 f"peak-build free-space gate failure: {available} bytes available, "
                 f"{required} required"
             )
-    partial = output_dir.with_name(output_dir.name + ".partial")
     partial.mkdir(parents=True, exist_ok=True)
     _copy_notices(inputs.notices_dir, partial / "notices")
     checkpoints = Checkpoints(build_state / dataset_version / "checkpoints")
@@ -669,3 +719,464 @@ def build_full_corpus(
         raise RuntimeError("installed-size manifest did not converge")
     os.replace(partial, output_dir)
     return manifest
+
+
+def _recorded_lexical_pipeline_identity(checkpoint_dir: Path) -> str:
+    identities: set[str] = set()
+    for stage in ("oewn", "wiktextract", "conceptnet", "cmudict"):
+        path = checkpoint_dir / f"{stage}.json"
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"lexical recovery checkpoint is unreadable: {path}") from exc
+        if not isinstance(value, dict) or value.get("state") != "complete":
+            raise RuntimeError(f"lexical recovery checkpoint is incomplete: {path}")
+        fingerprint = value.get("fingerprint")
+        if not isinstance(fingerprint, str):
+            raise RuntimeError(f"lexical recovery checkpoint has no fingerprint: {path}")
+        match = re.match(r"^pipeline:([0-9a-f]{64})\|", fingerprint)
+        if match is None:
+            raise RuntimeError(f"lexical recovery checkpoint fingerprint is malformed: {path}")
+        identities.add(match.group(1))
+    if len(identities) != 1:
+        raise RuntimeError(
+            f"lexical recovery checkpoints mix pipeline identities: {sorted(identities)!r}"
+        )
+    return identities.pop()
+
+
+def _validated_recovery_lexical_state(
+    inputs: BuildInputs,
+    partial: Path,
+    checkpoints: Checkpoints,
+    fingerprints: dict[Path, str],
+    *,
+    dataset_version: str,
+    original_pipeline_identity: str,
+) -> tuple[dict[str, Any], dict[str, int]]:
+    lexical_path = partial / "lexicon.sqlite3"
+    if not lexical_path.is_file():
+        raise FileNotFoundError(f"recovery lexical database does not exist: {lexical_path}")
+    for suffix in ("-wal", "-shm"):
+        if lexical_path.with_name(lexical_path.name + suffix).exists():
+            raise RuntimeError("recovery lexical database has unfinalized SQLite sidecars")
+
+    connection = sqlite3.connect(
+        f"file:{lexical_path.as_posix()}?mode=ro&immutable=1", uri=True
+    )
+    try:
+        quick = connection.execute("PRAGMA quick_check").fetchall()
+        if len(quick) != 1 or str(quick[0][0]) != "ok":
+            raise RuntimeError(f"recovery lexical quick_check failed: {quick[:3]!r}")
+        foreign_key_failure = connection.execute("PRAGMA foreign_key_check").fetchone()
+        if foreign_key_failure is not None:
+            raise RuntimeError(
+                f"recovery lexical foreign-key check failed: {foreign_key_failure!r}"
+            )
+        metadata = {
+            str(key): str(value)
+            for key, value in connection.execute("SELECT key,value FROM metadata")
+        }
+        if metadata.get("schema_version") != "2":
+            raise RuntimeError("recovery lexical database is not schema version 2")
+        if metadata.get("dataset_version") != dataset_version:
+            raise RuntimeError("recovery lexical dataset version does not match")
+
+        stage_sources: dict[str, tuple[Path, ...]] = {
+            "oewn": (inputs.oewn,),
+            "wiktextract": inputs.wiktextract,
+            "conceptnet": (inputs.conceptnet,),
+            "cmudict": (inputs.cmudict,),
+        }
+        stage_counts: dict[str, Any] = {}
+        for stage, paths in stage_sources.items():
+            fingerprint = _composite_fingerprint(
+                paths, fingerprints, original_pipeline_identity
+            )
+            resumed = _resume_lexical_checkpoint(
+                connection, checkpoints, stage, fingerprint
+            )
+            if resumed is None:
+                raise RuntimeError(
+                    f"recovery lexical checkpoint/database verification failed for {stage}"
+                )
+            resumed.pop("resumed", None)
+            stage_counts[stage] = resumed
+        lexical_counts = _db_counts(connection)
+        integrity = connection.execute("PRAGMA integrity_check").fetchone()
+        if not integrity or integrity[0] != "ok":
+            raise RuntimeError(f"recovery lexical integrity_check failed: {integrity!r}")
+    finally:
+        connection.close()
+    return stage_counts, lexical_counts
+
+
+def _completed_semantic_recovery_counts(
+    semantic_dir: Path, dataset_version: str
+) -> dict[str, object]:
+    verified = _verified_semantic_counts(semantic_dir, dataset_version)
+    mapping = semantic_dir / "mapping.sqlite3"
+    connection = sqlite3.connect(
+        f"file:{mapping.as_posix()}?mode=ro&immutable=1", uri=True
+    )
+    try:
+        metadata = {
+            str(key): str(value)
+            for key, value in connection.execute("SELECT key,value FROM metadata")
+        }
+        terms_value = verified.get("terms")
+        dimensions_value = verified.get("dimensions")
+        languages = verified.get("languages")
+        if (
+            not isinstance(terms_value, int)
+            or isinstance(terms_value, bool)
+            or not isinstance(dimensions_value, int)
+            or isinstance(dimensions_value, bool)
+            or not isinstance(languages, dict)
+        ):
+            raise RuntimeError("completed recovery semantic verification is malformed")
+        terms = terms_value
+        row = connection.execute(
+            """SELECT MIN(semantic_id),MAX(semantic_id),MIN(vector_offset),
+            MAX(vector_offset),
+            SUM(CASE WHEN semantic_id!=vector_offset THEN 1 ELSE 0 END)
+            FROM semantic_terms"""
+        ).fetchone()
+        expected = (0, terms - 1, 0, terms - 1, 0)
+        observed = tuple(None if value is None else int(value) for value in row or ())
+        if observed != expected:
+            raise RuntimeError(
+                "completed recovery semantic IDs/vector offsets are not exact and contiguous"
+            )
+        expected_rows = int(metadata["source_expected_rows"])
+        malformed = int(metadata["source_malformed"])
+        duplicates = int(metadata["source_duplicates"])
+        if terms + malformed + duplicates != expected_rows:
+            raise RuntimeError("completed recovery semantic import counters are inconsistent")
+    except (KeyError, ValueError) as exc:
+        raise RuntimeError("completed recovery semantic metadata is incomplete") from exc
+    finally:
+        connection.close()
+    return {
+        "expected_rows": expected_rows,
+        "terms": terms,
+        "dimensions": dimensions_value,
+        "languages": languages,
+        "malformed": malformed,
+        "duplicates": duplicates,
+    }
+
+
+def _require_sha256(value: str, *, field: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise ValueError(f"{field} must be a lowercase 64-hex SHA-256")
+    return value
+
+
+def _recovery_semantic_root(partial: Path) -> Path:
+    candidates = [
+        path
+        for path in (partial / "semantic.partial", partial / "semantic")
+        if path.is_dir()
+    ]
+    if len(candidates) != 1:
+        raise RuntimeError(
+            "recovery requires exactly one semantic.partial or semantic directory"
+        )
+    return candidates[0]
+
+
+def _verify_recovery_artifact_anchors(
+    partial: Path,
+    *,
+    expected_lexicon_sha256: str,
+    expected_global_index_sha256: str,
+    expected_global_vectors_sha256: str,
+) -> dict[str, str]:
+    semantic_root = _recovery_semantic_root(partial)
+    paths = {
+        "lexicon.sqlite3": partial / "lexicon.sqlite3",
+        "global.usearch": semantic_root / "indexes" / "global.usearch",
+        "global.f16": semantic_root / "vectors" / "global.f16",
+    }
+    expected = {
+        "lexicon.sqlite3": _require_sha256(
+            expected_lexicon_sha256, field="expected_lexicon_sha256"
+        ),
+        "global.usearch": _require_sha256(
+            expected_global_index_sha256, field="expected_global_index_sha256"
+        ),
+        "global.f16": _require_sha256(
+            expected_global_vectors_sha256, field="expected_global_vectors_sha256"
+        ),
+    }
+    observed: dict[str, str] = {}
+    for name, path in paths.items():
+        if not path.is_file():
+            raise FileNotFoundError(f"recovery anchor artifact does not exist: {path}")
+        observed[name] = file_sha256(path)
+        if observed[name] != expected[name]:
+            raise RuntimeError(
+                f"recovery anchor mismatch for {name}: "
+                f"expected {expected[name]}, got {observed[name]}"
+            )
+    return observed
+
+
+def _verify_recovery_notices(source: Path | None, staged: Path) -> None:
+    if source is None:
+        raise FileNotFoundError("recovery requires the supplied repository notices directory")
+    pairs = [(source / "DATA_LICENSES.md", staged / "DATA_LICENSES.md")]
+    pairs.extend(
+        (source / "licenses" / name, staged / "licenses" / name)
+        for name in (
+            "OEWN-LICENSE.md",
+            "PRINCETON-WORDNET.txt",
+            "CC-BY-4.0.txt",
+            "CC-BY-SA-4.0.txt",
+            "GFDL-1.3.txt",
+            "CMUDICT.txt",
+        )
+    )
+    for supplied, recovered in pairs:
+        if not supplied.is_file() or not recovered.is_file():
+            raise FileNotFoundError(
+                f"recovery notice pair is incomplete: {supplied}, {recovered}"
+            )
+        if supplied.read_bytes() != recovered.read_bytes():
+            raise RuntimeError(f"staged recovery notice differs from supplied bytes: {recovered}")
+
+
+def _recovery_implementation_provenance() -> dict[str, str]:
+    repository = Path(__file__).resolve().parents[3]
+    lock_path = repository / "uv.lock"
+    if not lock_path.is_file():
+        raise FileNotFoundError("recovery provenance requires the repository uv.lock")
+    return {
+        "usearch_version": importlib.metadata.version("usearch"),
+        "uv_lock_sha256": file_sha256(lock_path),
+    }
+
+
+def _verify_final_recovery_tree(
+    partial: Path,
+    semantic_dir: Path,
+    *,
+    dataset_version: str,
+    notices_dir: Path | None,
+) -> dict[str, object]:
+    counts = _completed_semantic_recovery_counts(semantic_dir, dataset_version)
+    mapping = semantic_dir / "mapping.sqlite3"
+    connection = sqlite3.connect(
+        f"file:{mapping.as_posix()}?mode=ro&immutable=1", uri=True
+    )
+    try:
+        integrity = connection.execute("PRAGMA integrity_check").fetchone()
+        if not integrity or integrity[0] != "ok":
+            raise RuntimeError(f"final semantic integrity_check failed: {integrity!r}")
+    finally:
+        connection.close()
+    _verify_recovery_notices(notices_dir, partial / "notices")
+    transient = [
+        path
+        for path in partial.rglob("*")
+        if path.is_file()
+        and path.name.endswith((".partial", "-wal", "-shm"))
+    ]
+    if transient:
+        raise RuntimeError(
+            f"recovery tree contains transient files: {[str(path) for path in transient]!r}"
+        )
+    return counts
+
+
+def _recover_full_corpus_from_semantic_partial_locked(
+    inputs: BuildInputs,
+    output_dir: Path,
+    build_state: Path,
+    *,
+    dataset_version: str = "data-v1.0.0",
+    retrieved_at: str | None = None,
+    enforce_corpus_floors: bool = True,
+    original_build_commit: str,
+    recovery_commit: str,
+    expected_lexicon_sha256: str,
+    expected_global_index_sha256: str,
+    expected_global_vectors_sha256: str,
+    expected_original_pipeline_identity: str | None = None,
+) -> dict[str, Any]:
+    """Finish one verified post-global build without rerunning lexical stages.
+
+    This is deliberately separate from :func:`build_full_corpus`: it has no
+    destructive fallback, never opens the completed lexical database writable,
+    and remains idempotent when semantic completion succeeded but a later gate
+    prevented final dataset promotion.
+    """
+
+    for label, commit in (
+        ("original_build_commit", original_build_commit),
+        ("recovery_commit", recovery_commit),
+    ):
+        if not re.fullmatch(r"[0-9a-f]{40}", commit):
+            raise ValueError(f"{label} must be a lowercase 40-hex Git commit")
+    inputs.validate()
+    recovery_pipeline_identity = _pipeline_identity()
+    if output_dir.exists():
+        raise FileExistsError(f"refusing to replace existing output: {output_dir}")
+    partial = output_dir.with_name(output_dir.name + ".partial")
+    if not partial.is_dir():
+        raise FileNotFoundError(f"recovery dataset partial does not exist: {partial}")
+    _verify_recovery_notices(inputs.notices_dir, partial / "notices")
+    artifact_anchors = _verify_recovery_artifact_anchors(
+        partial,
+        expected_lexicon_sha256=expected_lexicon_sha256,
+        expected_global_index_sha256=expected_global_index_sha256,
+        expected_global_vectors_sha256=expected_global_vectors_sha256,
+    )
+    implementation_provenance = _recovery_implementation_provenance()
+
+    records, fingerprints = _source_records(inputs, retrieved_at)
+    checkpoint_dir = build_state / dataset_version / "checkpoints"
+    original_pipeline_identity = _recorded_lexical_pipeline_identity(checkpoint_dir)
+    if expected_original_pipeline_identity is not None:
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_original_pipeline_identity):
+            raise ValueError(
+                "expected_original_pipeline_identity must be a lowercase 64-hex digest"
+            )
+        if original_pipeline_identity != expected_original_pipeline_identity:
+            raise RuntimeError(
+                "recorded lexical pipeline identity does not match original build commit"
+            )
+    checkpoints = Checkpoints(checkpoint_dir)
+    stage_counts, lexical_counts = _validated_recovery_lexical_state(
+        inputs,
+        partial,
+        checkpoints,
+        fingerprints,
+        dataset_version=dataset_version,
+        original_pipeline_identity=original_pipeline_identity,
+    )
+
+    semantic_dir = partial / "semantic"
+    semantic_partial = partial / "semantic.partial"
+    if semantic_dir.is_dir():
+        if semantic_partial.exists():
+            raise RuntimeError("recovery dataset contains both semantic and semantic.partial")
+        semantic_counts = _completed_semantic_recovery_counts(
+            semantic_dir, dataset_version
+        )
+    else:
+        if not semantic_partial.is_dir():
+            raise FileNotFoundError("recovery semantic.partial does not exist")
+        semantic_counts = resume_numberbatch_partial(
+            inputs.numberbatch, semantic_dir, dataset_version
+        )
+        verified_semantic = _completed_semantic_recovery_counts(
+            semantic_dir, dataset_version
+        )
+        if semantic_counts != verified_semantic:
+            raise RuntimeError("recovered Numberbatch artifacts disagree with verification")
+
+    semantic_fingerprint = _composite_fingerprint(
+        (inputs.numberbatch,), fingerprints, recovery_pipeline_identity
+    )
+    _record_semantic_checkpoint(semantic_dir, semantic_fingerprint, semantic_counts)
+    checkpoints.mark("numberbatch", semantic_fingerprint, counts=semantic_counts)
+    stage_counts["numberbatch"] = semantic_counts
+
+    corpus_floors, floor_failures = evaluate_corpus_floors(stage_counts)
+    if enforce_corpus_floors and floor_failures:
+        raise RuntimeError("full-corpus floor failure: " + "; ".join(floor_failures))
+
+    write_sources_lock(partial / "sources.lock.json", records)
+    size_projection = assert_size_targets()
+    manifest: dict[str, Any] = {
+        "schema_version": 1,
+        "dataset_version": dataset_version,
+        "profile": "full",
+        "pipeline_identity": recovery_pipeline_identity,
+        "recovery_provenance": {
+            "mode": "validated-post-global-semantic-resume",
+            "original_build_commit": original_build_commit,
+            "original_pipeline_identity": original_pipeline_identity,
+            "recovery_commit": recovery_commit,
+            "recovery_pipeline_identity": recovery_pipeline_identity,
+            "artifact_sha256": artifact_anchors,
+            **implementation_provenance,
+        },
+        "lexical_counts": lexical_counts,
+        "stage_counts": stage_counts,
+        "semantic": semantic_counts,
+        "corpus_floors": corpus_floors,
+        "corpus_floors_enforced": enforce_corpus_floors,
+        "resource_projection": size_projection,
+        "installed_size": 0,
+        "installed_size_limit": INSTALLED_LIMIT,
+        "ngrams_included": False,
+    }
+    manifest_path = partial / "build-manifest.json"
+    for _attempt in range(3):
+        write_json_atomic(manifest_path, manifest)
+        installed_size = _installed_size(partial)
+        if installed_size > INSTALLED_LIMIT:
+            raise RuntimeError(
+                f"installed-size gate failure: {installed_size} bytes exceeds {INSTALLED_LIMIT}"
+            )
+        if manifest["installed_size"] == installed_size:
+            break
+        manifest["installed_size"] = installed_size
+    else:  # pragma: no cover - digit length converges in at most two writes
+        raise RuntimeError("installed-size manifest did not converge")
+    final_semantic_counts = _verify_final_recovery_tree(
+        partial,
+        semantic_dir,
+        dataset_version=dataset_version,
+        notices_dir=inputs.notices_dir,
+    )
+    if final_semantic_counts != semantic_counts:
+        raise RuntimeError("final semantic verification disagrees with recovery counts")
+    final_artifact_anchors = _verify_recovery_artifact_anchors(
+        partial,
+        expected_lexicon_sha256=expected_lexicon_sha256,
+        expected_global_index_sha256=expected_global_index_sha256,
+        expected_global_vectors_sha256=expected_global_vectors_sha256,
+    )
+    if final_artifact_anchors != artifact_anchors:
+        raise RuntimeError("immutable recovery artifact anchors changed during recovery")
+    os.replace(partial, output_dir)
+    return manifest
+
+
+def recover_full_corpus_from_semantic_partial(
+    inputs: BuildInputs,
+    output_dir: Path,
+    build_state: Path,
+    *,
+    dataset_version: str = "data-v1.0.0",
+    retrieved_at: str | None = None,
+    enforce_corpus_floors: bool = True,
+    original_build_commit: str,
+    recovery_commit: str,
+    expected_lexicon_sha256: str,
+    expected_global_index_sha256: str,
+    expected_global_vectors_sha256: str,
+    expected_original_pipeline_identity: str | None = None,
+) -> dict[str, Any]:
+    """Exclusively finish one verified post-global corpus build."""
+
+    lock_path = build_state / dataset_version / ".recovery.lock"
+    with InstallationLock(lock_path):
+        return _recover_full_corpus_from_semantic_partial_locked(
+            inputs,
+            output_dir,
+            build_state,
+            dataset_version=dataset_version,
+            retrieved_at=retrieved_at,
+            enforce_corpus_floors=enforce_corpus_floors,
+            original_build_commit=original_build_commit,
+            recovery_commit=recovery_commit,
+            expected_lexicon_sha256=expected_lexicon_sha256,
+            expected_global_index_sha256=expected_global_index_sha256,
+            expected_global_vectors_sha256=expected_global_vectors_sha256,
+            expected_original_pipeline_identity=expected_original_pipeline_identity,
+        )

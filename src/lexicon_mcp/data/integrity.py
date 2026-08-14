@@ -7,8 +7,8 @@ import re
 import sqlite3
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
 
+from ..usearch_compat import index_count
 from .manifest import Component
 
 
@@ -82,25 +82,45 @@ def default_semantic_count(path: Path, component: Component) -> int:
     """Read an index/mapping count without loading all vectors into memory."""
 
     table = component.integrity.get("semantic_table")
+    if component.artifact_type == "semantic_index" or path.suffix.lower() == ".usearch":
+        try:
+            dimensions = int(component.integrity["semantic_dimensions"])
+            metric = str(component.integrity["semantic_metric"])
+            dtype = str(component.integrity["semantic_dtype"])
+            connectivity = int(component.integrity["semantic_connectivity"])
+            expansion_add = int(component.integrity["semantic_expansion_add"])
+            expansion_search = int(component.integrity["semantic_expansion_search"])
+        except KeyError as exc:
+            raise IntegrityError(
+                f"semantic index schema is missing {exc.args[0]!r}: {path}"
+            ) from exc
+        except (TypeError, ValueError) as exc:
+            raise IntegrityError(f"semantic index schema is malformed: {path}") from exc
+        if (
+            dimensions < 1
+            or metric != "cos"
+            or dtype != "i8"
+            or connectivity != 16
+            or expansion_add != 256
+            or expansion_search < 512
+        ):
+            raise IntegrityError(f"semantic index schema is unsupported: {path}")
+        try:
+            return index_count(
+                path,
+                dimensions=dimensions,
+                metric=metric,
+                dtype=dtype,
+                connectivity=connectivity,
+                expansion_add=expansion_add,
+                expansion_search=expansion_search,
+            )
+        except Exception as exc:
+            raise IntegrityError(f"unable to inspect semantic index {path}: {exc}") from exc
     if path.suffix.lower() in {".sqlite", ".sqlite3", ".db"}:
         if table is None:
             table = component.integrity.get("semantic_mapping_table", "semantic_terms")
         return sqlite_count(path, str(table))
-    if component.artifact_type == "semantic_index" or path.suffix.lower() == ".usearch":
-        try:
-            from usearch.index import Index
-
-            metadata: Any = Index.metadata(str(path))
-        except (ImportError, OSError, RuntimeError, ValueError) as exc:
-            raise IntegrityError(f"unable to inspect semantic index {path}: {exc}") from exc
-        size = getattr(metadata, "size", None)
-        if size is None and isinstance(metadata, dict):
-            # USearch 2.26 calls this field ``count_present``.  Retain the
-            # ``size`` fallback for compatible future/older bindings.
-            size = metadata.get("count_present", metadata.get("size"))
-        if size is None:
-            raise IntegrityError(f"semantic index metadata has no size: {path}")
-        return int(size)
     raise IntegrityError(f"no semantic count reader for {component.artifact_type}: {path}")
 
 

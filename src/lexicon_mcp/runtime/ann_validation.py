@@ -10,8 +10,8 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from usearch.index import Index
 
+from ..usearch_compat import open_index_view
 from .locator import ActiveDataset
 
 DEFAULT_LANGUAGES = ("en", "de", "es", "fr", "it", "pt", "ru", "ja", "ar", "hi")
@@ -472,11 +472,13 @@ def validate_ann_acceptance(
         if dimensions < 1:
             raise RuntimeError("semantic metadata dimensions must be positive")
         try:
+            connectivity = int(metadata.get("connectivity", "16"))
+            expansion_add = int(metadata.get("expansion_add", "256"))
             expansion_search = int(metadata.get("expansion_search", "512"))
         except (TypeError, ValueError) as exc:
-            raise RuntimeError("semantic metadata has no valid expansion_search") from exc
-        if expansion_search < 512:
-            raise RuntimeError("semantic expansion_search must be at least 512")
+            raise RuntimeError("semantic metadata has no valid USearch schema") from exc
+        if connectivity != 16 or expansion_add != 256 or expansion_search < 512:
+            raise RuntimeError("semantic metadata has an unsupported USearch schema")
         row_bytes = dimensions * np.dtype("<f2").itemsize
         vector_bytes = vector_path.stat().st_size
         if vector_bytes % row_bytes:
@@ -514,34 +516,42 @@ def validate_ann_acceptance(
             k=k,
             chunk_size=chunk_size,
         )
-        global_index = Index.restore(global_path, view=True)
-        if global_index is None:
-            raise RuntimeError("USearch could not restore the global ANN index")
-        global_index.expansion_search = expansion_search
-        for seed in all_seeds:
-            query = _unit_vector(matrix, seed.vector_offset)
-            ann, deterministic, strict_language = _ann_neighbors(
-                global_index,
-                connection,
-                matrix,
-                query,
-                seed,
-                k=k,
-                index_size=global_size,
-                expected_language=None,
-            )
-            results.append(
-                _seed_result(
-                    "global",
+        global_index = open_index_view(
+            global_path,
+            dimensions=dimensions,
+            metric="cos",
+            dtype="i8",
+            connectivity=connectivity,
+            expansion_add=expansion_add,
+            expansion_search=expansion_search,
+            expected_count=global_size,
+        )
+        try:
+            for seed in all_seeds:
+                query = _unit_vector(matrix, seed.vector_offset)
+                ann, deterministic, strict_language = _ann_neighbors(
+                    global_index,
+                    connection,
+                    matrix,
+                    query,
                     seed,
-                    ann,
-                    global_exact[seed.semantic_id],
-                    deterministic,
-                    strict_language,
-                    k,
+                    k=k,
+                    index_size=global_size,
+                    expected_language=None,
                 )
-            )
-        del global_index
+                results.append(
+                    _seed_result(
+                        "global",
+                        seed,
+                        ann,
+                        global_exact[seed.semantic_id],
+                        deterministic,
+                        strict_language,
+                        k,
+                    )
+                )
+        finally:
+            global_index.reset()
 
         for language in languages:
             shard = connection.execute(
@@ -564,34 +574,42 @@ def validate_ann_acceptance(
                 chunk_size=chunk_size,
             )
             index_path = _safe_artifact(semantic, str(shard["index_file"]), "ANN shard")
-            index = Index.restore(index_path, view=True)
-            if index is None:
-                raise RuntimeError(f"USearch could not restore ANN shard {language!r}")
-            index.expansion_search = expansion_search
-            for seed in seeds_by_language[language]:
-                query = _unit_vector(matrix, seed.vector_offset)
-                ann, deterministic, strict_language = _ann_neighbors(
-                    index,
-                    connection,
-                    matrix,
-                    query,
-                    seed,
-                    k=k,
-                    index_size=index_size,
-                    expected_language=language,
-                )
-                results.append(
-                    _seed_result(
-                        "language_shard",
+            index = open_index_view(
+                index_path,
+                dimensions=dimensions,
+                metric="cos",
+                dtype="i8",
+                connectivity=connectivity,
+                expansion_add=expansion_add,
+                expansion_search=expansion_search,
+                expected_count=index_size,
+            )
+            try:
+                for seed in seeds_by_language[language]:
+                    query = _unit_vector(matrix, seed.vector_offset)
+                    ann, deterministic, strict_language = _ann_neighbors(
+                        index,
+                        connection,
+                        matrix,
+                        query,
                         seed,
-                        ann,
-                        exact[seed.semantic_id],
-                        deterministic,
-                        strict_language,
-                        k,
+                        k=k,
+                        index_size=index_size,
+                        expected_language=language,
                     )
-                )
-            del index
+                    results.append(
+                        _seed_result(
+                            "language_shard",
+                            seed,
+                            ann,
+                            exact[seed.semantic_id],
+                            deterministic,
+                            strict_language,
+                            k,
+                        )
+                    )
+            finally:
+                index.reset()
         del matrix
     finally:
         connection.close()

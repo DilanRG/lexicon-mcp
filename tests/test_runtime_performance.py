@@ -24,6 +24,7 @@ def test_full_corpus_latency_and_private_memory_gates() -> None:
     assert report.idle_private_bytes <= 512 * MIB, report
     assert report.semantic_worker_peak_private_bytes > 0, report
     assert report.semantic_worker_peak_private_bytes <= 1_024 * MIB, report
-    # Mapped index/vector/SQLite residency is reported separately and is not
-    # charged against the semantic private-memory gate above.
+    # Total worker working set and mapped index/vector/SQLite residency are
+    # diagnostics only and do not change the private-memory release gate.
+    assert report.semantic_worker_peak_working_set_bytes > 0, report
     assert report.semantic_worker_peak_mapped_artifact_rss_bytes > 0, report
