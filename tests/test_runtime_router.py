@@ -97,12 +97,15 @@ def routed(tmp_path: Path) -> PackRouter:
         unavailable=(),
         components=tuple(components),
         packs=(
-            ActivationPack("core", "core", (), "artifact-core"),
-            ActivationPack("lexical-en", "lexical", ("en",), "artifact-lexical-en"),
+            ActivationPack("core", "core", (), ("artifact-core",)),
+            ActivationPack("lexical-en", "lexical", ("en",), ("artifact-lexical-en",)),
             ActivationPack(
-                "lexical-bundle-001", "lexical", ("cy", "gv"), "artifact-lexical-bundle"
+                "lexical-bundle-001",
+                "lexical",
+                ("cy", "gv"),
+                ("artifact-lexical-bundle",),
             ),
-            ActivationPack("semantic-en", "semantic", ("en",), "artifact-semantic-en"),
+            ActivationPack("semantic-en", "semantic", ("en",), ("artifact-semantic-en",)),
         ),
     )
     router = PackRouter(activation, store, max_open_packs=2)
@@ -171,8 +174,8 @@ def test_a_capability_can_be_missing_for_an_installed_language(tmp_path: Path) -
         unavailable=(),
         components=tuple(components),
         packs=(
-            ActivationPack("core", "core", (), "artifact-core"),
-            ActivationPack("lexical-en", "lexical", ("en",), "artifact-lexical-en"),
+            ActivationPack("core", "core", (), ("artifact-core",)),
+            ActivationPack("lexical-en", "lexical", ("en",), ("artifact-lexical-en",)),
         ),
     )
 
@@ -258,7 +261,7 @@ def test_an_activation_without_a_core_pack_cannot_answer_coverage(
         effective={},
         unavailable=(),
         components=(ActivationComponent("artifact-x", "0" * 64, "x.sqlite3", 1),),
-        packs=(ActivationPack("lexical-en", "lexical", ("en",), "artifact-x"),),
+        packs=(ActivationPack("lexical-en", "lexical", ("en",), ("artifact-x",)),),
     )
 
     router = PackRouter(activation, ComponentStore(tmp_path / "components"))

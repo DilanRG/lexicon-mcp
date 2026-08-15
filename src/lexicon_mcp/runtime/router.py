@@ -141,7 +141,7 @@ class PackRouter:
     def _core_component(self) -> ActivationComponent:
         for pack in self.activation.packs:
             if pack.capability == "core":
-                return self.activation.component(pack.component)
+                return self.activation.component(pack.components[0])
         raise RouterError("activation has no core pack; the catalogue is unreadable")
 
     # -------------------------------------------------------------- routing

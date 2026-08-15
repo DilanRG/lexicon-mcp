@@ -42,7 +42,7 @@ class ActivationPack:
     id: str
     capability: str
     languages: tuple[str, ...]
-    component: str
+    components: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,7 +75,7 @@ class Activation:
         language = normalize_language(language)
         for pack in self.packs:
             if pack.capability == capability and language in pack.languages:
-                return self.component(pack.component)
+                return self.component(pack.components[0])
         return None
 
     def digests(self) -> set[str]:
@@ -125,7 +125,7 @@ class Activation:
                     "id": pack.id,
                     "capability": pack.capability,
                     "languages": list(pack.languages),
-                    "component": pack.component,
+                    "components": list(pack.components),
                 }
                 for pack in self.packs
             ],
@@ -178,7 +178,7 @@ def build_activation(
             id=pack.id,
             capability=pack.capability,
             languages=pack.languages,
-            component=pack.component,
+            components=pack.components,
         )
         for pack in manifest.packs
         if pack.id in selected_packs
@@ -263,9 +263,17 @@ def parse_activation(raw: bytes | str | Mapping[str, Any]) -> Activation:
         field = f"packs[{index}]"
         if not isinstance(item, dict):
             raise ActivationError(f"{field} must be an object")
-        component = safe_identifier(item.get("component"), field=f"{field}.component")
-        if component not in component_ids:
-            raise ActivationError(f"{field} references uninstalled component {component!r}")
+        raw_components = item.get("components")
+        if not isinstance(raw_components, list) or not raw_components:
+            raise ActivationError(f"{field}.components must be a non-empty array")
+        pack_components: list[str] = []
+        for index, entry in enumerate(raw_components):
+            component = safe_identifier(entry, field=f"{field}.components[{index}]")
+            if component not in component_ids:
+                raise ActivationError(
+                    f"{field} references uninstalled component {component!r}"
+                )
+            pack_components.append(component)
         languages = item.get("languages")
         if not isinstance(languages, list):
             raise ActivationError(f"{field}.languages must be an array")
@@ -277,7 +285,7 @@ def parse_activation(raw: bytes | str | Mapping[str, Any]) -> Activation:
                     normalize_language(language, field=f"{field}.languages")
                     for language in languages
                 ),
-                component=component,
+                components=tuple(pack_components),
             )
         )
 

@@ -106,7 +106,7 @@ def test_activation_round_trips_through_json() -> None:
 def test_parsing_rejects_a_record_that_routes_to_a_missing_component() -> None:
     activation = activation_for(["en"], ["lexical"])
     payload = activation.to_dict()
-    payload["packs"][-1]["component"] = "artifact-not-installed"
+    payload["packs"][-1]["components"] = ["artifact-not-installed"]
 
     with pytest.raises(ActivationError, match="uninstalled component"):
         parse_activation(json.dumps(payload))

@@ -157,8 +157,9 @@ def resolve(
     # component; both collapse here so sizes are never double counted.
     component_ids: list[str] = []
     for pack in selected:
-        if pack.component not in component_ids:
-            component_ids.append(pack.component)
+        for component in pack.components:
+            if component not in component_ids:
+                component_ids.append(component)
 
     compressed = 0
     installed = 0

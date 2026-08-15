@@ -141,16 +141,20 @@ class Component:
 class Pack:
     """One independently selectable unit of a schema-2 release.
 
-    A pack binds a capability and a set of languages to exactly one component.
-    Tiering is invisible here on purpose: a caller asks for a language, and
-    whether that language has its own pack or shares a bundle is a packaging
-    detail resolved through this table.
+    A pack binds a capability and a set of languages to the components that
+    serve them.  Tiering is invisible here on purpose: a caller asks for a
+    language, and whether that language has its own pack or shares a bundle is a
+    packaging detail resolved through this table.
+
+    Most packs are a single component.  A semantic pack is not: it needs its
+    mapping rows, its vectors and its USearch index, which are separate
+    artifacts because the index is loaded from a file rather than a blob.
     """
 
     id: str
     capability: str
     languages: tuple[str, ...]
-    component: str
+    components: tuple[str, ...]
     required: bool
 
 
@@ -496,6 +500,29 @@ def _parse_language_tags(
     return tuple(parsed)
 
 
+def _parse_pack_components(
+    item: dict[str, Any], field: str, component_ids: set[str]
+) -> tuple[str, ...]:
+    """Accept a single `component` or a `components` array, never both."""
+
+    single = item.get("component")
+    many = item.get("components")
+    if (single is None) == (many is None):
+        raise ManifestError(f"{field} needs exactly one of component or components")
+    raw = [single] if single is not None else many
+    if not isinstance(raw, list) or not raw:
+        raise ManifestError(f"{field}.components must be a non-empty array")
+    resolved: list[str] = []
+    for index, value in enumerate(raw):
+        component = safe_identifier(value, field=f"{field}.components[{index}]")
+        if component not in component_ids:
+            raise ManifestError(f"{field} references unknown component {component!r}")
+        if component in resolved:
+            raise ManifestError(f"{field} lists component {component!r} twice")
+        resolved.append(component)
+    return tuple(resolved)
+
+
 def _parse_packs(value: Any, component_ids: set[str]) -> tuple[Pack, ...]:
     if not isinstance(value, list) or not value:
         raise ManifestError("packs must be a non-empty array")
@@ -513,9 +540,7 @@ def _parse_packs(value: Any, component_ids: set[str]) -> tuple[Pack, ...]:
         capability = _string(item.get("capability"), f"{field}.capability")
         if capability not in _CAPABILITIES:
             raise ManifestError(f"{field}.capability must be one of {list(_CAPABILITIES)}")
-        component = safe_identifier(item.get("component"), field=f"{field}.component")
-        if component not in component_ids:
-            raise ManifestError(f"{field} references unknown component {component!r}")
+        components = _parse_pack_components(item, field, component_ids)
         required = item.get("required", capability == "core")
         if not isinstance(required, bool):
             raise ManifestError(f"{field}.required must be boolean")
@@ -537,7 +562,7 @@ def _parse_packs(value: Any, component_ids: set[str]) -> tuple[Pack, ...]:
                     f"{capability!r} by pack {previous!r}"
                 )
             claimed[(capability, language)] = pack_id
-        parsed.append(Pack(pack_id, capability, languages, component, required))
+        parsed.append(Pack(pack_id, capability, languages, components, required))
     if not any(pack.capability == "core" for pack in parsed):
         raise ManifestError("packs must include at least one core pack")
     return tuple(parsed)

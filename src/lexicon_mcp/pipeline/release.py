@@ -1,12 +1,12 @@
 """Package built schema-2 packs into a release with its manifest.
 
-Each pack becomes one component: compressed straight into independently hashed
-parts, never staged as a whole compressed file, so packaging a 23 GB corpus
-costs only the final release assets in peak storage.
+Each pack is compressed straight into independently hashed parts, never staged
+as a whole compressed file, so packaging a 23 GB corpus costs only the final
+release assets in peak storage.
 
 The manifest's pack table is what makes tiering invisible to callers -- it maps
-(capability, language) to a component, so a user names a language and the
-installer resolves whether that language owns a pack or shares a bundle.
+(capability, language) to the components serving it, so a user names a language
+and the installer resolves whether that language owns a pack or shares a bundle.
 """
 
 from __future__ import annotations
@@ -112,7 +112,7 @@ def package_packs(
             entry: dict[str, Any] = {
                 "id": pack.id,
                 "capability": pack.capability,
-                "component": component_id,
+                "components": [component_id],
             }
             if pack.capability == "core":
                 entry["required"] = True
