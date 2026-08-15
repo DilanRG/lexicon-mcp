@@ -396,3 +396,118 @@ def test_translations_survive_without_the_target_language(
     # Usable as an answer, and honest that the French entry is not installed.
     assert result["target_language_installed"] is False
     assert result["target_details_available"] is False
+
+
+def build_semantic_source(root: Path) -> Path:
+    """A miniature semantic artifact set: mapping, vectors, per-language index."""
+
+    import numpy as np
+
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "vectors").mkdir(exist_ok=True)
+    (root / "indexes" / "languages").mkdir(parents=True, exist_ok=True)
+
+    dimensions = 4
+    # Four vectors; rows 1 and 3 belong to French, so English gathers a
+    # non-contiguous slice and its offsets must be rewritten.
+    matrix = np.arange(4 * dimensions, dtype="<f2").reshape(4, dimensions)
+    (root / "vectors" / "global.f16").write_bytes(matrix.tobytes())
+    (root / "indexes" / "languages" / "en.usearch").write_bytes(b"usearch-en-index")
+
+    connection = sqlite3.connect(root / "mapping.sqlite3")
+    connection.executescript(
+        """
+        CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE provenance (provenance_id INTEGER PRIMARY KEY, source TEXT NOT NULL,
+            source_license TEXT NOT NULL, source_url TEXT NOT NULL);
+        CREATE TABLE lexical_terms (term_id INTEGER PRIMARY KEY, term TEXT NOT NULL,
+            normalized_term TEXT NOT NULL, language TEXT NOT NULL);
+        CREATE TABLE semantic_terms (semantic_id INTEGER PRIMARY KEY, concept TEXT NOT NULL,
+            term_id INTEGER NOT NULL, vector_offset INTEGER NOT NULL UNIQUE);
+        CREATE TABLE semantic_languages (language TEXT PRIMARY KEY, index_file TEXT NOT NULL,
+            term_count INTEGER NOT NULL);
+        """
+    )
+    connection.execute(
+        "INSERT INTO provenance VALUES (1,'Numberbatch','CC-BY-SA-4.0','https://conceptnet.io/')"
+    )
+    for term_id, term, language in ((1, "dog", "en"), (2, "chien", "fr"), (3, "cat", "en")):
+        connection.execute(
+            "INSERT INTO lexical_terms VALUES (?,?,?,?)", (term_id, term, term, language)
+        )
+    # offsets deliberately interleaved across languages
+    connection.execute("INSERT INTO semantic_terms VALUES (10,'/c/en/dog',1,0)")
+    connection.execute("INSERT INTO semantic_terms VALUES (11,'/c/fr/chien',2,1)")
+    connection.execute("INSERT INTO semantic_terms VALUES (12,'/c/en/cat',3,2)")
+    connection.execute(
+        "INSERT INTO semantic_languages VALUES ('en','indexes/languages/en.usearch',2)"
+    )
+    for key, value in (
+        ("dimensions", str(dimensions)),
+        ("vector_file", "vectors/global.f16"),
+        ("vector_dtype", "float16"),
+        ("index_dtype", "i8"),
+        ("index_metric", "cos"),
+        ("connectivity", "16"),
+        ("expansion_add", "256"),
+        ("expansion_search", "512"),
+        ("source", "ConceptNet Numberbatch 19.08"),
+        ("source_license", "CC-BY-SA-4.0"),
+        ("source_url", "https://github.com/commonsense/conceptnet-numberbatch"),
+    ):
+        connection.execute("INSERT INTO metadata VALUES (?,?)", (key, value))
+    connection.commit()
+    connection.close()
+    return root
+
+
+def test_semantic_pack_gathers_its_own_vectors_and_rewrites_offsets(
+    tmp_path: Path,
+) -> None:
+    import numpy as np
+
+    from lexicon_mcp.pipeline.transform import build_semantic_pack
+
+    source = build_semantic_source(tmp_path / "semantic")
+
+    result = build_semantic_pack(
+        source, tmp_path / "pack", "en", dataset_version=VERSION
+    )
+
+    assert result.terms == 2
+    assert result.dimensions == 4
+    # semantic_id is preserved, because the USearch index keys on it.
+    rows = read(result.mapping, "SELECT semantic_id, concept, vector_offset FROM semantic_terms")
+    assert rows == [(10, "/c/en/dog", 0), (12, "/c/en/cat", 1)]
+
+    # The gathered file holds only English rows, in their new offset order.
+    gathered = np.frombuffer(result.vectors.read_bytes(), dtype="<f2").reshape(2, 4)
+    original = np.arange(16, dtype="<f2").reshape(4, 4)
+    assert np.array_equal(gathered[0], original[0])
+    assert np.array_equal(gathered[1], original[2])
+
+
+def test_semantic_pack_ships_the_existing_index_verbatim(tmp_path: Path) -> None:
+    """The index keys on semantic_id, so it never needs rebuilding."""
+
+    from lexicon_mcp.pipeline.transform import build_semantic_pack
+
+    source = build_semantic_source(tmp_path / "semantic")
+
+    result = build_semantic_pack(
+        source, tmp_path / "pack", "en", dataset_version=VERSION
+    )
+
+    assert result.index.read_bytes() == b"usearch-en-index"
+    assert read(
+        result.mapping, "SELECT language, index_file, term_count FROM semantic_languages"
+    ) == [("en", "en.usearch", 2)]
+
+
+def test_semantic_pack_refuses_a_language_without_vectors(tmp_path: Path) -> None:
+    from lexicon_mcp.pipeline.transform import TransformError, build_semantic_pack
+
+    source = build_semantic_source(tmp_path / "semantic")
+
+    with pytest.raises(TransformError, match="no semantic vectors"):
+        build_semantic_pack(source, tmp_path / "pack", "cy", dataset_version=VERSION)

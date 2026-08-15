@@ -16,6 +16,7 @@ from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from .packs import (
     CORE_PACK_SCHEMA,
@@ -403,3 +404,166 @@ def build_core_pack(
         db.execute("DETACH DATABASE counts")
         db.execute("VACUUM")
     return destination
+
+
+SEMANTIC_PACK_SCHEMA = """
+CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE provenance (
+    provenance_id INTEGER PRIMARY KEY,
+    source TEXT NOT NULL,
+    source_license TEXT NOT NULL,
+    source_url TEXT NOT NULL
+);
+CREATE TABLE lexical_terms (
+    term_id INTEGER PRIMARY KEY,
+    term TEXT NOT NULL,
+    normalized_term TEXT NOT NULL,
+    language TEXT NOT NULL,
+    UNIQUE (language, normalized_term, term)
+);
+CREATE TABLE semantic_terms (
+    semantic_id INTEGER PRIMARY KEY,
+    concept TEXT NOT NULL UNIQUE,
+    term_id INTEGER NOT NULL REFERENCES lexical_terms(term_id),
+    vector_offset INTEGER NOT NULL UNIQUE
+);
+CREATE TABLE semantic_languages (
+    language TEXT PRIMARY KEY,
+    index_file TEXT NOT NULL,
+    term_count INTEGER NOT NULL
+);
+CREATE INDEX semantic_terms_term_lookup ON semantic_terms(term_id);
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticPackResult:
+    language: str
+    mapping: Path
+    vectors: Path
+    index: Path
+    terms: int
+    dimensions: int
+
+
+def build_semantic_pack(
+    semantic_root: Path,
+    destination: Path,
+    language: str,
+    *,
+    dataset_version: str,
+) -> SemanticPackResult:
+    """Emit the three artifacts one semantic language needs.
+
+    ``semantic_id`` is preserved, because the per-language USearch index keys on
+    it -- so that index ships verbatim and is never rebuilt.  Only
+    ``vector_offset`` is rewritten, since the pack carries its own gathered
+    vector file rather than the 5.5 GB global one.
+
+    Vectors are gathered in source-offset order so the global file is read
+    forwards rather than seeking randomly across it.
+    """
+
+    import shutil as _shutil
+
+    import numpy as np
+
+    mapping_source = semantic_root / "mapping.sqlite3"
+    reader = sqlite3.connect(_read_only_uri(mapping_source), uri=True)
+    try:
+        metadata = dict(reader.execute("SELECT key, value FROM metadata"))
+        dimensions = int(metadata["dimensions"])
+        vector_source = semantic_root / metadata["vector_file"]
+        shard = reader.execute(
+            "SELECT index_file, term_count FROM semantic_languages WHERE language = ?",
+            (language,),
+        ).fetchone()
+        if shard is None:
+            raise TransformError(f"no semantic vectors for {language!r}")
+        rows = reader.execute(
+            """
+            SELECT s.semantic_id, s.concept, s.term_id, s.vector_offset,
+                   t.term, t.normalized_term, t.language
+            FROM semantic_terms AS s
+            JOIN lexical_terms AS t ON t.term_id = s.term_id
+            WHERE t.language = ?
+            ORDER BY s.vector_offset
+            """,
+            (language,),
+        ).fetchall()
+        provenance = reader.execute("SELECT * FROM provenance").fetchall()
+    finally:
+        reader.close()
+
+    if not rows:
+        raise TransformError(f"semantic language {language!r} has no terms")
+    if len(rows) != int(shard[1]):
+        raise TransformError(
+            f"semantic language {language!r} has {len(rows)} terms, "
+            f"but its index declares {shard[1]}"
+        )
+
+    destination.mkdir(parents=True, exist_ok=True)
+    vectors_path = destination / "vectors.f16"
+    row_bytes = dimensions * 2
+    total = vector_source.stat().st_size // row_bytes
+    matrix: Any = np.memmap(vector_source, dtype="<f2", mode="r", shape=(total, dimensions))
+    with vectors_path.open("wb") as sink:
+        for _semantic_id, _concept, _term_id, offset, *_ in rows:
+            if not 0 <= int(offset) < total:
+                raise TransformError("semantic vector offset is outside the matrix")
+            sink.write(matrix[int(offset)].tobytes())
+    del matrix
+
+    index_source = semantic_root / str(shard[0])
+    index_path = destination / f"{language.replace('-', '_')}.usearch"
+    _shutil.copyfile(index_source, index_path)
+
+    mapping_path = destination / "mapping.sqlite3"
+    with _writable(mapping_path) as db:
+        db.executescript(SEMANTIC_PACK_SCHEMA)
+        db.executemany("INSERT INTO provenance VALUES (?,?,?,?)", provenance)
+        db.executemany(
+            "INSERT INTO lexical_terms VALUES (?,?,?,?)",
+            [(row[2], row[4], row[5], row[6]) for row in rows],
+        )
+        db.executemany(
+            "INSERT INTO semantic_terms VALUES (?,?,?,?)",
+            [(row[0], row[1], row[2], position) for position, row in enumerate(rows)],
+        )
+        db.execute(
+            "INSERT INTO semantic_languages VALUES (?,?,?)",
+            (language, index_path.name, len(rows)),
+        )
+        for key, value in (
+            ("schema_version", str(DATASET_SCHEMA_VERSION)),
+            ("dataset_version", dataset_version),
+            ("capability", "semantic"),
+            ("language", language),
+            ("dimensions", str(dimensions)),
+            ("vector_dtype", metadata["vector_dtype"]),
+            ("vector_file", vectors_path.name),
+            ("index_dtype", metadata["index_dtype"]),
+            ("index_metric", metadata["index_metric"]),
+            ("connectivity", metadata["connectivity"]),
+            ("expansion_add", metadata["expansion_add"]),
+            ("expansion_search", metadata["expansion_search"]),
+            ("source", metadata["source"]),
+            ("source_license", metadata["source_license"]),
+            ("source_url", metadata["source_url"]),
+            ("term_count", str(len(rows))),
+        ):
+            db.execute("INSERT INTO metadata VALUES (?, ?)", (key, value))
+        db.commit()
+        db.execute("VACUUM")
+
+    if vectors_path.stat().st_size != len(rows) * row_bytes:
+        raise TransformError("gathered vector file does not match its term count")
+    return SemanticPackResult(
+        language=language,
+        mapping=mapping_path,
+        vectors=vectors_path,
+        index=index_path,
+        terms=len(rows),
+        dimensions=dimensions,
+    )
