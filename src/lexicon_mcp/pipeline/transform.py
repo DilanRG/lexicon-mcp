@@ -287,6 +287,20 @@ def _assert_pack_is_closed(db: sqlite3.Connection) -> None:
     if dangling:
         raise TransformError(f"pack has {dangling} edge targets it cannot resolve")
 
+    # Synonyms are same-language throughout the corpus -- measured at 0 of
+    # 3,974,062 crossing a language boundary -- so the runtime queries them with
+    # a plain join to local terms. Assert it here rather than discover later that
+    # a corpus change silently started dropping synonyms.
+    foreign_synonyms = db.execute(
+        "SELECT COUNT(*) FROM synonyms"
+        " WHERE target_term_id NOT IN (SELECT term_id FROM lexical_terms)"
+    ).fetchone()[0]
+    if foreign_synonyms:
+        raise TransformError(
+            f"pack has {foreign_synonyms} synonyms pointing outside its own languages; "
+            "the runtime resolves synonyms locally and would drop them"
+        )
+
     # Stubs and headwords must not overlap, or a term would be reachable through
     # two tables with two different truths about whether its payload is present.
     overlap = db.execute(
@@ -571,6 +585,24 @@ def build_semantic_pack(
 
 WORDPLAY_PACK_SCHEMA = """
 CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE provenance (
+    provenance_id INTEGER PRIMARY KEY,
+    source TEXT NOT NULL,
+    source_license TEXT NOT NULL,
+    source_url TEXT NOT NULL
+);
+CREATE TABLE lexical_entries (
+    entry_id TEXT PRIMARY KEY,
+    term_id INTEGER NOT NULL,
+    part_of_speech TEXT,
+    etymology TEXT,
+    provenance_id INTEGER NOT NULL
+);
+CREATE TABLE senses (
+    sense_id TEXT PRIMARY KEY,
+    entry_id TEXT NOT NULL,
+    gloss TEXT
+);
 CREATE TABLE lexical_terms (
     term_id INTEGER PRIMARY KEY,
     term TEXT NOT NULL,
@@ -610,6 +642,8 @@ CREATE VIRTUAL TABLE wordplay_fts USING fts5(
 """
 
 WORDPLAY_PACK_INDEXES = """
+CREATE INDEX wordplay_entries_lookup ON lexical_entries(term_id, part_of_speech);
+CREATE INDEX wordplay_senses_lookup ON senses(entry_id);
 CREATE INDEX pronunciations_words_rhyme ON pronunciations_words(rhyme_key, term_id);
 CREATE INDEX pronunciations_words_phonemes ON pronunciations_words(phonemes, term_id);
 CREATE INDEX wordplay_terms_anagram
@@ -652,6 +686,19 @@ def build_wordplay_pack(
             "INSERT INTO lexical_terms SELECT * FROM src.lexical_terms WHERE language = ?",
             (language,),
         )
+        db.execute("INSERT INTO provenance SELECT * FROM src.provenance")
+        # Wordplay results carry the sense and source behind each hit, so the
+        # pack needs the entries and senses those annotations read. Glosses are
+        # 98 MiB of the total; carrying them keeps the pack answering fully
+        # rather than depending on the 2 GB English dictionary being installed.
+        db.execute(
+            "INSERT INTO lexical_entries SELECT e.* FROM src.lexical_entries AS e"
+            " WHERE e.term_id IN (SELECT term_id FROM lexical_terms)"
+        )
+        db.execute(
+            "INSERT INTO senses SELECT s.* FROM src.senses AS s"
+            " WHERE s.entry_id IN (SELECT entry_id FROM lexical_entries)"
+        )
         db.execute(
             "INSERT INTO pronunciations_words SELECT p.* FROM src.pronunciations_words AS p"
             " WHERE p.term_id IN (SELECT term_id FROM lexical_terms)"
@@ -677,7 +724,13 @@ def build_wordplay_pack(
 
         counts = {
             table: int(db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
-            for table in ("lexical_terms", "pronunciations_words", "wordplay_terms")
+            for table in (
+                "lexical_terms",
+                "pronunciations_words",
+                "wordplay_terms",
+                "lexical_entries",
+                "senses",
+            )
         }
         if not counts["wordplay_terms"]:
             raise TransformError(f"no wordplay indexes for {language!r} in the corpus")
@@ -700,8 +753,8 @@ def build_wordplay_pack(
         raw_bytes=destination.stat().st_size,
         terms=counts["lexical_terms"],
         stubs=0,
-        entries=0,
-        senses=0,
+        entries=counts["lexical_entries"],
+        senses=counts["senses"],
         relations=0,
         translations=counts["pronunciations_words"],
     )

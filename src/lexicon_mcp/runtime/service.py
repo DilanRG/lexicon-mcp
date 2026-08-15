@@ -11,7 +11,7 @@ from typing import Any, TypeVar
 
 from ..pipeline.wordplay import is_palindrome, normalized_letters
 from .actual_wordplay import WORDPLAY_KINDS, SQLiteActualWordplaySearch
-from .locator import ActiveDataset, DatasetLocator
+from .locator import ActiveComponents, ActiveDataset, DatasetLocator
 from .normalization import (
     normalize_key,
     normalize_language,
@@ -19,9 +19,12 @@ from .normalization import (
     sense_scope,
     validate_limit,
 )
+from .pack_queries import relation_rows as pack_relation_rows
+from .pack_queries import translation_coverage as pack_translation_coverage
+from .pack_queries import translation_rows as pack_translation_rows
 from .router import PackRouter
 from .semantic import SemanticSearch, SemanticWorker, UnavailableSemanticSearch
-from .wordplay import SQLiteWordplaySearch
+from .wordplay import SQLiteWordplaySearch, UnavailableWordplaySearch
 
 RELATIONS = frozenset(
     {
@@ -184,7 +187,7 @@ class LexiconService:
             raise RuntimeError(f"Lexical database does not exist: {self.database_path}")
         if not dataset_version:
             raise ValueError("dataset_version cannot be empty")
-        if dataset_profile not in SUPPORTED_DATASET_PROFILES:
+        if router is None and dataset_profile not in SUPPORTED_DATASET_PROFILES:
             raise ValueError("dataset_profile must be full or english")
         self.dataset_version = dataset_version
         self.dataset_profile = dataset_profile
@@ -216,6 +219,12 @@ class LexiconService:
             "relations",
             "pronunciations_words",
         }
+        if router is not None:
+            # A lexical pack carries the catalogue instead of the wordplay
+            # indexes, which live in their own pack.
+            required_tables = (required_tables - {"pronunciations_words"}) | {
+                "target_catalogue"
+            }
         missing = required_tables - self._tables
         if missing:
             self._connection.close()
@@ -223,8 +232,9 @@ class LexiconService:
                 "Lexical database is missing required compact-schema tables: "
                 + ", ".join(sorted(missing))
             )
-        self._check_dataset_version()
-        self._check_dataset_profile()
+        if router is None:
+            self._check_dataset_version()
+            self._check_dataset_profile()
 
         if semantic_search is not None:
             self._semantic = semantic_search
@@ -237,9 +247,19 @@ class LexiconService:
             )
         else:
             self._semantic = UnavailableSemanticSearch()
-        self._wordplay = SQLiteWordplaySearch(self.database_path)
+        wordplay_path = self.database_path
+        if router is not None:
+            component = router.activation.component_for("wordplay", "en")
+            wordplay_path = (
+                router.store.open_path(component.sha256) if component is not None else None
+            )
         try:
-            self._actual_wordplay = SQLiteActualWordplaySearch(self.database_path)
+            if wordplay_path is None:
+                self._wordplay = UnavailableWordplaySearch()
+                self._actual_wordplay = UnavailableWordplaySearch()
+            else:
+                self._wordplay = SQLiteWordplaySearch(wordplay_path)
+                self._actual_wordplay = SQLiteActualWordplaySearch(wordplay_path)
         except BaseException:
             self._connection.close()
             raise
@@ -256,6 +276,36 @@ class LexiconService:
     @classmethod
     def from_locator(cls, locator: DatasetLocator | None = None) -> LexiconService:
         return cls.from_active_dataset((locator or DatasetLocator()).active())
+
+    @classmethod
+    def from_components(cls, active: ActiveComponents) -> LexiconService:
+        """Serve a schema-2 install, routing each language to its own pack.
+
+        The primary connection is any installed lexical pack: it is only read
+        for schema introspection, because every language-scoped query resolves
+        its own connection through the router.
+        """
+
+        router = active.router()
+        languages = router.installed_languages("lexical")
+        if not languages:
+            router.close()
+            raise RuntimeError(
+                "The active installation has no lexical languages. Install at least "
+                "one with: lexicon-data add-language --languages en"
+            )
+        component = active.activation.component_for("lexical", languages[0])
+        assert component is not None  # a listed language always has a component
+        try:
+            return cls(
+                active.store.open_path(component.sha256),
+                active.version,
+                dataset_profile="components",
+                router=router,
+            )
+        except BaseException:
+            router.close()
+            raise
 
     def _check_dataset_version(self) -> None:
         metadata = {
@@ -409,6 +459,13 @@ class LexiconService:
             parameters.append(target_language)
         parameters.append(limit)
         with self._lock:
+            if self._router is not None:
+                return pack_translation_rows(
+                    self._db(language),
+                    sense_id=sense_id,
+                    limit=limit,
+                    target_language=target_language,
+                )
             return self._db(language).execute(
                 f"""
                 SELECT term.term, term.normalized_term,
@@ -438,6 +495,8 @@ class LexiconService:
             return {}
         placeholders = ", ".join("?" for _sense_id in sense_ids)
         with self._lock:
+            if self._router is not None:
+                return pack_translation_coverage(self._db(language), sense_ids)
             rows = self._db(language).execute(
                 f"""
                 SELECT translation.sense_id,
@@ -1010,8 +1069,33 @@ class LexiconService:
             LIMIT ?
         """
         with self._lock:
-            forward = self._connection.execute(select_forward, forward_parameters).fetchall()
-            reverse = self._connection.execute(select_reverse, reverse_parameters).fetchall()
+            if self._router is None:
+                forward = self._connection.execute(select_forward, forward_parameters).fetchall()
+                reverse = self._connection.execute(select_reverse, reverse_parameters).fetchall()
+            else:
+                # A pack's lexical_terms holds only its own headwords, so the
+                # monolith's join would silently drop every foreign target. The
+                # pack form resolves those through target_catalogue instead.
+                pack = self._db(language)
+                forward = pack_relation_rows(
+                    pack,
+                    word=word,
+                    language=language,
+                    relation_code=relation_code,
+                    limit=limit,
+                    target_language=target_language,
+                    sense_id=source_sense_id,
+                )
+                reverse = pack_relation_rows(
+                    pack,
+                    word=word,
+                    language=language,
+                    relation_code=inverse_code,
+                    limit=limit,
+                    reverse=True,
+                    target_language=target_language,
+                    sense_id=source_sense_id,
+                )
 
         oriented: list[dict[str, Any]] = []
         for row in forward:

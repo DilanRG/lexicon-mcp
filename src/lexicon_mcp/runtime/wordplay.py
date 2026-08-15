@@ -160,9 +160,13 @@ class SQLiteWordplaySearch:
         schema_row = self._connection.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
-        if schema_row is None or str(schema_row[0]) != "3":
+        # The wordplay tables are identical in lexical schema 3 and in the
+        # schema 4 pack that now carries them; only the container differs.
+        if schema_row is None or str(schema_row[0]) not in {"3", "4"}:
             value = None if schema_row is None else str(schema_row[0])
-            raise RuntimeError(f"Compact wordplay requires lexical schema version 3, got {value!r}")
+            raise RuntimeError(
+                f"Compact wordplay requires lexical schema version 3 or 4, got {value!r}"
+            )
 
         expected_columns = {
             "lexical_terms": {"term_id", "term", "normalized_term", "language"},
@@ -355,3 +359,36 @@ class SQLiteWordplaySearch:
             "sense_scope": "unsensed",
             "provenance": dict(_CMU_PROVENANCE),
         }
+
+
+class UnavailableWordplaySearch:
+    """Stands in when the wordplay pack is not installed.
+
+    Every method raises rather than returning an empty list, so a caller cannot
+    read "no rhymes for this word" out of "you did not install the wordplay
+    pack". The service turns the error into a typed unavailable response.
+    """
+
+    def __init__(self, reason: str = "wordplay_component_not_installed") -> None:
+        self.reason = reason
+
+    def _unavailable(self) -> RuntimeError:
+        return RuntimeError(self.reason)
+
+    def search(self, *_args: object, **_kwargs: object) -> list[dict[str, Any]]:
+        raise self._unavailable()
+
+    def anagram(self, *_args: object, **_kwargs: object) -> list[dict[str, Any]]:
+        raise self._unavailable()
+
+    def palindrome(self, *_args: object, **_kwargs: object) -> list[dict[str, Any]]:
+        raise self._unavailable()
+
+    def spoonerism(self, *_args: object, **_kwargs: object) -> list[dict[str, Any]]:
+        raise self._unavailable()
+
+    def pun(self, *_args: object, **_kwargs: object) -> list[dict[str, Any]]:
+        raise self._unavailable()
+
+    def close(self) -> None:
+        return None

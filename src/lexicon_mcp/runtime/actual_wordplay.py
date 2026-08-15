@@ -126,9 +126,10 @@ class SQLiteActualWordplaySearch:
                 " WHERE key IN ('schema_version', 'wordplay_index_version')"
             ).fetchall()
         }
-        if metadata.get("schema_version") != "3":
+        # Identical tables in lexical schema 3 and in the schema 4 wordplay pack.
+        if metadata.get("schema_version") not in {"3", "4"}:
             raise RuntimeError(
-                "Actual wordplay requires lexical schema version 3, got "
+                "Actual wordplay requires lexical schema version 3 or 4, got "
                 f"{metadata.get('schema_version')!r}"
             )
         if metadata.get("wordplay_index_version") != "1":

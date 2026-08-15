@@ -186,14 +186,49 @@ FROM translations AS translation
 LEFT JOIN lexical_terms AS local ON local.term_id = translation.target_term_id
 LEFT JOIN target_catalogue AS stub ON stub.term_id = translation.target_term_id
 JOIN provenance ON provenance.provenance_id = translation.provenance_id
-WHERE translation.sense_id = ?
+WHERE translation.sense_id = ?{language_filter}
 ORDER BY translation.position, target_language, normalized_term, term
 LIMIT ?
 """
 
+# Distinct target languages and row counts for a bounded sense set, resolved
+# through the catalogue like everything else that names a foreign term.
+_TRANSLATION_COVERAGE = """
+SELECT translation.sense_id,
+       COUNT(DISTINCT COALESCE(local.language, stub.language)) AS language_count,
+       COUNT(*) AS translation_count
+FROM translations AS translation
+LEFT JOIN lexical_terms AS local ON local.term_id = translation.target_term_id
+LEFT JOIN target_catalogue AS stub ON stub.term_id = translation.target_term_id
+WHERE translation.sense_id IN ({placeholders})
+GROUP BY translation.sense_id
+"""
+
+
+def translation_coverage(
+    connection: sqlite3.Connection, sense_ids: list[str]
+) -> dict[str, tuple[int, int]]:
+    """Language and row counts per sense, for truncation reporting."""
+
+    if not sense_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in sense_ids)
+    connection.row_factory = sqlite3.Row
+    rows = connection.execute(
+        _TRANSLATION_COVERAGE.format(placeholders=placeholders), sense_ids
+    ).fetchall()
+    return {
+        str(row["sense_id"]): (int(row["language_count"]), int(row["translation_count"]))
+        for row in rows
+    }
+
 
 def translation_rows(
-    connection: sqlite3.Connection, *, sense_id: str, limit: int = 100
+    connection: sqlite3.Connection,
+    *,
+    sense_id: str,
+    limit: int = 100,
+    target_language: str | None = None,
 ) -> list[sqlite3.Row]:
     """Translations of a sense, including targets whose language is absent.
 
@@ -204,7 +239,15 @@ def translation_rows(
     """
 
     connection.row_factory = sqlite3.Row
-    return connection.execute(_TRANSLATIONS, (sense_id, limit)).fetchall()
+    if target_language is None:
+        sql = _TRANSLATIONS.format(language_filter="")
+        parameters: list[Any] = [sense_id, limit]
+    else:
+        sql = _TRANSLATIONS.format(
+            language_filter=" AND COALESCE(local.language, stub.language) = ?"
+        )
+        parameters = [sense_id, target_language, limit]
+    return connection.execute(sql, parameters).fetchall()
 
 
 def expandable(row: sqlite3.Row) -> bool:

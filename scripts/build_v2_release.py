@@ -68,6 +68,78 @@ def cached_language_sizes(source: Path, work: Path) -> tuple[LanguageSize, ...]:
     return sizes
 
 
+def package_existing(args, plan, packs_dir: Path) -> int:
+    """Package packs already on disk, so a single rebuilt pack does not cost a
+    full rebuild of the other 149."""
+
+    built: list[PackResult] = []
+    semantic_built: list[SemanticPackResult] = []
+
+    core_path = packs_dir / "core.sqlite3"
+    if not core_path.is_file():
+        raise SystemExit(f"no core pack at {core_path}; run a build first")
+    built.append(
+        PackResult(PlannedPack("core", "core", (), 0), core_path,
+                   core_path.stat().st_size, 0, 0, 0, 0, 0, 0)
+    )
+    wordplay_path = packs_dir / "wordplay-en.sqlite3"
+    if wordplay_path.is_file():
+        built.append(
+            PackResult(PlannedPack("wordplay-en", "wordplay", ("en",), 0), wordplay_path,
+                       wordplay_path.stat().st_size, 0, 0, 0, 0, 0, 0)
+        )
+    for pack in plan:
+        path = packs_dir / f"{pack.id}.sqlite3"
+        if not path.is_file():
+            raise SystemExit(f"planned pack is missing: {path}")
+        built.append(PackResult(pack, path, path.stat().st_size, 0, 0, 0, 0, 0, 0))
+
+    for language in semantic_languages(args.dataset):
+        directory = packs_dir / f"semantic-{language}"
+        mapping = directory / "mapping.sqlite3"
+        vectors = directory / "vectors.f16"
+        index = directory / f"{language.replace('-', '_')}.usearch"
+        if not (mapping.is_file() and vectors.is_file() and index.is_file()):
+            raise SystemExit(f"semantic pack is incomplete: {directory}")
+        connection = sqlite3.connect(f"file:{mapping.as_posix()}?mode=ro&immutable=1", uri=True)
+        try:
+            terms = int(
+                connection.execute("SELECT COUNT(*) FROM semantic_terms").fetchone()[0]
+            )
+            dimensions = int(
+                connection.execute(
+                    "SELECT value FROM metadata WHERE key='dimensions'"
+                ).fetchone()[0]
+            )
+        finally:
+            connection.close()
+        semantic_built.append(
+            SemanticPackResult(language, mapping, vectors, index, terms, dimensions)
+        )
+
+    print(f"packaging {len(built)} packs and {len(semantic_built)} semantic packs", flush=True)
+    package_packs(
+        built,
+        args.output,
+        dataset_version=args.dataset_version,
+        repository=args.repository,
+        tag=args.dataset_version,
+        transformation_commit=args.transformation_commit,
+        semantic=semantic_built,
+        sources=load_sources(args.dataset),
+        source_dataset={
+            "dataset_version": json.loads(
+                (args.dataset / "build-manifest.json").read_text(encoding="utf-8")
+            )["dataset_version"],
+            "manifest_sha256": hashlib.sha256(
+                (args.dataset / "manifest.json").read_bytes()
+            ).hexdigest(),
+        },
+    )
+    print(f"packaged release into {args.output}", flush=True)
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -95,6 +167,11 @@ def main() -> int:
     )
     parser.add_argument(
         "--skip-semantic", action="store_true", help="build lexical packs only"
+    )
+    parser.add_argument(
+        "--package-only",
+        action="store_true",
+        help="package the packs already in --work without rebuilding them",
     )
     args = parser.parse_args()
 
@@ -133,6 +210,8 @@ def main() -> int:
 
     wanted = set(args.only) if args.only else None
     packs_dir = args.work / "packs"
+    if args.package_only:
+        return package_existing(args, plan, packs_dir)
     built: list[PackResult] = []
 
     core_plan = PlannedPack("core", "core", (), 0)
