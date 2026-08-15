@@ -511,3 +511,94 @@ def test_semantic_pack_refuses_a_language_without_vectors(tmp_path: Path) -> Non
 
     with pytest.raises(TransformError, match="no semantic vectors"):
         build_semantic_pack(source, tmp_path / "pack", "cy", dataset_version=VERSION)
+
+
+def wordplay_corpus(tmp_path: Path) -> Path:
+    """A corpus carrying the v3 wordplay indexes."""
+
+    from lexicon_mcp.pipeline.schema import (
+        create_lexical_query_indexes,
+        create_wordplay_indexes,
+    )
+
+    path = tmp_path / "wordplay.sqlite3"
+    connection = sqlite3.connect(path)
+    create_lexical_schema(connection, "data-v1.1.0")
+    connection.execute(
+        "INSERT INTO provenance VALUES (1,'fixture','CC0-1.0','https://fixtures.invalid')"
+    )
+    words = [(1, "stop", "en"), (2, "pots", "en"), (3, "level", "en"), (4, "chien", "fr")]
+    for term_id, term, language in words:
+        connection.execute(
+            "INSERT INTO lexical_terms VALUES (?,?,?,?)", (term_id, term, term, language)
+        )
+    for term_id, phonemes, rhyme in (
+        (1, "S T AA1 P", "AA1 P"),
+        (2, "P AA1 T S", "AA1 T S"),
+        (3, "L EH1 V AH0 L", "EH1 V AH0 L"),
+    ):
+        connection.execute(
+            "INSERT INTO pronunciations_words VALUES (?,?,?)", (term_id, phonemes, rhyme)
+        )
+    connection.commit()
+    create_lexical_query_indexes(connection)
+    create_wordplay_indexes(connection)
+    connection.commit()
+    connection.close()
+    return path
+
+
+def test_wordplay_pack_is_self_contained(tmp_path: Path) -> None:
+    """Rhymes and anagrams must not require the 2 GB English dictionary."""
+
+    from lexicon_mcp.pipeline.transform import build_wordplay_pack
+
+    corpus = wordplay_corpus(tmp_path)
+
+    result = build_wordplay_pack(
+        corpus, tmp_path / "wordplay-en.sqlite3", dataset_version=VERSION
+    )
+
+    assert result.pack.id == "wordplay-en"
+    # Its own English terms, so wordplay resolves term ids without another pack.
+    assert read(result.path, "SELECT term_id, term FROM lexical_terms ORDER BY term_id") == [
+        (1, "stop"),
+        (2, "pots"),
+        (3, "level"),
+    ]
+    assert read(result.path, "SELECT COUNT(*) FROM pronunciations_words") == [(3,)]
+
+
+def test_wordplay_indexes_are_copied_not_recomputed(tmp_path: Path) -> None:
+    from lexicon_mcp.pipeline.transform import build_wordplay_pack
+
+    corpus = wordplay_corpus(tmp_path)
+    expected = read(
+        corpus,
+        "SELECT term_id, letter_signature, is_palindrome FROM wordplay_terms ORDER BY term_id",
+    )
+
+    result = build_wordplay_pack(
+        corpus, tmp_path / "wordplay-en.sqlite3", dataset_version=VERSION
+    )
+
+    assert read(
+        result.path,
+        "SELECT term_id, letter_signature, is_palindrome FROM wordplay_terms ORDER BY term_id",
+    ) == expected
+    # 'stop' and 'pots' share a signature; 'level' is the palindrome.
+    signatures = {term_id: sig for term_id, sig, _ in expected}
+    assert signatures[1] == signatures[2]
+
+
+def test_wordplay_pack_rebuilds_its_contentless_search_index(tmp_path: Path) -> None:
+    from lexicon_mcp.pipeline.transform import build_wordplay_pack
+
+    corpus = wordplay_corpus(tmp_path)
+
+    result = build_wordplay_pack(
+        corpus, tmp_path / "wordplay-en.sqlite3", dataset_version=VERSION
+    )
+
+    hits = read(result.path, "SELECT rowid FROM wordplay_fts WHERE wordplay_fts MATCH 'stop'")
+    assert hits == [(1,)]

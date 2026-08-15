@@ -567,3 +567,141 @@ def build_semantic_pack(
         terms=len(rows),
         dimensions=dimensions,
     )
+
+
+WORDPLAY_PACK_SCHEMA = """
+CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE lexical_terms (
+    term_id INTEGER PRIMARY KEY,
+    term TEXT NOT NULL,
+    normalized_term TEXT NOT NULL,
+    language TEXT NOT NULL,
+    UNIQUE (language, normalized_term, term)
+);
+CREATE TABLE pronunciations_words (
+    term_id INTEGER NOT NULL,
+    phonemes TEXT NOT NULL,
+    rhyme_key TEXT NOT NULL,
+    PRIMARY KEY (term_id, phonemes)
+) WITHOUT ROWID;
+CREATE TABLE wordplay_terms (
+    term_id INTEGER PRIMARY KEY,
+    normalized_letters TEXT NOT NULL,
+    letter_signature TEXT NOT NULL,
+    reverse_letters TEXT NOT NULL,
+    is_palindrome INTEGER NOT NULL CHECK (is_palindrome IN (0,1)),
+    wordplay_eligible INTEGER NOT NULL CHECK (wordplay_eligible IN (0,1))
+) WITHOUT ROWID;
+CREATE TABLE pronunciation_onsets (
+    term_id INTEGER NOT NULL,
+    phonemes TEXT NOT NULL,
+    onset TEXT NOT NULL,
+    remainder TEXT NOT NULL,
+    PRIMARY KEY (term_id, phonemes)
+) WITHOUT ROWID;
+CREATE VIRTUAL TABLE wordplay_fts USING fts5(
+    normalized_term,
+    content='',
+    detail=none,
+    columnsize=0,
+    tokenize='unicode61 remove_diacritics 0',
+    prefix='2 3 4 5 6 7 8'
+);
+"""
+
+WORDPLAY_PACK_INDEXES = """
+CREATE INDEX pronunciations_words_rhyme ON pronunciations_words(rhyme_key, term_id);
+CREATE INDEX pronunciations_words_phonemes ON pronunciations_words(phonemes, term_id);
+CREATE INDEX wordplay_terms_anagram
+    ON wordplay_terms(letter_signature, normalized_letters, term_id)
+    WHERE wordplay_eligible = 1;
+CREATE INDEX wordplay_terms_palindrome
+    ON wordplay_terms(normalized_letters, term_id)
+    WHERE is_palindrome = 1;
+CREATE INDEX pronunciation_onsets_lookup
+    ON pronunciation_onsets(onset, remainder, term_id);
+CREATE INDEX pronunciation_onsets_reverse
+    ON pronunciation_onsets(remainder, onset, term_id);
+"""
+
+
+def build_wordplay_pack(
+    source: Path,
+    destination: Path,
+    *,
+    dataset_version: str,
+    language: str = "en",
+) -> PackResult:
+    """Emit the English rhyme, anagram, spoonerism and homophone indexes.
+
+    Self-contained on purpose. Every wordplay query in the runtime joins these
+    indexes to `lexical_terms`, so the pack carries its own copy of that
+    language's terms; somebody who wants rhymes and anagrams then needs this
+    pack alone rather than the full 2 GB English dictionary.
+
+    The reverse indexes are copied rather than recomputed so they are identical
+    to the corpus they came from. The FTS index cannot be: it is contentless, so
+    its rows cannot be read back out, and it is rebuilt from the same statement
+    the corpus build used.
+    """
+
+    with _writable(destination) as db:
+        db.executescript(WORDPLAY_PACK_SCHEMA)
+        db.execute("ATTACH DATABASE ? AS src", (_read_only_uri(source),))
+        db.execute(
+            "INSERT INTO lexical_terms SELECT * FROM src.lexical_terms WHERE language = ?",
+            (language,),
+        )
+        db.execute(
+            "INSERT INTO pronunciations_words SELECT p.* FROM src.pronunciations_words AS p"
+            " WHERE p.term_id IN (SELECT term_id FROM lexical_terms)"
+        )
+        db.execute(
+            "INSERT INTO wordplay_terms SELECT w.* FROM src.wordplay_terms AS w"
+            " WHERE w.term_id IN (SELECT term_id FROM lexical_terms)"
+        )
+        db.execute(
+            "INSERT INTO pronunciation_onsets SELECT o.* FROM src.pronunciation_onsets AS o"
+            " WHERE o.term_id IN (SELECT term_id FROM lexical_terms)"
+        )
+        db.execute(
+            """INSERT INTO wordplay_fts(rowid, normalized_term)
+            SELECT DISTINCT term.term_id, term.normalized_term
+            FROM lexical_terms AS term
+            JOIN pronunciations_words AS pronunciation
+              ON pronunciation.term_id = term.term_id
+            WHERE term.language = ? AND term.normalized_term <> ''""",
+            (language,),
+        )
+        db.execute("INSERT INTO wordplay_fts(wordplay_fts) VALUES('integrity-check')")
+
+        counts = {
+            table: int(db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            for table in ("lexical_terms", "pronunciations_words", "wordplay_terms")
+        }
+        if not counts["wordplay_terms"]:
+            raise TransformError(f"no wordplay indexes for {language!r} in the corpus")
+        for key, value in (
+            ("schema_version", str(DATASET_SCHEMA_VERSION)),
+            ("dataset_version", dataset_version),
+            ("pack_id", f"wordplay-{language}"),
+            ("capability", "wordplay"),
+            ("languages", language),
+        ):
+            db.execute("INSERT INTO metadata VALUES (?, ?)", (key, value))
+        db.executescript(WORDPLAY_PACK_INDEXES)
+        db.commit()
+        db.execute("DETACH DATABASE src")
+        db.execute("VACUUM")
+
+    return PackResult(
+        pack=PlannedPack(f"wordplay-{language}", "wordplay", (language,), 0),
+        path=destination,
+        raw_bytes=destination.stat().st_size,
+        terms=counts["lexical_terms"],
+        stubs=0,
+        entries=0,
+        senses=0,
+        relations=0,
+        translations=counts["pronunciations_words"],
+    )

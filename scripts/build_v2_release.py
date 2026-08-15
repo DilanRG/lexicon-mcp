@@ -32,6 +32,7 @@ from lexicon_mcp.pipeline.transform import (
     build_lexical_pack,
     build_semantic_pack,
     build_term_counts,
+    build_wordplay_pack,
     language_sizes,
 )
 
@@ -173,6 +174,21 @@ def main() -> int:
             f"  {result.raw_bytes / 1024**2:>10,.1f} MiB"
             f"  terms {result.terms:>9,}  stubs {result.stubs:>9,}"
             f"  relations {result.relations:>10,}"
+            f"  [{time.monotonic() - started:.1f}s]",
+            flush=True,
+        )
+
+    if wanted is None or "wordplay-en" in wanted:
+        started = time.monotonic()
+        print("building wordplay-en ...", flush=True)
+        wordplay = build_wordplay_pack(
+            source,
+            packs_dir / "wordplay-en.sqlite3",
+            dataset_version=args.dataset_version,
+        )
+        built.append(wordplay)
+        print(
+            f"  {wordplay.raw_bytes / 1024**2:>10,.1f} MiB  terms {wordplay.terms:>9,}"
             f"  [{time.monotonic() - started:.1f}s]",
             flush=True,
         )
