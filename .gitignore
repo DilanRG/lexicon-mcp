@@ -12,3 +12,4 @@ dist/
 .staging/
 .tmp/
 *.partial
+dev-docs/
