@@ -391,7 +391,7 @@ def test_required_full_corpus_anchors_offline() -> None:
         )
         spoonerism = service.wordplay("light rain", "spoonerism", limit=20)["results"]
         assert any(
-            item["swapped_left_term"] == "right" and item["swapped_right_term"] == "lane"
+            "right" in item["swapped_left_terms"] and "lane" in item["swapped_right_terms"]
             for item in spoonerism
         )
         puns = service.wordplay("sea", "pun", context="the sea was calm", limit=20)["results"]

@@ -45,6 +45,9 @@ _CMU_PROVENANCE = {
 # source word before any Cartesian pairing work, bounding every loop.
 _SPOONERISM_SOURCE_ALTERNATIVES = 8
 
+# Upper bound on distinct headwords reported for one swapped pronunciation.
+_SPOONERISM_RESOLVE_TERMS = 8
+
 # Pun inspects at most this many source-native sense IDs per term.
 _PUN_SENSE_FETCH = 8
 
@@ -285,17 +288,17 @@ class SQLiteActualWordplaySearch:
                 if (swapped_left, swapped_right) in seen_swaps:
                     continue
                 seen_swaps.add((swapped_left, swapped_right))
-                left_resolved = self._resolve_phoneme_term(swapped_left)
-                right_resolved = self._resolve_phoneme_term(swapped_right)
-                both_lexical = left_resolved is not None and right_resolved is not None
+                left_resolved = self._resolve_phoneme_terms(swapped_left)
+                right_resolved = self._resolve_phoneme_terms(swapped_right)
+                both_lexical = bool(left_resolved) and bool(right_resolved)
                 results.append(
                     {
                         "left": {"term": left_term, "phonemes": left_phonemes},
                         "right": {"term": right_term, "phonemes": right_phonemes},
                         "swapped_left": swapped_left,
                         "swapped_right": swapped_right,
-                        "swapped_left_term": left_resolved,
-                        "swapped_right_term": right_resolved,
+                        "swapped_left_terms": left_resolved,
+                        "swapped_right_terms": right_resolved,
                         "onset_left": left_onset,
                         "onset_right": right_onset,
                         "language": "en",
@@ -471,17 +474,26 @@ class SQLiteActualWordplaySearch:
             ).fetchall()
         return [(str(row["term"]), str(row["phonemes"])) for row in rows]
 
-    def _resolve_phoneme_term(self, phonemes: str) -> str | None:
+    def _resolve_phoneme_terms(self, phonemes: str) -> list[str]:
+        """Every corpus headword carrying this exact pronunciation.
+
+        A swapped pronunciation frequently belongs to several headwords
+        (right/rite/wright/write); reporting one arbitrary spelling would be
+        misleading, so all distinct normalized terms are returned, bounded
+        and deterministically ordered.
+        """
+
         with self._lock:
-            row = self._connection.execute(
+            rows = self._connection.execute(
                 """
-                SELECT MIN(t.term) AS term
+                SELECT t.normalized_term
                 FROM pronunciations_words AS p
                 JOIN lexical_terms AS t ON t.term_id = p.term_id
                 WHERE p.phonemes = ? AND t.language = 'en'
+                GROUP BY t.normalized_term
+                ORDER BY t.normalized_term COLLATE BINARY
+                LIMIT ?
                 """,
-                (phonemes,),
-            ).fetchone()
-        if row is None or row["term"] is None:
-            return None
-        return str(row["term"])
+                (phonemes, _SPOONERISM_RESOLVE_TERMS),
+            ).fetchall()
+        return [str(row["normalized_term"]) for row in rows]

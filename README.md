@@ -76,8 +76,9 @@ every kind except `pun`.
   onset) using at most eight CMU pronunciation alternatives per word. Swapped
   outputs are pronunciation-derived phrases labelled
   `lexicality_scope="generated_candidate"` unless both swapped pronunciations
-  resolve to corpus headwords (then `"lexical_term"` and the resolved terms
-  are reported). Empty-to-empty and identical onsets are never swapped.
+  resolve to corpus headwords (then `"lexical_term"` and every resolved
+  headword is reported, since one pronunciation can spell several words).
+  Empty-to-empty and identical onsets are never swapped.
 * **pun** returns exact CMUdict homophones of the query that carry at least
   one source-native sense distinct from the query term's senses, labelled
   `result_class="candidate"` with `sound_relation="homophone"`; it is never

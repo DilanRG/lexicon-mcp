@@ -227,8 +227,8 @@ def test_spoonerism_swaps_onsets_with_lexicality_labelling(
     assert item["onset_right"] == "R"
     assert item["swapped_left"] == "R AY1 T"
     assert item["swapped_right"] == "L EY1 N"
-    assert item["swapped_left_term"] == "right"
-    assert item["swapped_right_term"] == "lane"
+    assert item["swapped_left_terms"] == ["right"]
+    assert item["swapped_right_terms"] == ["lane"]
     assert item["lexicality_scope"] == "lexical_term"
     assert item["explanation"] == "initial consonant clusters exchanged"
     assert item["provenance"] == [_CMU_PROVENANCE]
@@ -236,8 +236,8 @@ def test_spoonerism_swaps_onsets_with_lexicality_labelling(
     generated = service.wordplay("civic noon", "spoonerism")["results"]
     assert len(generated) == 1
     assert generated[0]["lexicality_scope"] == "generated_candidate"
-    assert generated[0]["swapped_left_term"] is None
-    assert generated[0]["swapped_right_term"] is None
+    assert generated[0]["swapped_left_terms"] == []
+    assert generated[0]["swapped_right_terms"] == []
 
     with pytest.raises(ValueError, match="exactly two"):
         service.wordplay("light", "spoonerism")
