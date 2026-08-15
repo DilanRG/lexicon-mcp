@@ -19,6 +19,7 @@ from .normalization import (
     sense_scope,
     validate_limit,
 )
+from .router import PackRouter
 from .semantic import SemanticSearch, SemanticWorker, UnavailableSemanticSearch
 from .wordplay import SQLiteWordplaySearch
 
@@ -152,6 +153,19 @@ def _provenance(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, str | None]:
     }
 
 
+class LanguageNotInstalled(RuntimeError):
+    """A query named a language this install does not serve.
+
+    Raised rather than returning nothing, so a caller can never mistake an
+    uninstalled language for a word that does not exist. Tool entry points
+    translate it into a typed unavailable response.
+    """
+
+    def __init__(self, language: str) -> None:
+        super().__init__(f"language is not installed: {language}")
+        self.language = language
+
+
 class LexiconService:
     """Thread-safe queries over one immutable, already-activated dataset."""
 
@@ -163,6 +177,7 @@ class LexiconService:
         semantic_directory: str | Path | None = None,
         semantic_search: SemanticSearch | None = None,
         dataset_profile: str = "full",
+        router: PackRouter | None = None,
     ) -> None:
         self.database_path = Path(database_path).resolve()
         if not self.database_path.is_file():
@@ -173,6 +188,7 @@ class LexiconService:
             raise ValueError("dataset_profile must be full or english")
         self.dataset_version = dataset_version
         self.dataset_profile = dataset_profile
+        self._router = router
         self._connection = sqlite3.connect(
             f"file:{self.database_path.as_posix()}?mode=ro&immutable=1",
             uri=True,
@@ -306,6 +322,21 @@ class LexiconService:
     def __exit__(self, *_: object) -> None:
         self.close()
 
+    def _db(self, language: str | None = None) -> sqlite3.Connection:
+        """The connection serving *language*.
+
+        A monolith answers for every language from one file. A schema-2 install
+        answers from the pack that owns the language, so every language-scoped
+        query resolves its connection here rather than assuming one exists.
+        """
+
+        if self._router is None or language is None:
+            return self._connection
+        connection = self._router.connection_for("lexical", language)
+        if connection is None:
+            raise LanguageNotInstalled(language)
+        return connection
+
     def _sense_rows(
         self,
         word: str,
@@ -324,7 +355,7 @@ class LexiconService:
             parameters.append(sense_id)
         parameters.append(limit)
         with self._lock:
-            return self._connection.execute(
+            return self._db(language).execute(
                 f"""
                 SELECT sense.sense_id, entry.entry_id, term.term AS word,
                        term.normalized_term AS normalized_word,
@@ -349,6 +380,7 @@ class LexiconService:
         columns: str,
         identifier: str,
         *,
+        language: str | None = None,
         id_column: str = "sense_id",
         limit: int = 100,
     ) -> list[sqlite3.Row]:
@@ -357,7 +389,7 @@ class LexiconService:
         if id_column not in {"sense_id", "entry_id"}:
             raise RuntimeError(f"unsafe dependent-row key {id_column!r}")
         with self._lock:
-            return self._connection.execute(
+            return self._db(language).execute(
                 f"SELECT {columns} FROM {table} WHERE {id_column} = ? ORDER BY position LIMIT ?",
                 (identifier, limit),
             ).fetchall()
@@ -366,6 +398,7 @@ class LexiconService:
         self,
         sense_id: str,
         *,
+        language: str | None = None,
         target_language: str | None = None,
         limit: int = 100,
     ) -> list[sqlite3.Row]:
@@ -376,7 +409,7 @@ class LexiconService:
             parameters.append(target_language)
         parameters.append(limit)
         with self._lock:
-            return self._connection.execute(
+            return self._db(language).execute(
                 f"""
                 SELECT term.term, term.normalized_term,
                        term.language AS target_language,
@@ -396,14 +429,16 @@ class LexiconService:
                 parameters,
             ).fetchall()
 
-    def _translation_coverage(self, sense_ids: list[str]) -> dict[str, tuple[int, int]]:
+    def _translation_coverage(
+        self, sense_ids: list[str], *, language: str | None = None
+    ) -> dict[str, tuple[int, int]]:
         """Return distinct-language and row counts for a bounded sense set."""
 
         if not sense_ids or "translations" not in self._tables:
             return {}
         placeholders = ", ".join("?" for _sense_id in sense_ids)
         with self._lock:
-            rows = self._connection.execute(
+            rows = self._db(language).execute(
                 f"""
                 SELECT translation.sense_id,
                        COUNT(DISTINCT term.language) AS language_count,
@@ -444,7 +479,7 @@ class LexiconService:
             return candidates[:limit]
 
         sense_ids = [str(row["sense_id"]) for row in candidates]
-        coverage = self._translation_coverage(sense_ids)
+        coverage = self._translation_coverage(sense_ids, language=language)
         if not coverage:
             return candidates[:limit]
 
@@ -467,9 +502,11 @@ class LexiconService:
             selected_ids.add(str(row["sense_id"]))
         return [row for row in candidates if str(row["sense_id"]) in selected_ids][:limit]
 
-    def _synonym_rows(self, sense_id: str, *, limit: int) -> list[sqlite3.Row]:
+    def _synonym_rows(
+        self, sense_id: str, *, limit: int, language: str | None = None
+    ) -> list[sqlite3.Row]:
         with self._lock:
-            return self._connection.execute(
+            return self._db(language).execute(
                 """
                 SELECT term.term, term.normalized_term, term.language,
                        synonym.part_of_speech, synonym.position,
@@ -592,7 +629,9 @@ class LexiconService:
                         "sense_scope": sense_scope(sense_id),
                         "provenance": _provenance(item),
                     }
-                    for item in self._translation_rows(sense_id, limit=translations_limit + 1)
+                    for item in self._translation_rows(
+                        sense_id, limit=translations_limit + 1, language=language
+                    )
                 ]
             )
 
@@ -679,7 +718,9 @@ class LexiconService:
             row_sense_id = str(row["sense_id"])
             candidates: list[tuple[tuple[str, str], dict[str, Any]]] = []
             seen_in_sense: set[tuple[str, str]] = set()
-            for item in self._synonym_rows(row_sense_id, limit=_MAX_QUERY_BUDGET):
+            for item in self._synonym_rows(
+                row_sense_id, limit=_MAX_QUERY_BUDGET, language=language
+            ):
                 identity = (str(item["normalized_term"]), str(item["language"]))
                 if identity == (key, language) or identity in seen_in_sense:
                     continue
