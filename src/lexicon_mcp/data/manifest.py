@@ -466,6 +466,12 @@ def _parse_components(value: Any, source_ids: set[str]) -> tuple[Component, ...]
     return tuple(parsed)
 
 
+def is_sha256(value: object) -> bool:
+    """True when *value* is a lowercase hexadecimal SHA-256 digest."""
+
+    return isinstance(value, str) and _SHA256_RE.fullmatch(value) is not None
+
+
 def normalize_language(value: Any, *, field: str = "language") -> str:
     """Normalize a language tag to the single form manifests store."""
 
