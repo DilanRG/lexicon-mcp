@@ -1,4 +1,9 @@
-"""Resolve an already-installed, atomically activated dataset."""
+"""Resolve an already-installed, atomically activated dataset.
+
+Schema 1 resolved a directory; schema 2 resolves an activation record and the
+content-addressed store behind it. Both are read-only views: nothing here can
+download, activate or delete anything.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +14,10 @@ from pathlib import Path
 from typing import Any
 
 from platformdirs import user_data_dir
+
+from ..data.activation import Activation, ActivationError, parse_activation
+from ..data.store import ComponentStore
+from .router import PackRouter
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,3 +105,83 @@ class DatasetLocator:
         if not lexical.is_file():
             raise RuntimeError(f"Active dataset is missing {lexical.name}")
         return ActiveDataset(self.root, version, dataset_path, manifest)
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveComponents:
+    """A resolved schema-2 install: an activation plus the store backing it."""
+
+    root: Path
+    activation: Activation
+    store: ComponentStore
+
+    @property
+    def version(self) -> str:
+        return self.activation.dataset_version
+
+    def router(self, **options: Any) -> PackRouter:
+        return PackRouter(self.activation, self.store, **options)
+
+
+def _pointer_schema(root: Path) -> int | None:
+    pointer = root / "current.json"
+    try:
+        value = json.loads(pointer.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value.get("schema_version") if isinstance(value, dict) else None
+
+
+class ComponentLocator:
+    """Resolve the active schema-2 activation without mutating anything.
+
+    Deliberately reads the activation record and the store directly rather than
+    importing the installer: runtime code must never be able to reach an object
+    that can download, activate or delete data.
+    """
+
+    def __init__(self, root: str | os.PathLike[str] | None = None) -> None:
+        configured = root or os.environ.get("LEXICON_DATA_DIR")
+        self.root = Path(configured or user_data_dir("lexicon-mcp")).expanduser().resolve()
+
+    def active(self) -> ActiveComponents:
+        pointer_path = self.root / "current.json"
+        schema = _pointer_schema(self.root)
+        if schema is None:
+            raise RuntimeError(
+                f"No active lexicon dataset at {pointer_path}. Install one explicitly, "
+                "for example: lexicon-data install --version data-v2.0.0 --languages en. "
+                f"LEXICON_DATA_DIR selects the dataset root (currently {self.root})."
+            )
+        if schema != 2:
+            raise RuntimeError(
+                f"The dataset at {self.root} uses the schema {schema} layout, which this "
+                "release does not serve. Reinstall it with a schema 2 release, or pin "
+                "lexicon-mcp 1.2.x to keep using the existing corpus."
+            )
+        pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+        activation_id = pointer.get("activation_id")
+        if not isinstance(activation_id, str) or not activation_id.strip():
+            raise RuntimeError("Activation pointer does not name an activation")
+        record = self.root / "activations" / f"{activation_id}.json"
+        try:
+            activation = parse_activation(record.read_bytes())
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"Active dataset has no activation record: {record}") from exc
+        except (OSError, ActivationError) as exc:
+            raise RuntimeError(f"Active dataset has an invalid activation: {exc}") from exc
+        if activation.activation_id != activation_id:
+            raise RuntimeError("Activation record does not match the pointer that names it")
+
+        store = ComponentStore(self.root / "components")
+        missing = [
+            component.id
+            for component in activation.components
+            if not store.contains(component.sha256)
+        ]
+        if missing:
+            raise RuntimeError(
+                "Active dataset is missing installed components "
+                f"({', '.join(sorted(missing))}); run lexicon-data verify"
+            )
+        return ActiveComponents(self.root, activation, store)

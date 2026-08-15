@@ -277,3 +277,66 @@ def test_closing_releases_every_open_pack(routed: PackRouter) -> None:
     routed.close()
 
     assert routed.open_pack_count == 0
+
+
+def test_component_locator_resolves_the_active_activation(tmp_path: Path) -> None:
+    """The runtime reads an activation without touching the installer."""
+
+    from release_fixture import write_release
+
+    from lexicon_mcp.data.component_lifecycle import ComponentLifecycle
+    from lexicon_mcp.data.lifecycle import DatasetLifecycle
+    from lexicon_mcp.runtime.locator import ComponentLocator
+
+    release = write_release(tmp_path / "release")
+    data = tmp_path / "data"
+    fetcher = DatasetLifecycle(data, sleep=lambda _s: None, safety_margin=0)
+    ComponentLifecycle(data, fetcher=fetcher).install(
+        release, languages=["en"], capabilities=["lexical"]
+    )
+
+    active = ComponentLocator(data).active()
+
+    assert active.version == "data-v2.0.0"
+    with active.router() as router:
+        assert router.availability("lexical", "en").reason == "installed"
+        assert router.availability("lexical", "de").reason == "language_not_installed"
+
+
+def test_component_locator_refuses_a_schema_one_layout(tmp_path: Path) -> None:
+    from lexicon_mcp.runtime.locator import ComponentLocator
+
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "current.json").write_text(
+        '{"schema_version": 1, "version": "data-v1.1.0"}', encoding="utf-8"
+    )
+
+    with pytest.raises(RuntimeError, match="schema 1 layout"):
+        ComponentLocator(data).active()
+
+
+def test_component_locator_reports_a_missing_component(tmp_path: Path) -> None:
+    from release_fixture import write_release
+
+    from lexicon_mcp.data.component_lifecycle import ComponentLifecycle
+    from lexicon_mcp.data.lifecycle import DatasetLifecycle
+    from lexicon_mcp.runtime.locator import ComponentLocator
+
+    release = write_release(tmp_path / "release")
+    data = tmp_path / "data"
+    fetcher = DatasetLifecycle(data, sleep=lambda _s: None, safety_margin=0)
+    manager = ComponentLifecycle(data, fetcher=fetcher)
+    manager.install(release, languages=["en"], capabilities=["lexical"])
+    digest = manager.active_activation().components[0].sha256
+    manager.store.path_for(digest).unlink()
+
+    with pytest.raises(RuntimeError, match="missing installed components"):
+        ComponentLocator(data).active()
+
+
+def test_no_active_dataset_names_the_command_that_installs_one(tmp_path: Path) -> None:
+    from lexicon_mcp.runtime.locator import ComponentLocator
+
+    with pytest.raises(RuntimeError, match="lexicon-data install"):
+        ComponentLocator(tmp_path / "empty").active()
