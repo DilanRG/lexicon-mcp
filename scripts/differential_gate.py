@@ -183,7 +183,15 @@ def main() -> int:
                 print(f"  {language}: not installed, skipped", flush=True)
                 continue
             words = sample_words(pack, language, args.words, args.seed)
-            for word in words:
+            language_started = time.monotonic()
+            for index, word in enumerate(words, start=1):
+                if index % 10 == 0:
+                    rate = (time.monotonic() - language_started) / index
+                    print(
+                        f"    {language} {index}/{len(words)} words"
+                        f"  {report.divergent} divergent  {rate:.1f}s/word",
+                        flush=True,
+                    )
                 for code in range(1, 13):
                     expected = relation_key(
                         mono.execute(
