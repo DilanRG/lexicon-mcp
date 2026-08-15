@@ -282,3 +282,116 @@ def test_core_pack_reports_capability_coverage(corpus: Path, tmp_path: Path) -> 
         ("en", 2, 3, 4, 1, 3, 1, 1, 1),
         ("fr", 1, 1, 1, 0, 2, 1, 0, 0),
     ]
+
+
+MONOLITH_FORWARD = """
+WITH candidates AS (
+    SELECT target.term AS target_term,
+           target.language AS target_language,
+           (SELECT COUNT(*) FROM lexical_entries AS e
+             WHERE e.term_id = target.term_id) AS target_entry_count,
+           (SELECT COUNT(*) FROM senses AS s
+              JOIN lexical_entries AS e2 ON e2.entry_id = s.entry_id
+             WHERE e2.term_id = target.term_id) AS target_sense_count,
+           target.normalized_term AS target_normalized,
+           relation.target_sense_id, provenance.provenance_id,
+           relation.direction_code,
+           ROW_NUMBER() OVER (
+               PARTITION BY target.term_id
+               ORDER BY CASE WHEN relation.source_sense_id IS NULL
+                              AND relation.target_sense_id IS NULL THEN 1 ELSE 0 END,
+                        relation.source_sense_id, relation.target_sense_id,
+                        provenance.provenance_id, relation.direction_code
+           ) AS target_variant_rank
+    FROM relations AS relation
+    JOIN lexical_terms AS source ON source.term_id = relation.source_term_id
+    JOIN lexical_terms AS target ON target.term_id = relation.target_term_id
+    JOIN provenance ON provenance.provenance_id = relation.provenance_id
+    WHERE source.normalized_term = ? AND source.language = ?
+      AND relation.relation_code = ?
+)
+SELECT * FROM candidates
+ORDER BY target_variant_rank, target_sense_count DESC, target_entry_count DESC,
+         (LENGTH(target_normalized) - LENGTH(REPLACE(target_normalized, ' ', ''))),
+         LENGTH(target_normalized), target_language, target_normalized,
+         target_term, target_sense_id, provenance_id, direction_code
+LIMIT ?
+"""
+
+
+def compare_key(rows) -> list[tuple]:
+    return [
+        (
+            row["target_term"],
+            row["target_language"],
+            row["target_entry_count"],
+            row["target_sense_count"],
+            row["target_variant_rank"],
+        )
+        for row in rows
+    ]
+
+
+def test_pack_relations_match_the_monolith_exactly(corpus: Path, tmp_path: Path) -> None:
+    """The differential gate, at unit scale."""
+
+    from lexicon_mcp.runtime.pack_queries import relation_rows
+
+    pack = build_en(corpus, tmp_path)
+
+    monolith = sqlite3.connect(f"file:{corpus.as_posix()}?mode=ro", uri=True)
+    monolith.row_factory = sqlite3.Row
+    expected = compare_key(monolith.execute(MONOLITH_FORWARD, ("dog", "en", 1, 10)).fetchall())
+    monolith.close()
+
+    sharded = sqlite3.connect(f"file:{pack.as_posix()}?mode=ro", uri=True)
+    try:
+        actual = compare_key(
+            relation_rows(sharded, word="dog", language="en", relation_code=1, limit=10)
+        )
+    finally:
+        sharded.close()
+
+    # Includes the en -> fr edge, whose target is a stub in this pack.
+    assert expected == [("hound", "en", 1, 1, 1), ("chien", "fr", 1, 1, 1)]
+    assert actual == expected
+
+
+def test_reverse_relations_resolve_through_the_catalogue(
+    corpus: Path, tmp_path: Path
+) -> None:
+    """cy -> en: English is only the target, and the source is a foreign stub."""
+
+    from lexicon_mcp.runtime.pack_queries import relation_rows
+
+    pack = build_en(corpus, tmp_path)
+    connection = sqlite3.connect(f"file:{pack.as_posix()}?mode=ro", uri=True)
+    try:
+        rows = relation_rows(
+            connection, word="dog", language="en", relation_code=1, limit=10, reverse=True
+        )
+    finally:
+        connection.close()
+
+    assert [(row["target_term"], row["target_language"]) for row in rows] == [("ci", "cy")]
+    assert rows[0]["target_payload_local"] == 0
+
+
+def test_translations_survive_without_the_target_language(
+    corpus: Path, tmp_path: Path
+) -> None:
+    from lexicon_mcp.runtime.pack_queries import as_result, translation_rows
+
+    pack = build_en(corpus, tmp_path)
+    connection = sqlite3.connect(f"file:{pack.as_posix()}?mode=ro", uri=True)
+    try:
+        rows = translation_rows(connection, sense_id="s1")
+    finally:
+        connection.close()
+
+    result = as_result(rows[0])
+    assert result["term"] == "chien"
+    assert result["target_language"] == "fr"
+    # Usable as an answer, and honest that the French entry is not installed.
+    assert result["target_language_installed"] is False
+    assert result["target_details_available"] is False
