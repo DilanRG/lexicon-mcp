@@ -20,6 +20,12 @@ _VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _TABLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _LANGUAGE_RE = re.compile(r"^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$")
 _DATASET_PROFILES = frozenset({"full", "english"})
+_SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2})
+# Schema 2 selects installs by capability rather than by profile.  "core" is
+# always installed; the rest are requested independently, because a language can
+# have lexical data without semantic vectors, and pronunciation and wordplay are
+# English-only in the current corpus.
+_CAPABILITIES = ("core", "lexical", "semantic", "pronunciation", "wordplay")
 _SEMANTIC_INDEX_SCHEMA_KEYS = frozenset(
     {
         "semantic_dimensions",
@@ -132,6 +138,31 @@ class Component:
 
 
 @dataclass(frozen=True, slots=True)
+class Pack:
+    """One independently selectable unit of a schema-2 release.
+
+    A pack binds a capability and a set of languages to exactly one component.
+    Tiering is invisible here on purpose: a caller asks for a language, and
+    whether that language has its own pack or shares a bundle is a packaging
+    detail resolved through this table.
+    """
+
+    id: str
+    capability: str
+    languages: tuple[str, ...]
+    component: str
+    required: bool
+
+
+@dataclass(frozen=True, slots=True)
+class SourceDataset:
+    """The dataset a transformed release was derived from."""
+
+    dataset_version: str
+    manifest_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
 class DatasetManifest:
     schema_version: int
     dataset_version: str
@@ -144,12 +175,33 @@ class DatasetManifest:
     components: tuple[Component, ...]
     raw: bytes
     sha256: str
+    packs: tuple[Pack, ...] = ()
+    source_dataset: SourceDataset | None = None
 
     def component(self, component_id: str) -> Component:
         for item in self.components:
             if item.id == component_id:
                 return item
         raise KeyError(component_id)
+
+    def packs_for(self, capability: str) -> tuple[Pack, ...]:
+        return tuple(pack for pack in self.packs if pack.capability == capability)
+
+    def required_packs(self) -> tuple[Pack, ...]:
+        return tuple(pack for pack in self.packs if pack.required)
+
+    def languages_for(self, capability: str) -> tuple[str, ...]:
+        seen: set[str] = set()
+        for pack in self.packs:
+            if pack.capability == capability:
+                seen.update(pack.languages)
+        return tuple(sorted(seen))
+
+    def pack_for(self, capability: str, language: str) -> Pack | None:
+        for pack in self.packs:
+            if pack.capability == capability and language in pack.languages:
+                return pack
+        return None
 
 
 def _parse_release(value: Any, dataset_version: str) -> Release:
@@ -414,8 +466,101 @@ def _parse_components(value: Any, source_ids: set[str]) -> tuple[Component, ...]
     return tuple(parsed)
 
 
+def normalize_language(value: Any, *, field: str = "language") -> str:
+    """Normalize a language tag to the single form manifests store."""
+
+    if not isinstance(value, str) or not _LANGUAGE_RE.fullmatch(value):
+        raise ManifestError(f"{field} is not a valid language tag: {value!r}")
+    return value.replace("_", "-").lower()
+
+
+def _parse_language_tags(
+    value: Any, field: str, *, allow_empty: bool = False
+) -> tuple[str, ...]:
+    if not isinstance(value, list) or (not value and not allow_empty):
+        raise ManifestError(f"{field} must be a non-empty array")
+    parsed: list[str] = []
+    seen: set[str] = set()
+    for index, language in enumerate(value):
+        normalized = normalize_language(language, field=f"{field}[{index}]")
+        if normalized in seen:
+            raise ManifestError(f"{field} contains a duplicate language tag: {normalized}")
+        seen.add(normalized)
+        parsed.append(normalized)
+    return tuple(parsed)
+
+
+def _parse_packs(value: Any, component_ids: set[str]) -> tuple[Pack, ...]:
+    if not isinstance(value, list) or not value:
+        raise ManifestError("packs must be a non-empty array")
+    parsed: list[Pack] = []
+    seen_ids: set[str] = set()
+    claimed: dict[tuple[str, str], str] = {}
+    for index, item in enumerate(value):
+        field = f"packs[{index}]"
+        if not isinstance(item, dict):
+            raise ManifestError(f"{field} must be an object")
+        pack_id = safe_identifier(item.get("id"), field=f"{field}.id")
+        if pack_id in seen_ids:
+            raise ManifestError(f"duplicate pack id: {pack_id}")
+        seen_ids.add(pack_id)
+        capability = _string(item.get("capability"), f"{field}.capability")
+        if capability not in _CAPABILITIES:
+            raise ManifestError(f"{field}.capability must be one of {list(_CAPABILITIES)}")
+        component = safe_identifier(item.get("component"), field=f"{field}.component")
+        if component not in component_ids:
+            raise ManifestError(f"{field} references unknown component {component!r}")
+        required = item.get("required", capability == "core")
+        if not isinstance(required, bool):
+            raise ManifestError(f"{field}.required must be boolean")
+        if capability == "core":
+            if not required:
+                raise ManifestError(f"{field} core packs must be required")
+            languages = _parse_language_tags(
+                item.get("languages", []), f"{field}.languages", allow_empty=True
+            )
+        else:
+            languages = _parse_language_tags(item.get("languages"), f"{field}.languages")
+        # Exactly one pack may serve a (capability, language) pair, so selection
+        # can never be ambiguous and never needs a tie-break rule.
+        for language in languages:
+            previous = claimed.get((capability, language))
+            if previous is not None:
+                raise ManifestError(
+                    f"{field} language {language!r} is already served for capability "
+                    f"{capability!r} by pack {previous!r}"
+                )
+            claimed[(capability, language)] = pack_id
+        parsed.append(Pack(pack_id, capability, languages, component, required))
+    if not any(pack.capability == "core" for pack in parsed):
+        raise ManifestError("packs must include at least one core pack")
+    return tuple(parsed)
+
+
+def _parse_source_dataset(value: Any) -> SourceDataset | None:
+    """Parse the provenance of a release transformed from an earlier dataset."""
+
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ManifestError("source_dataset must be an object")
+    return SourceDataset(
+        dataset_version=safe_version(
+            value.get("dataset_version"), field="source_dataset.dataset_version"
+        ),
+        manifest_sha256=_sha256(
+            value.get("manifest_sha256"), "source_dataset.manifest_sha256"
+        ),
+    )
+
+
 def parse_manifest(raw: bytes | str) -> DatasetManifest:
-    """Parse and validate a canonical schema-v1 dataset manifest."""
+    """Parse and validate a canonical schema-v1 or schema-v2 dataset manifest.
+
+    Schema 1 selects an install by profile; schema 2 replaces that with capability
+    packs resolved per language.  Schema 1 stays parseable so an installed v1
+    dataset can still be reported and rolled back after a v2 upgrade.
+    """
 
     if isinstance(raw, str):
         raw = raw.encode("utf-8")
@@ -425,29 +570,10 @@ def parse_manifest(raw: bytes | str) -> DatasetManifest:
         raise ManifestError(f"manifest is not valid UTF-8 JSON: {exc}") from exc
     if not isinstance(value, dict):
         raise ManifestError("manifest root must be an object")
-    if value.get("schema_version") != 1:
-        raise ManifestError("schema_version must be 1")
+    schema_version = value.get("schema_version")
+    if schema_version not in _SUPPORTED_SCHEMA_VERSIONS:
+        raise ManifestError("schema_version must be 1 or 2")
     dataset_version = safe_version(value.get("dataset_version"))
-    profile = _string(value.get("profile"), "profile")
-    if profile not in _DATASET_PROFILES:
-        raise ManifestError("profile must be full or english")
-    languages_value = value.get("languages")
-    if languages_value is None:
-        languages: tuple[str, ...] = ()
-    else:
-        if not isinstance(languages_value, list) or not languages_value:
-            raise ManifestError("languages must be a non-empty array")
-        parsed_languages: list[str] = []
-        for index, language in enumerate(languages_value):
-            if not isinstance(language, str) or not _LANGUAGE_RE.fullmatch(language):
-                raise ManifestError(f"languages[{index}] is not a valid language tag")
-            normalized = language.replace("_", "-").lower()
-            if normalized in parsed_languages:
-                raise ManifestError(f"duplicate language tag: {normalized}")
-            parsed_languages.append(normalized)
-        languages = tuple(parsed_languages)
-    if profile == "english" and languages != ("en",):
-        raise ManifestError("the english profile requires languages=['en']")
     release = _parse_release(value.get("release"), dataset_version)
     sources = _parse_sources(value.get("sources"))
     components = _parse_components(value.get("components"), {item.id for item in sources})
@@ -456,8 +582,35 @@ def parse_manifest(raw: bytes | str) -> DatasetManifest:
         transformation_commit
     ):
         raise ManifestError("transformation_commit must be a lowercase 40-hex Git commit")
+
+    packs: tuple[Pack, ...] = ()
+    source_dataset: SourceDataset | None = None
+    if schema_version == 1:
+        profile = _string(value.get("profile"), "profile")
+        if profile not in _DATASET_PROFILES:
+            raise ManifestError("profile must be full or english")
+        languages_value = value.get("languages")
+        languages = (
+            ()
+            if languages_value is None
+            else _parse_language_tags(languages_value, "languages")
+        )
+        if profile == "english" and languages != ("en",):
+            raise ManifestError("the english profile requires languages=['en']")
+    else:
+        if "profile" in value:
+            raise ManifestError("schema 2 replaces profile with capability packs")
+        if "languages" in value:
+            raise ManifestError("schema 2 declares languages per pack, not at the root")
+        profile = "components"
+        packs = _parse_packs(value.get("packs"), {item.id for item in components})
+        languages = tuple(
+            sorted({language for pack in packs for language in pack.languages})
+        )
+        source_dataset = _parse_source_dataset(value.get("source_dataset"))
+
     return DatasetManifest(
-        schema_version=1,
+        schema_version=schema_version,
         dataset_version=dataset_version,
         profile=profile,
         languages=languages,
@@ -468,4 +621,6 @@ def parse_manifest(raw: bytes | str) -> DatasetManifest:
         components=components,
         raw=raw,
         sha256=hashlib.sha256(raw).hexdigest(),
+        packs=packs,
+        source_dataset=source_dataset,
     )
