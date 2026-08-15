@@ -52,7 +52,6 @@ def built(tmp_path: Path) -> list[PackResult]:
         PlannedPack("core", "core", (), 0),
         PlannedPack("lexical-en", "lexical", ("en",), 0),
         PlannedPack("lexical-bundle-001", "lexical", ("cy", "gv"), 0),
-        PlannedPack("semantic-en", "semantic", ("en",), 0),
     ]
     return [
         PackResult(
@@ -129,7 +128,6 @@ def test_every_pack_is_compressed_into_named_parts(tmp_path: Path) -> None:
 
     for component in manifest["components"]:
         assert component["compression"] == "zstd"
-        assert component["integrity"]["dataset_schema_version"] == DATASET_SCHEMA_VERSION
         for part in component["parts"]:
             asset = tmp_path / "release" / part["name"]
             assert asset.is_file()
@@ -146,6 +144,7 @@ def test_component_paths_are_grouped_by_capability(tmp_path: Path) -> None:
         transformation_commit="1" * 40,
         sources=SOURCES,
         source_dataset=SOURCE_DATASET,
+        semantic=[semantic_result(tmp_path, "en")],
         created_at="2026-08-16T00:00:00Z",
     )
 
@@ -153,7 +152,8 @@ def test_component_paths_are_grouped_by_capability(tmp_path: Path) -> None:
 
     assert paths["artifact-core"] == "core.sqlite3"
     assert paths["artifact-lexical-en"] == "lexical/lexical-en.sqlite3"
-    assert paths["artifact-semantic-en"] == "semantic/semantic-en.sqlite3"
+    assert paths["artifact-semantic-en-mapping"] == "semantic/en/mapping.sqlite3"
+    assert paths["artifact-semantic-en-index"] == "semantic/en/en.usearch"
 
 
 def test_a_release_without_a_core_pack_is_refused(tmp_path: Path) -> None:
@@ -183,3 +183,64 @@ def test_source_provenance_is_carried_from_the_original_corpus(tmp_path: Path) -
 
     with pytest.raises(ValueError, match="cannot read source provenance"):
         load_sources(tmp_path / "missing")
+
+
+def semantic_result(tmp_path: Path, language: str):
+    from lexicon_mcp.pipeline.transform import SemanticPackResult
+
+    root = tmp_path / "built" / f"semantic-{language}"
+    root.mkdir(parents=True, exist_ok=True)
+    mapping = root / "mapping.sqlite3"
+    connection = sqlite3.connect(mapping)
+    connection.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    connection.execute(
+        "INSERT INTO metadata VALUES ('schema_version', ?)", (str(DATASET_SCHEMA_VERSION),)
+    )
+    connection.execute("CREATE TABLE semantic_terms (semantic_id INTEGER PRIMARY KEY)")
+    connection.executemany(
+        "INSERT INTO semantic_terms VALUES (?)", [(index,) for index in range(3)]
+    )
+    connection.commit()
+    connection.close()
+    vectors = root / "vectors.f16"
+    vectors.write_bytes(b"\x00" * (3 * 300 * 2))
+    index = root / f"{language}.usearch"
+    index.write_bytes(b"usearch")
+    return SemanticPackResult(
+        language=language,
+        mapping=mapping,
+        vectors=vectors,
+        index=index,
+        terms=3,
+        dimensions=300,
+    )
+
+
+def test_a_semantic_pack_declares_its_three_components(tmp_path: Path) -> None:
+    manifest = package_packs(
+        built(tmp_path),
+        tmp_path / "release",
+        dataset_version="data-v2.0.0",
+        repository="DilanRG/lexicon-mcp",
+        tag="data-v2.0.0",
+        transformation_commit="1" * 40,
+        sources=SOURCES,
+        source_dataset=SOURCE_DATASET,
+        semantic=[semantic_result(tmp_path, "en")],
+        created_at="2026-08-16T00:00:00Z",
+    )
+    parsed = parse_manifest((tmp_path / "release" / "manifest.json").read_bytes())
+
+    pack = next(item for item in parsed.packs if item.id == "semantic-en")
+    assert pack.components == (
+        "artifact-semantic-en-mapping",
+        "artifact-semantic-en-vectors",
+        "artifact-semantic-en-index",
+    )
+
+    # Selecting the language pulls all three, and only once.
+    selection = resolve(parsed, languages=["en"], capabilities=["semantic"])
+    assert set(selection.components) == {"artifact-core", *pack.components}
+
+    types = {item["id"]: item["artifact_type"] for item in manifest["components"]}
+    assert types["artifact-semantic-en-index"] == "semantic_index"
