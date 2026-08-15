@@ -250,3 +250,63 @@ def test_all_languages_installs_everything(tmp_path: Path, release: Path) -> Non
     assert result["current"]["effective"]["lexical"] == ["cy", "en", "fr", "gv"]
     assert result["current"]["effective"]["semantic"] == ["en"]
     assert result["current"]["components"] == len(PAYLOADS)
+
+
+def test_languages_reports_what_this_install_actually_serves(
+    tmp_path: Path, release: Path
+) -> None:
+    data = tmp_path / "data"
+    common = ["--data-dir", str(data)]
+    main([*common, "install", "--version", VERSION, "--from", str(release), "--languages", "en"])
+
+    report, code = run(build_parser().parse_args([*common, "languages"]))
+
+    assert code == 0
+    assert report["dataset_languages"] == 5
+    assert report["installed"]["lexical"] == ["en"]
+    # Only the installed language is listed by default.
+    assert [row["language"] for row in report["languages"]] == ["en"]
+    english = report["languages"][0]
+    assert english["term_count"] == 2_000_000
+    assert english["capabilities"]["lexical"] == "installed"
+    # English has vectors upstream, but the semantic pack was not selected.
+    assert english["capabilities"]["semantic"] == "capability_not_installed"
+
+
+def test_languages_distinguishes_every_reason_a_language_is_unavailable(
+    tmp_path: Path, release: Path
+) -> None:
+    data = tmp_path / "data"
+    common = ["--data-dir", str(data)]
+    main([*common, "install", "--version", VERSION, "--from", str(release), "--languages", "en"])
+
+    report, _code = run(
+        build_parser().parse_args([*common, "languages", "--language", "de,cy,zz"])
+    )
+
+    rows = {row["language"]: row for row in report["languages"]}
+    # In the corpus, not installed here: installing more would fix it.
+    assert rows["de"]["capabilities"]["lexical"] == "language_not_installed"
+    assert rows["de"]["in_dataset"] is True
+    # Welsh exists but the corpus has no vectors for it at all.
+    assert rows["cy"]["capabilities"]["semantic"] == "not_available_upstream"
+    # Not a language this dataset carries.
+    assert rows["zz"]["in_dataset"] is False
+    assert rows["zz"]["capabilities"]["lexical"] == "unknown_language"
+
+
+def test_languages_can_list_the_whole_dataset(tmp_path: Path, release: Path) -> None:
+    data = tmp_path / "data"
+    common = ["--data-dir", str(data)]
+    main([*common, "install", "--version", VERSION, "--from", str(release), "--languages", "en"])
+
+    report, _code = run(build_parser().parse_args([*common, "languages", "--all"]))
+
+    assert [row["language"] for row in report["languages"]] == ["cy", "de", "en", "fr", "gv"]
+
+
+def test_languages_parser_accepts_explicit_tags() -> None:
+    args = build_parser().parse_args(["languages", "--language", "en,fr", "--all"])
+
+    assert args.language == ["en", "fr"]
+    assert args.all is True

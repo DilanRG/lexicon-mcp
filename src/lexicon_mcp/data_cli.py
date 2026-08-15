@@ -23,6 +23,7 @@ from lexicon_mcp.data.locking import LockBusyError
 from lexicon_mcp.data.manifest import ManifestError
 from lexicon_mcp.data.selection import REQUESTABLE_CAPABILITIES, SelectionError
 from lexicon_mcp.data.store import StoreError
+from lexicon_mcp.runtime.router import PackRouter, RouterError
 
 DEFAULT_MANIFEST = (
     "https://github.com/DilanRG/lexicon-mcp/releases/download/{version}/manifest.json"
@@ -207,6 +208,21 @@ def build_parser() -> argparse.ArgumentParser:
         "prune", help="delete stored components no retained activation references"
     )
 
+    languages = commands.add_parser(
+        "languages",
+        help="report language coverage and what this install actually serves",
+    )
+    languages.add_argument(
+        "--all",
+        action="store_true",
+        help="list every language in the dataset, not only the installed ones",
+    )
+    languages.add_argument(
+        "--language",
+        type=_language_list,
+        help="report only these languages, installed or not",
+    )
+
     commands.add_parser("status", help="show active and retained versions")
 
     verify = commands.add_parser("verify", help="verify all artifacts in an installed version")
@@ -227,6 +243,68 @@ def build_parser() -> argparse.ArgumentParser:
     rollback = commands.add_parser("rollback", help="activate the retained previous version")
     rollback.add_argument("--version", help="explicit retained version (defaults to previous)")
     return parser
+
+
+def _languages_report(
+    components: ComponentLifecycle,
+    *,
+    requested: list[str] | None,
+    list_all: bool,
+) -> dict[str, Any]:
+    """Report coverage per language, and what this install actually serves.
+
+    Defaults to the installed languages: the corpus carries thousands, and
+    dumping all of them buries the answer most callers want.
+    """
+
+    activation = components.active_activation()
+    if activation is None:
+        raise LifecycleError("no active dataset is installed")
+    with PackRouter(activation, components.store) as router:
+        coverage = router.coverage
+        if requested:
+            wanted = [tag.replace("_", "-").lower() for tag in requested]
+        elif list_all:
+            wanted = sorted(coverage)
+        else:
+            wanted = sorted(
+                {
+                    language
+                    for capability in REQUESTABLE_CAPABILITIES
+                    for language in router.installed_languages(capability)
+                }
+            )
+        rows = []
+        for language in wanted:
+            known = coverage.get(language)
+            row: dict[str, Any] = {
+                "language": language,
+                "in_dataset": known is not None,
+                "capabilities": {
+                    capability: router.availability(capability, language).reason
+                    for capability in REQUESTABLE_CAPABILITIES
+                },
+            }
+            if known is not None:
+                row.update(
+                    {
+                        "term_count": known.term_count,
+                        "entry_count": known.entry_count,
+                        "sense_count": known.sense_count,
+                        "translation_count": known.translation_count,
+                        "relation_count": known.relation_count,
+                    }
+                )
+            rows.append(row)
+    return {
+        "dataset_version": activation.dataset_version,
+        "dataset_languages": len(coverage),
+        "installed": {
+            capability: list(router.installed_languages(capability))
+            for capability in REQUESTABLE_CAPABILITIES
+        },
+        "languages": rows,
+    }
 
 
 def _is_component_install(data_dir: Path | None, lifecycle: DatasetLifecycle) -> bool:
@@ -344,6 +422,12 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         ), 0
     if args.command == "prune":
         return ComponentLifecycle(args.data_dir, fetcher=lifecycle).prune(), 0
+    if args.command == "languages":
+        return _languages_report(
+            ComponentLifecycle(args.data_dir, fetcher=lifecycle),
+            requested=args.language,
+            list_all=args.all,
+        ), 0
     if args.command == "fetch":
         source = _manifest_source(
             _resolved_source(args),
@@ -406,6 +490,7 @@ def main(argv: list[str] | None = None) -> int:
         LifecycleError,
         LockBusyError,
         ManifestError,
+        RouterError,
         SelectionError,
         SpaceError,
         StoreError,

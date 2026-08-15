@@ -4,12 +4,48 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
+import tempfile
 from pathlib import Path
+
+from lexicon_mcp.pipeline.packs import CORE_PACK_SCHEMA
 
 VERSION = "data-v2.0.0"
 
+# language -> (terms, has_semantic, has_pronunciation, has_wordplay).
+# 'de' is in the corpus but served by no pack, which is what makes
+# "in the dataset but not installed" testable.
+CATALOGUE = {
+    "en": (2_000_000, True, True, True),
+    "fr": (1_500_000, True, False, False),
+    "de": (750_000, True, False, False),
+    "cy": (50_000, False, False, False),
+    "gv": (11_000, False, False, False),
+}
+
+
+def _core_payload() -> bytes:
+    """A real core pack, so language coverage can be read back."""
+
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "core.sqlite3"
+        connection = sqlite3.connect(path)
+        connection.executescript(CORE_PACK_SCHEMA)
+        connection.executemany(
+            "INSERT INTO language_catalogue VALUES (?,?,?,?,?,?,?,?,?)",
+            [
+                (language, terms, terms, terms, 0, 0, int(sem), int(pron), int(play))
+                for language, (terms, sem, pron, play) in CATALOGUE.items()
+            ],
+        )
+        connection.execute("INSERT INTO metadata VALUES ('pack_id','core')")
+        connection.commit()
+        connection.close()
+        return path.read_bytes()
+
+
 PAYLOADS = {
-    "artifact-core": ("core.sqlite3", b"core catalogue payload"),
+    "artifact-core": ("core.sqlite3", _core_payload()),
     "artifact-lexical-en": ("lexical/en.sqlite3", b"english lexical payload" * 4),
     "artifact-lexical-fr": ("lexical/fr.sqlite3", b"french lexical payload" * 3),
     "artifact-lexical-bundle": ("lexical/bundle.sqlite3", b"bundled payload" * 2),
