@@ -298,6 +298,7 @@ def _assert_pack_is_closed(db: sqlite3.Connection) -> None:
 
 def build_core_pack(
     source: Path,
+    counts: Path,
     destination: Path,
     *,
     dataset_version: str,
@@ -318,15 +319,16 @@ def build_core_pack(
     with _writable(destination) as db:
         db.executescript(CORE_PACK_SCHEMA)
         db.execute("ATTACH DATABASE ? AS src", (_read_only_uri(source),))
+        db.execute("ATTACH DATABASE ? AS counts", (_read_only_uri(counts),))
+        # Summed from the per-term counts rather than recomputed. Grouping
+        # COUNT(DISTINCT) over lexical_terms joined to entries joined to senses
+        # builds an enormous temporary b-tree and does not finish in usable time
+        # on the real corpus; this is one indexed pass over already-derived data.
         rows = db.execute(
             """
-            SELECT t.language,
-                   COUNT(DISTINCT t.term_id),
-                   COUNT(DISTINCT e.entry_id),
-                   COUNT(DISTINCT s.sense_id)
+            SELECT t.language, COUNT(*), SUM(c.entry_count), SUM(c.sense_count)
             FROM src.lexical_terms AS t
-            LEFT JOIN src.lexical_entries AS e ON e.term_id = t.term_id
-            LEFT JOIN src.senses AS s ON s.entry_id = e.entry_id
+            JOIN counts.term_counts AS c ON c.term_id = t.term_id
             GROUP BY t.language
             """
         ).fetchall()
@@ -398,5 +400,6 @@ def build_core_pack(
             db.execute("INSERT INTO metadata VALUES (?, ?)", (key, value))
         db.commit()
         db.execute("DETACH DATABASE src")
+        db.execute("DETACH DATABASE counts")
         db.execute("VACUUM")
     return destination

@@ -260,6 +260,7 @@ def test_transform_never_writes_to_the_source_corpus(corpus: Path, tmp_path: Pat
 def test_core_pack_reports_capability_coverage(corpus: Path, tmp_path: Path) -> None:
     destination = build_core_pack(
         corpus,
+        build_term_counts(corpus, tmp_path / "counts.sqlite3"),
         tmp_path / "core.sqlite3",
         dataset_version=VERSION,
         semantic_languages=["en", "fr"],

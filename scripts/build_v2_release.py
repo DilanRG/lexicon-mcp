@@ -135,6 +135,7 @@ def main() -> int:
         print("building core catalogue ...", flush=True)
         core_path = build_core_pack(
             source,
+            counts,
             packs_dir / "core.sqlite3",
             dataset_version=args.dataset_version,
             semantic_languages=semantic_languages(args.dataset),
