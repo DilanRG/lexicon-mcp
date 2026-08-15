@@ -65,79 +65,115 @@ _RELATION_ORDER = """
     LIMIT ?
 """
 
-_FORWARD = f"""
-WITH candidates AS (
-    SELECT source.term_id AS source_term_id,
+def _relation_sql(
+    *,
+    reverse: bool,
+    target_language: bool,
+    sense_filter: bool,
+) -> str:
+    """Build the relation query for one orientation and filter combination.
+
+    The service filters relations by target language and by source sense, so the
+    pack-native form must too. The clauses are assembled rather than templated
+    at import time because the filtered and unfiltered plans differ.
+    """
+
+    if reverse:
+        anchor = "target"
+        rank_partition = "relation.source_term_id"
+        sense_column = "relation.target_sense_id"
+        resolved_key = "relation.source_term_id"
+        head = """
+           target.term_id AS source_term_id,
+           target.term AS source_term,
+           target.normalized_term AS source_normalized,
+           target.language AS source_language,
+           relation.target_sense_id AS source_sense_id,"""
+        tail_sense = "relation.source_sense_id AS target_sense_id"
+        rank_order = "relation.target_sense_id, relation.source_sense_id"
+    else:
+        anchor = "source"
+        rank_partition = "relation.target_term_id"
+        sense_column = "relation.source_sense_id"
+        resolved_key = "relation.target_term_id"
+        head = """
+           source.term_id AS source_term_id,
            source.term AS source_term,
            source.normalized_term AS source_normalized,
            source.language AS source_language,
-           relation.source_sense_id,
+           relation.source_sense_id,"""
+        tail_sense = "relation.target_sense_id"
+        rank_order = "relation.source_sense_id, relation.target_sense_id"
+
+    clauses = [
+        f"{anchor}.normalized_term = ?",
+        f"{anchor}.language = ?",
+        "relation.relation_code = ?",
+    ]
+    if target_language:
+        clauses.append("COALESCE(local.language, stub.language) = ?")
+    if sense_filter:
+        clauses.append(f"{sense_column} = ?")
+
+    return f"""
+WITH candidates AS (
+    SELECT{head}
 {_TARGET_COLUMNS}
-           relation.target_sense_id,
+           {tail_sense},
            relation.direction_code,
            provenance.provenance_id,
            provenance.source, provenance.source_license, provenance.source_url,
+           {2 if reverse else 1} AS query_orientation,
            ROW_NUMBER() OVER (
-               PARTITION BY relation.target_term_id
+               PARTITION BY {rank_partition}
                ORDER BY CASE
                             WHEN relation.source_sense_id IS NULL
                              AND relation.target_sense_id IS NULL THEN 1
                             ELSE 0
                         END,
-                        relation.source_sense_id,
-                        relation.target_sense_id,
+                        {rank_order},
                         provenance.provenance_id,
                         relation.direction_code
            ) AS target_variant_rank
     FROM relations AS relation
-    JOIN lexical_terms AS source ON source.term_id = relation.source_term_id
-    LEFT JOIN lexical_terms AS local ON local.term_id = relation.target_term_id
-    LEFT JOIN target_catalogue AS stub ON stub.term_id = relation.target_term_id
+    JOIN lexical_terms AS {anchor} ON {anchor}.term_id = relation.{anchor}_term_id
+    LEFT JOIN lexical_terms AS local ON local.term_id = {resolved_key}
+    LEFT JOIN target_catalogue AS stub ON stub.term_id = {resolved_key}
     JOIN provenance ON provenance.provenance_id = relation.provenance_id
-    WHERE source.normalized_term = ?
-      AND source.language = ?
-      AND relation.relation_code = ?
+    WHERE {" AND ".join(clauses)}
 )
 SELECT * FROM candidates
 {_RELATION_ORDER}
 """
 
-_REVERSE = f"""
-WITH candidates AS (
-    SELECT target.term_id AS source_term_id,
-           target.term AS source_term,
-           target.normalized_term AS source_normalized,
-           target.language AS source_language,
-           relation.target_sense_id AS source_sense_id,
-{_TARGET_COLUMNS}
-           relation.source_sense_id AS target_sense_id,
-           relation.direction_code,
-           provenance.provenance_id,
-           provenance.source, provenance.source_license, provenance.source_url,
-           ROW_NUMBER() OVER (
-               PARTITION BY relation.source_term_id
-               ORDER BY CASE
-                            WHEN relation.source_sense_id IS NULL
-                             AND relation.target_sense_id IS NULL THEN 1
-                            ELSE 0
-                        END,
-                        relation.target_sense_id,
-                        relation.source_sense_id,
-                        provenance.provenance_id,
-                        relation.direction_code
-           ) AS target_variant_rank
-    FROM relations AS relation
-    JOIN lexical_terms AS target ON target.term_id = relation.target_term_id
-    LEFT JOIN lexical_terms AS local ON local.term_id = relation.source_term_id
-    LEFT JOIN target_catalogue AS stub ON stub.term_id = relation.source_term_id
-    JOIN provenance ON provenance.provenance_id = relation.provenance_id
-    WHERE target.normalized_term = ?
-      AND target.language = ?
-      AND relation.relation_code = ?
-)
-SELECT * FROM candidates
-{_RELATION_ORDER}
-"""
+
+def relation_rows(
+    connection: sqlite3.Connection,
+    *,
+    word: str,
+    language: str,
+    relation_code: int,
+    limit: int,
+    reverse: bool = False,
+    target_language: str | None = None,
+    sense_id: str | None = None,
+) -> list[sqlite3.Row]:
+    """Direct relations for a word, resolved entirely within one pack."""
+
+    sql = _relation_sql(
+        reverse=reverse,
+        target_language=target_language is not None,
+        sense_filter=sense_id is not None,
+    )
+    parameters: list[Any] = [word, language, relation_code]
+    if target_language is not None:
+        parameters.append(target_language)
+    if sense_id is not None:
+        parameters.append(sense_id)
+    parameters.append(limit)
+    connection.row_factory = sqlite3.Row
+    return connection.execute(sql, parameters).fetchall()
+
 
 _TRANSLATIONS = """
 SELECT COALESCE(local.term, stub.term) AS term,
@@ -154,23 +190,6 @@ WHERE translation.sense_id = ?
 ORDER BY translation.position, target_language, normalized_term, term
 LIMIT ?
 """
-
-
-def relation_rows(
-    connection: sqlite3.Connection,
-    *,
-    word: str,
-    language: str,
-    relation_code: int,
-    limit: int,
-    reverse: bool = False,
-) -> list[sqlite3.Row]:
-    """Direct relations for a word, resolved entirely within one pack."""
-
-    connection.row_factory = sqlite3.Row
-    return connection.execute(
-        _REVERSE if reverse else _FORWARD, (word, language, relation_code, limit)
-    ).fetchall()
 
 
 def translation_rows(
