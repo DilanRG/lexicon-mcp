@@ -9,6 +9,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, TypeVar
 
+from ..pipeline.wordplay import is_palindrome, normalized_letters
+from .actual_wordplay import WORDPLAY_KINDS, SQLiteActualWordplaySearch
 from .locator import ActiveDataset, DatasetLocator
 from .normalization import (
     normalize_key,
@@ -36,7 +38,7 @@ RELATIONS = frozenset(
     }
 )
 WORDPLAY_MODES = frozenset({"rhyme", "near_rhyme", "sounds_like", "spelled_like", "prefix"})
-SUPPORTED_SCHEMA_VERSION = "2"
+SUPPORTED_SCHEMA_VERSION = "3"
 SUPPORTED_DATASET_PROFILES = frozenset({"full", "english"})
 
 _RELATION_CODES = {
@@ -72,6 +74,7 @@ _INVERSE_RELATION_CODES = {
 _INVERSE_DIRECTION_CODES = {1: 2, 2: 1, 3: 3}
 
 _MAX_QUERY_BUDGET = 100
+_MAX_CONTEXT_LENGTH = 512
 _RELATION_SCAN_FLOOR = 256
 _RELATION_SCAN_CEILING = 512
 _RELATION_BATCH_SOURCE_LIMIT = 200
@@ -135,6 +138,10 @@ def _relation_scan_limit(limit: int) -> int:
     """Overfetch enough rows for diversity ranking without unbounded scans."""
 
     return min(_RELATION_SCAN_CEILING, max(_RELATION_SCAN_FLOOR, limit * 8))
+
+
+def _letters_form_palindrome(key: str) -> bool:
+    return is_palindrome(normalized_letters(key))
 
 
 def _provenance(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, str | None]:
@@ -215,6 +222,11 @@ class LexiconService:
         else:
             self._semantic = UnavailableSemanticSearch()
         self._wordplay = SQLiteWordplaySearch(self.database_path)
+        try:
+            self._actual_wordplay = SQLiteActualWordplaySearch(self.database_path)
+        except BaseException:
+            self._connection.close()
+            raise
 
     @classmethod
     def from_active_dataset(cls, dataset: ActiveDataset) -> LexiconService:
@@ -1959,6 +1971,62 @@ class LexiconService:
             },
             results,
         )
+
+    def wordplay(
+        self,
+        text: str,
+        kind: str,
+        context: str | None = None,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        """Return deterministic, corpus-backed wordplay candidates."""
+
+        if not isinstance(kind, str) or kind not in WORDPLAY_KINDS:
+            raise ValueError(
+                "kind must be one of: " + ", ".join(sorted(WORDPLAY_KINDS))
+            )
+        if context is not None and kind != "pun":
+            raise ValueError("context is only accepted when kind is 'pun'")
+        original = text.strip() if isinstance(text, str) else text
+        key = normalize_key(text, field="text")
+        limit = validate_limit(limit)
+        normalized_context: str | None = None
+        context_scope = "uncontextualized"
+        if context is not None:
+            if not isinstance(context, str):
+                raise ValueError("context must be text")
+            normalized_context = context.strip()
+            if not normalized_context or len(normalized_context) > _MAX_CONTEXT_LENGTH:
+                raise ValueError(
+                    "context must contain between 1 and "
+                    f"{_MAX_CONTEXT_LENGTH} characters"
+                )
+            context_scope = "contextualized"
+
+        query: dict[str, Any] = {
+            "text": original,
+            "normalized_text": key,
+            "kind": kind,
+            "context": normalized_context,
+            "limit": limit,
+        }
+        if kind == "anagram":
+            results = self._actual_wordplay.anagram(key, limit=limit)
+        elif kind == "palindrome":
+            query["input_is_palindrome"] = _letters_form_palindrome(key)
+            results = self._actual_wordplay.palindrome(key, limit=limit)
+        elif kind == "spoonerism":
+            parts = key.split()
+            if len(parts) != 2:
+                raise ValueError(
+                    "spoonerism requires exactly two whitespace-separated words"
+                )
+            results = self._actual_wordplay.spoonerism(parts[0], parts[1], limit=limit)
+        else:
+            results = self._actual_wordplay.pun(
+                key, context_scope=context_scope, limit=limit
+            )
+        return self._response("wordplay", query, results)
 
     @staticmethod
     def _validate_sense_id(value: str | None) -> str | None:

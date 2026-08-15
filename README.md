@@ -11,7 +11,7 @@ network access or data mutation while running.
 
 ## Model-visible tools
 
-The server exposes exactly six tools:
+The server exposes exactly seven tools:
 
 1. `dictionary_lookup`
 2. `dictionary_synonyms`
@@ -19,6 +19,7 @@ The server exposes exactly six tools:
 4. `dictionary_relations`
 5. `dictionary_semantic_neighbors`
 6. `rhymes`
+7. `wordplay`
 
 Relation results label direct edges as `relation_scope="direct"`, `distance=1`.
 Hypernym and hyponym queries can additionally return a bounded, homogeneous
@@ -52,6 +53,44 @@ multilingual index; setting it to the source tag produces monolingual results,
 and another tag requests cross-lingual results. English `rhymes(mode="near")` is
 fixed to exactly one ARPAbet-token insertion, deletion, or substitution in v1;
 there is no automatic or caller-configurable edit distance.
+
+`wordplay(text, kind, context=None, limit=20)` answers exactly one requested
+kind per call, `kind` being `anagram`, `palindrome`, `spoonerism`, or `pun`.
+There is no automatic mode and no `-1`; `limit` follows the same `1..100`
+policy as every other tool, and `context` (1..512 characters) is rejected for
+every kind except `pun`.
+
+* **anagram** returns English headwords whose normalized letters (NFKC +
+  casefold, ASCII `a-z` only) are a reordering of the query's letters. Only
+  strictly alphabetic single-token headwords are eligible, so phrase or
+  punctuated anagrams are never claimed, and the query itself is excluded.
+* **palindrome** reports `input_is_palindrome` for the query and returns
+  stored corpus palindromes other than the query. Candidates are enumerated
+  deterministically in `(normalized_letters, term_id)` index order starting
+  at the query's letters and wrapping once; every candidate's normalized
+  letters read identically in reverse. One-code-point inputs yield no
+  candidates.
+* **spoonerism** requires exactly two whitespace-separated English headwords.
+  It exchanges their initial ARPAbet consonant clusters (the onset is every
+  consonant token before the first vowel; vowel-initial words have an empty
+  onset) using at most eight CMU pronunciation alternatives per word. Swapped
+  outputs are pronunciation-derived phrases labelled
+  `lexicality_scope="generated_candidate"` unless both swapped pronunciations
+  resolve to corpus headwords (then `"lexical_term"` and the resolved terms
+  are reported). Empty-to-empty and identical onsets are never swapped.
+* **pun** returns exact CMUdict homophones of the query that carry at least
+  one source-native sense distinct from the query term's senses, labelled
+  `result_class="candidate"` with `sound_relation="homophone"`; it is never
+  claimed to be a finished joke. Without `context` the response is labelled
+  `context_scope="uncontextualized"`. Meanings are never inferred from vector
+  similarity.
+
+Every wordplay result carries a `provenance` array: spelling and senses come
+from Open English WordNet or Wiktionary via Wiktextract entries where present,
+and phonetic derivations come from the CMU Pronouncing Dictionary. The first
+wordplay-capable dataset is `data-v1.1.0` (lexical schema 3); `data-v1.0.0`
+artifacts do not contain the wordplay indexes and are rejected by this server
+version.
 
 Dataset installation, verification, repair, and rollback are deliberately CLI-only.
 

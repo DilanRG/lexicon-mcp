@@ -203,7 +203,7 @@ def test_full_fixture_build_has_senses_translations_relations_and_wordplay(tmp_p
     metadata = dict(connection.execute("SELECT key,value FROM metadata"))
     assert metadata["build.wiktextract.language_codes"] == "7"
     assert metadata["build.conceptnet.source_assertions"] == "4"
-    assert metadata["schema_version"] == "2"
+    assert metadata["schema_version"] == "3"
     assert connection.execute("PRAGMA page_size").fetchone()[0] == 32768
     indexes = {
         row[0]
@@ -215,10 +215,35 @@ def test_full_fixture_build_has_senses_translations_relations_and_wordplay(tmp_p
         "lexical_entries_lookup",
         "relations_source_lookup",
         "pronunciations_words_rhyme",
+        "wordplay_terms_anagram",
+        "wordplay_terms_palindrome",
+        "pronunciation_onsets_lookup",
+        "pronunciation_onsets_reverse",
     } <= indexes
+    wordplay_metadata = dict(
+        connection.execute("SELECT key,value FROM metadata WHERE key LIKE 'wordplay%'")
+    )
+    assert wordplay_metadata["wordplay_index_version"] == "1"
+    eligible = connection.execute(
+        "SELECT COUNT(*) FROM wordplay_terms WHERE wordplay_eligible = 1"
+    ).fetchone()[0]
+    assert eligible == int(wordplay_metadata["wordplay.eligible_terms"])
+    onset_rows = connection.execute(
+        "SELECT COUNT(*) FROM pronunciation_onsets"
+    ).fetchone()[0]
+    assert onset_rows == connection.execute(
+        "SELECT COUNT(*) FROM pronunciations_words"
+    ).fetchone()[0] == int(wordplay_metadata["wordplay.pronunciation_onsets"])
+    assert connection.execute("PRAGMA foreign_key_check").fetchone() is None
     connection.close()
 
     build_manifest = json.loads((root / "build-manifest.json").read_text(encoding="utf-8"))
+    assert build_manifest["wordplay"] == {
+        "index_version": 1,
+        "eligible_terms": eligible,
+        "palindromes": int(wordplay_metadata["wordplay.palindromes"]),
+        "pronunciation_onsets": onset_rows,
+    }
     measured_size = sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
     assert build_manifest["installed_size"] == measured_size
     assert build_manifest["resource_projection"]["total"] < 30 * 1024**3
@@ -282,6 +307,7 @@ def test_semantic_artifacts_share_dense_global_ids(tmp_path: Path) -> None:
     metadata = dict(connection.execute("SELECT key,value FROM metadata"))
     assert metadata["dimensions"] == "4"
     assert metadata["vector_dtype"] == "float16"
+    # The semantic mapping schema is unchanged by the lexical v3 bump.
     assert metadata["schema_version"] == "2"
     assert metadata["expansion_add"] == "256"
     assert metadata["expansion_search"] == "512"

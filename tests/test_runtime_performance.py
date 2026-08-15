@@ -20,6 +20,18 @@ def test_full_corpus_latency_and_private_memory_gates() -> None:
     report = run_isolated_performance(dataset)
     print(report.to_json(), flush=True)
     assert report.lexical_p95_ms <= 150, report
+    # Wordplay gates: warm p95 <= 100 ms and first-call <= 500 ms per kind
+    # at limits 1, 20, and 100 on the packaged artifact.
+    assert set(report.wordplay_warm_p95_ms) == {
+        "anagram",
+        "palindrome",
+        "spoonerism",
+        "pun",
+    }
+    for kind, value in report.wordplay_warm_p95_ms.items():
+        assert value <= 100, (kind, report)
+    for kind, value in report.wordplay_cold_ms.items():
+        assert value <= 500, (kind, report)
     assert report.semantic_cold_ms <= 2_000, report
     assert report.semantic_warm_p95_ms <= 500, report
     assert report.idle_private_bytes <= 512 * MIB, report

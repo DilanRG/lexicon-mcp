@@ -380,6 +380,27 @@ def test_required_full_corpus_anchors_offline() -> None:
             for item in service.dictionary_wordplay("prefix", "seren", 100)["results"]
         )
 
+        anagrams = service.wordplay("listen", "anagram", limit=100)["results"]
+        assert {"silent", "enlist"} <= {item["term"].casefold() for item in anagrams}
+        assert all(item["term"].casefold() != "listen" for item in anagrams)
+        palindromes = service.wordplay("level", "palindrome", limit=100)
+        assert palindromes["query"]["input_is_palindrome"] is True
+        assert all(
+            item["palindrome_key"] == item["palindrome_key"][::-1]
+            for item in palindromes["results"]
+        )
+        spoonerism = service.wordplay("light rain", "spoonerism", limit=20)["results"]
+        assert any(
+            item["swapped_left_term"] == "right" and item["swapped_right_term"] == "lane"
+            for item in spoonerism
+        )
+        puns = service.wordplay("sea", "pun", context="the sea was calm", limit=20)["results"]
+        assert puns and all(item["sound_relation"] == "homophone" for item in puns)
+        assert all(
+            set(item["query_sense_ids"]).isdisjoint(item["candidate_sense_ids"])
+            for item in puns
+        )
+
         english = service.dictionary_semantic_neighbors("cat", "en", "en", 20)
         german = service.dictionary_semantic_neighbors("cat", "en", "de", 20)
         assert english["available"] and english["results"]
@@ -391,7 +412,7 @@ def test_required_full_corpus_anchors_offline() -> None:
 
 @pytest.mark.full_corpus
 @pytest.mark.asyncio
-async def test_full_corpus_mcp_exposes_exactly_six_offline_tools() -> None:
+async def test_full_corpus_mcp_exposes_exactly_seven_offline_tools() -> None:
     dataset = _dataset_or_skip()
     with LexiconService.from_active_dataset(dataset) as service, deny_network():
         mcp = create_mcp(service)
@@ -403,6 +424,7 @@ async def test_full_corpus_mcp_exposes_exactly_six_offline_tools() -> None:
             "dictionary_relations",
             "dictionary_semantic_neighbors",
             "rhymes",
+            "wordplay",
         }
         assert all(tool.outputSchema is not None for tool in tools)
         _content, structured = await mcp.call_tool(

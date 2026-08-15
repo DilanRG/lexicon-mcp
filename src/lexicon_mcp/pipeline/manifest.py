@@ -422,7 +422,16 @@ def package_dataset(
             artifact_type = _component_type(relative)
             integrity: dict[str, Any] = {}
             if relative.endswith(".sqlite3"):
-                integrity.update({"sqlite": True, "dataset_schema_version": 2})
+                # Lexicon is schema 3 since the wordplay indexes; the
+                # semantic mapping artifact deliberately stays schema 2.
+                integrity.update(
+                    {
+                        "sqlite": True,
+                        "dataset_schema_version": (
+                            2 if relative == "semantic/mapping.sqlite3" else 3
+                        ),
+                    }
+                )
             if relative == "semantic/mapping.sqlite3":
                 integrity.update(
                     {

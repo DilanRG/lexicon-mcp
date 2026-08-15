@@ -19,6 +19,7 @@ import lexicon_mcp.server as server_module
 from lexicon_mcp.pipeline.schema import (
     create_lexical_query_indexes,
     create_lexical_schema,
+    create_wordplay_indexes,
 )
 from lexicon_mcp.runtime.offline import NetworkDisabledError
 from lexicon_mcp.runtime.service import LexiconService
@@ -49,6 +50,7 @@ def service(tmp_path: Path) -> LexiconService:
             ("oewn:cat-n", "oewn:entry:cat", "A small domesticated feline."),
         )
         create_lexical_query_indexes(connection)
+        create_wordplay_indexes(connection)
         connection.commit()
     instance = LexiconService(database, "data-test-v1")
     yield instance
@@ -56,7 +58,7 @@ def service(tmp_path: Path) -> LexiconService:
 
 
 @pytest.mark.asyncio
-async def test_mcp_exposes_exactly_six_structured_tools_and_no_admin(
+async def test_mcp_exposes_exactly_seven_structured_tools_and_no_admin(
     service: LexiconService,
 ) -> None:
     mcp = create_mcp(service)
@@ -69,6 +71,7 @@ async def test_mcp_exposes_exactly_six_structured_tools_and_no_admin(
         "dictionary_relations",
         "dictionary_semantic_neighbors",
         "rhymes",
+        "wordplay",
     }
     assert all(tool.outputSchema is not None for tool in tools)
     assert not any("install" in name or "repair" in name or "rollback" in name for name in names)
@@ -129,6 +132,20 @@ async def test_mcp_exposes_exactly_six_structured_tools_and_no_admin(
     assert rhyme_properties["text"]["maxLength"] == 256
     assert rhyme_properties["mode"]["enum"] == ["exact", "near"]
 
+    wordplay_properties = by_name["wordplay"].inputSchema["properties"]
+    assert wordplay_properties["kind"]["enum"] == [
+        "anagram",
+        "palindrome",
+        "spoonerism",
+        "pun",
+    ]
+    context_variant = wordplay_properties["context"]["anyOf"][0]
+    assert context_variant["minLength"] == 1
+    assert context_variant["maxLength"] == 512
+    assert wordplay_properties["limit"]["minimum"] == 1
+    assert wordplay_properties["limit"]["maximum"] == 100
+    assert by_name["wordplay"].inputSchema["required"] == ["text", "kind"]
+
 
 @pytest.mark.asyncio
 async def test_mcp_call_returns_native_structured_content(service: LexiconService) -> None:
@@ -140,6 +157,26 @@ async def test_mcp_call_returns_native_structured_content(service: LexiconServic
     assert structured is not None
     assert structured["type"] == "dictionary_lookup"
     assert structured["results"][0]["sense_id"] == "oewn:cat-n"
+
+
+@pytest.mark.asyncio
+async def test_mcp_wordplay_tool_returns_structured_wordplay(
+    service: LexiconService,
+) -> None:
+    mcp = create_mcp(service)
+    result = await mcp.call_tool("wordplay", {"text": "cat", "kind": "anagram"})
+    assert isinstance(result, tuple)
+    _content, structured = result
+    assert structured is not None
+    assert structured["type"] == "wordplay"
+    assert structured["query"]["kind"] == "anagram"
+    assert structured["count"] == len(structured["results"])
+    with pytest.raises(ToolError, match="Input should be 'anagram'"):
+        await mcp.call_tool("wordplay", {"text": "cat", "kind": "limerick"})
+    with pytest.raises(ToolError, match="limit"):
+        await mcp.call_tool(
+            "wordplay", {"text": "cat", "kind": "anagram", "limit": -1}
+        )
 
 
 @pytest.mark.asyncio

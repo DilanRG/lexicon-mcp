@@ -9,7 +9,7 @@ import sqlite3
 import threading
 import time
 import traceback
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any
@@ -110,6 +110,11 @@ class PerformanceReport:
     semantic_warm_samples: int
     semantic_seed: str
     semantic_language: str
+    # One entry per wordplay kind: first-call latency on this connection and
+    # warm p95 across limit=1,20,100 samples.
+    wordplay_cold_ms: dict[str, float] = field(default_factory=dict)
+    wordplay_warm_p95_ms: dict[str, float] = field(default_factory=dict)
+    wordplay_samples: int = 0
 
     def to_evidence(self) -> dict[str, object]:
         """Return every measurement with non-overlapping memory labels."""
@@ -119,6 +124,8 @@ class PerformanceReport:
                 "lexical_p95": self.lexical_p95_ms,
                 "semantic_cold": self.semantic_cold_ms,
                 "semantic_warm_p95": self.semantic_warm_p95_ms,
+                "wordplay_cold_by_kind": self.wordplay_cold_ms,
+                "wordplay_warm_p95_by_kind": self.wordplay_warm_p95_ms,
             },
             "memory_bytes": {
                 "idle_process_private": self.idle_private_bytes,
@@ -136,6 +143,7 @@ class PerformanceReport:
             "samples": {
                 "lexical": self.lexical_samples,
                 "semantic_warm": self.semantic_warm_samples,
+                "wordplay_warm": self.wordplay_samples,
             },
             "semantic_query": {
                 "language": self.semantic_language,
@@ -323,6 +331,41 @@ def _performance_worker(
                 lexical_calls[index % len(lexical_calls)]()
                 lexical_timings.append((time.perf_counter() - started) * 1000.0)
 
+            # One cold (first-call on this connection) plus warm samples at
+            # limit=1,20,100 per wordplay kind, including a high-fanout
+            # anagram probe and a two-alternative spoonerism pairing.
+            wordplay_queries: list[tuple[str, str, str | None, int]] = [
+                ("anagram", "listen", None, 1),
+                ("anagram", "listen", None, 20),
+                ("anagram", "stare", None, 100),
+                ("palindrome", "level", None, 1),
+                ("palindrome", "level", None, 20),
+                ("palindrome", "level", None, 100),
+                ("spoonerism", "light rain", None, 1),
+                ("spoonerism", "light rain", None, 20),
+                ("spoonerism", "light rain", None, 100),
+                ("pun", "sea", None, 1),
+                ("pun", "sea", "the sea was calm", 20),
+                ("pun", "sea", None, 100),
+            ]
+            wordplay_cold: dict[str, float] = {}
+            wordplay_warm: dict[str, list[float]] = {}
+            for kind, text, context, limit in wordplay_queries:
+                started = time.perf_counter()
+                service.wordplay(text, kind, context, limit)
+                elapsed = (time.perf_counter() - started) * 1000.0
+                if kind not in wordplay_cold or elapsed > wordplay_cold[kind]:
+                    wordplay_cold[kind] = elapsed
+                timings = wordplay_warm.setdefault(kind, [])
+                for _repeat in range(5):
+                    started = time.perf_counter()
+                    service.wordplay(text, kind, context, limit)
+                    timings.append((time.perf_counter() - started) * 1000.0)
+            wordplay_p95 = {
+                kind: percentile(timings, 0.95) for kind, timings in wordplay_warm.items()
+            }
+            wordplay_samples = sum(len(t) for t in wordplay_warm.values())
+
             seed, language = _semantic_seed(Path(semantic_directory))
             stop = threading.Event()
             child_private_peak = [0]
@@ -367,6 +410,9 @@ def _performance_worker(
                 semantic_warm_samples=len(warm_timings),
                 semantic_seed=seed,
                 semantic_language=language,
+                wordplay_cold_ms=wordplay_cold,
+                wordplay_warm_p95_ms=wordplay_p95,
+                wordplay_samples=wordplay_samples,
             )
             channel.send({"ok": True, "report": asdict(report)})
     except BaseException:

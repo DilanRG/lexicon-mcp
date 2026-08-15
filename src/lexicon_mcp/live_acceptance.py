@@ -41,6 +41,7 @@ EXPECTED_LEXICON_TOOLS = frozenset(
         "dictionary_relations",
         "dictionary_semantic_neighbors",
         "rhymes",
+        "wordplay",
     }
 )
 ADMIN_TERMS = frozenset({"install", "status", "verify", "repair", "rollback"})
@@ -503,7 +504,7 @@ def validate_lexicon_openapi(schema: Any) -> tuple[str, ...]:
     expected = frozenset((f"/{name}", "post") for name in EXPECTED_LEXICON_TOOLS)
     if operations != expected:
         raise AcceptanceFailure(
-            "Lexicon OpenAPI operations differ from the exact six-tool contract: "
+            "Lexicon OpenAPI operations differ from the exact seven-tool contract: "
             f"expected={sorted(expected)!r}, actual={sorted(operations)!r}"
         )
     serialized = json.dumps(schema, ensure_ascii=False).casefold()
@@ -568,6 +569,17 @@ def _require_provenance(value: Any, label: str) -> dict[str, Any]:
     _require_text(value.get("source"), f"{label} provenance.source")
     _require_text(value.get("license"), f"{label} provenance.license")
     return cast(dict[str, Any], value)
+
+
+def _require_provenance_array(value: Any, label: str) -> list[dict[str, Any]]:
+    """Wordplay results carry one provenance entry per contributing source."""
+
+    if not isinstance(value, list) or not value:
+        raise AcceptanceFailure(f"{label} provenance must be a non-empty array")
+    return [
+        _require_provenance(entry, f"{label} provenance[{index}]")
+        for index, entry in enumerate(value)
+    ]
 
 
 def _normalized_term(value: str) -> str:
@@ -1241,6 +1253,64 @@ class LiveAcceptanceRunner:
         if "bat" not in wordplay_terms:
             raise AcceptanceFailure("rhymes(exact/cat) did not return bat")
 
+        anagram, anagram_value, anagram_results = self._invoke_lexicon_tool(
+            "wordplay",
+            {"text": "listen", "kind": "anagram", "limit": 20},
+            installation,
+        )
+        if (
+            anagram_value["query"].get("kind") != "anagram"
+            or anagram_value["query"].get("normalized_text") != "listen"
+            or anagram_value["query"].get("context") is not None
+        ):
+            raise AcceptanceFailure("wordplay(anagram/listen) returned a wrong query scope")
+        anagram_terms: set[str] = set()
+        for item in anagram_results:
+            term = _require_text(item.get("term"), "wordplay anagram term")
+            _require_text(item.get("normalized_term"), f"wordplay anagram {term} key")
+            _require_text(item.get("signature"), f"wordplay anagram {term} signature")
+            if item.get("language") != "en":
+                raise AcceptanceFailure("wordplay anagram returned a non-English result")
+            if _normalized_term(term) == "listen":
+                raise AcceptanceFailure("wordplay anagram echoed its query")
+            if _normalized_term(term) in anagram_terms:
+                raise AcceptanceFailure("wordplay anagram returned a duplicate")
+            anagram_terms.add(_normalized_term(term))
+            _require_provenance_array(item.get("provenance"), f"wordplay anagram {term}")
+        if "silent" not in anagram_terms:
+            raise AcceptanceFailure("wordplay(anagram/listen) did not return silent")
+
+        pun, pun_value, pun_results = self._invoke_lexicon_tool(
+            "wordplay",
+            {
+                "text": "sea",
+                "kind": "pun",
+                "context": "the sea was calm",
+                "limit": 20,
+            },
+            installation,
+        )
+        if (
+            pun_value["query"].get("kind") != "pun"
+            or pun_value["query"].get("normalized_text") != "sea"
+            or pun_value["query"].get("context") != "the sea was calm"
+        ):
+            raise AcceptanceFailure("wordplay(pun/sea) returned a wrong query scope")
+        if not pun_results:
+            raise AcceptanceFailure("wordplay(pun/sea) returned no homophone candidates")
+        for item in pun_results:
+            term = _require_text(item.get("term"), "wordplay pun term")
+            _require_text(item.get("phonemes"), f"wordplay pun {term} phonemes")
+            if item.get("sound_relation") != "homophone":
+                raise AcceptanceFailure("wordplay pun returned a non-homophone relation")
+            if item.get("context_scope") != "contextualized":
+                raise AcceptanceFailure("wordplay pun did not label its context scope")
+            if item.get("result_class") != "candidate":
+                raise AcceptanceFailure("wordplay pun was not labelled a candidate")
+            if not item.get("candidate_sense_ids"):
+                raise AcceptanceFailure("wordplay pun candidate lacks source-native senses")
+            _require_provenance_array(item.get("provenance"), f"wordplay pun {term}")
+
         suite: dict[str, Any] = {
             "schema_version": 1,
             "execution_cycle": 1,
@@ -1291,6 +1361,20 @@ class LiveAcceptanceRunner:
                     "count": len(wordplay_results),
                     "required_candidate": "bat",
                     "query_excluded": True,
+                },
+                "wordplay": {
+                    "anagram": {
+                        "response_sha256": anagram.body_sha256,
+                        "count": len(anagram_results),
+                        "required_candidate": "silent",
+                        "query_excluded": True,
+                    },
+                    "pun": {
+                        "response_sha256": pun.body_sha256,
+                        "count": len(pun_results),
+                        "context_scope": "contextualized",
+                        "candidate_class": "candidate",
+                    },
                 },
             },
             "cross_tool_sense_flow": {
@@ -2690,6 +2774,63 @@ class FixtureHost:
                     "normalized_text": "cat",
                     "language": "en",
                 },
+                "count": len(results),
+                "results": results,
+            }
+        elif url.endswith("/wordplay"):
+            payload = request_payload or {}
+            kind = str(payload.get("kind", ""))
+            if kind == "anagram":
+                results = [
+                    {
+                        "term": "silent",
+                        "normalized_term": "silent",
+                        "signature": "eilnst",
+                        "language": "en",
+                        "explanation": "same normalized letters",
+                        "provenance": [wiktionary_provenance],
+                    }
+                ]
+                if self._value.get("wordplay_missing_anagram"):
+                    results = []
+                query = {
+                    **payload,
+                    "normalized_text": "listen",
+                    "context": None,
+                }
+            elif kind == "pun":
+                context_scope = (
+                    "uncontextualized"
+                    if self._value.get("wordplay_context_mislabelled")
+                    else "contextualized"
+                )
+                results = [
+                    {
+                        "term": "see",
+                        "phonemes": "S IY1",
+                        "query_sense_ids": ["oewn:sea-n-1"],
+                        "candidate_sense_ids": ["oewn:see-n-1"],
+                        "sound_relation": "homophone",
+                        "context_scope": context_scope,
+                        "result_class": "candidate",
+                        "explanation": (
+                            "exact CMUdict homophone with distinct source-native senses"
+                        ),
+                        "provenance": [provenance, wiktionary_provenance],
+                    }
+                ]
+                query = {
+                    **payload,
+                    "normalized_text": "sea",
+                    "context": payload.get("context"),
+                }
+            else:
+                results = []
+                query = {**payload, "normalized_text": str(payload.get("text", ""))}
+            body = {
+                "type": "wordplay",
+                "dataset_version": self._installation.version,
+                "query": query,
                 "count": len(results),
                 "results": results,
             }

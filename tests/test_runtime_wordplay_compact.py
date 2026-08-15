@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from lexicon_mcp.pipeline.schema import create_wordplay_indexes
 from lexicon_mcp.runtime.wordplay import SQLiteWordplaySearch
 
 
@@ -14,13 +15,32 @@ def _create_database(path: Path, rows: list[tuple[str, str, str, str]]) -> None:
         connection.executescript(
             """
             CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            INSERT INTO metadata VALUES ('schema_version', '2');
+            INSERT INTO metadata VALUES ('schema_version', '3');
             CREATE TABLE lexical_terms (
                 term_id INTEGER PRIMARY KEY,
                 term TEXT NOT NULL,
                 normalized_term TEXT NOT NULL,
                 language TEXT NOT NULL,
                 UNIQUE(language, normalized_term, term)
+            );
+            CREATE TABLE provenance (
+                provenance_id INTEGER PRIMARY KEY,
+                source TEXT NOT NULL,
+                source_license TEXT NOT NULL,
+                source_url TEXT NOT NULL,
+                UNIQUE (source, source_license, source_url)
+            );
+            CREATE TABLE lexical_entries (
+                entry_id TEXT PRIMARY KEY,
+                term_id INTEGER NOT NULL REFERENCES lexical_terms(term_id),
+                part_of_speech TEXT,
+                etymology TEXT,
+                provenance_id INTEGER NOT NULL REFERENCES provenance(provenance_id)
+            );
+            CREATE TABLE senses (
+                sense_id TEXT PRIMARY KEY,
+                entry_id TEXT NOT NULL REFERENCES lexical_entries(entry_id) ON DELETE CASCADE,
+                gloss TEXT
             );
             CREATE TABLE pronunciations_words (
                 term_id INTEGER NOT NULL REFERENCES lexical_terms(term_id),
@@ -62,6 +82,7 @@ def _create_database(path: Path, rows: list[tuple[str, str, str, str]]) -> None:
               ON pronunciation.term_id = term.term_id;
             """
         )
+        create_wordplay_indexes(connection)
         connection.commit()
 
 
@@ -161,13 +182,13 @@ def test_result_contract_and_input_limits(compact_database: Path) -> None:
             search.search("anagram", "cat")
 
 
-def test_rejects_non_v2_or_non_compact_schema(tmp_path: Path) -> None:
+def test_rejects_non_v3_or_non_compact_schema(tmp_path: Path) -> None:
     path = tmp_path / "legacy.sqlite3"
     with sqlite3.connect(path) as connection:
         connection.executescript(
             """
             CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            INSERT INTO metadata VALUES ('schema_version', '1');
+            INSERT INTO metadata VALUES ('schema_version', '2');
             CREATE TABLE lexical_terms (
                 term_id INTEGER PRIMARY KEY, term TEXT, normalized_term TEXT, language TEXT
             );
@@ -175,7 +196,7 @@ def test_rejects_non_v2_or_non_compact_schema(tmp_path: Path) -> None:
             CREATE VIRTUAL TABLE wordplay_fts USING fts5(normalized_term, content='');
             """
         )
-    with pytest.raises(RuntimeError, match="schema version 2"):
+    with pytest.raises(RuntimeError, match="schema version 3"):
         SQLiteWordplaySearch(path)
 
 

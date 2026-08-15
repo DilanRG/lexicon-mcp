@@ -34,7 +34,11 @@ from .numberbatch import (
 )
 from .oewn import SOURCE as OEWN_SOURCE
 from .oewn import build_oewn
-from .schema import create_lexical_query_indexes, create_lexical_schema
+from .schema import (
+    create_lexical_query_indexes,
+    create_lexical_schema,
+    create_wordplay_indexes,
+)
 from .size_estimator import INSTALLED_LIMIT, assert_size_targets
 from .source_rows import measure_source, verify_source_row_fields
 from .wiktextract import SOURCE as WIKTEXTRACT_SOURCE
@@ -670,6 +674,7 @@ def build_full_corpus(
             )
             stage_counts[stage] = counts
         create_lexical_query_indexes(connection)
+        wordplay_counts = create_wordplay_indexes(connection)
         lexical_counts = _db_counts(connection)
         for stage, counts in stage_counts.items():
             if not isinstance(counts, dict):
@@ -735,6 +740,10 @@ def build_full_corpus(
         "pipeline_identity": pipeline_identity,
         "lexical_counts": lexical_counts,
         "stage_counts": stage_counts,
+        "wordplay": {
+            "index_version": 1,
+            **wordplay_counts,
+        },
         "semantic": stage_counts["numberbatch"],
         "corpus_floors": corpus_floors,
         "corpus_floors_enforced": enforce_corpus_floors,
@@ -794,7 +803,7 @@ def _validated_recovery_lexical_state(
     *,
     dataset_version: str,
     original_pipeline_identity: str,
-) -> tuple[dict[str, Any], dict[str, int]]:
+) -> tuple[dict[str, Any], dict[str, int], dict[str, int]]:
     lexical_path = partial / "lexicon.sqlite3"
     if not lexical_path.is_file():
         raise FileNotFoundError(f"recovery lexical database does not exist: {lexical_path}")
@@ -818,10 +827,29 @@ def _validated_recovery_lexical_state(
             str(key): str(value)
             for key, value in connection.execute("SELECT key,value FROM metadata")
         }
-        if metadata.get("schema_version") != "2":
-            raise RuntimeError("recovery lexical database is not schema version 2")
+        if metadata.get("schema_version") != "3":
+            raise RuntimeError("recovery lexical database is not schema version 3")
         if metadata.get("dataset_version") != dataset_version:
             raise RuntimeError("recovery lexical dataset version does not match")
+        wordplay_tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+                " AND name IN ('wordplay_terms', 'pronunciation_onsets')"
+            )
+        }
+        if wordplay_tables != {"wordplay_terms", "pronunciation_onsets"}:
+            raise RuntimeError("recovery lexical database lacks wordplay index tables")
+        try:
+            wordplay_counts = {
+                "eligible_terms": int(metadata["wordplay.eligible_terms"]),
+                "palindromes": int(metadata["wordplay.palindromes"]),
+                "pronunciation_onsets": int(metadata["wordplay.pronunciation_onsets"]),
+            }
+        except KeyError as exc:
+            raise RuntimeError(
+                f"recovery lexical database lacks wordplay metadata: {exc.args[0]!r}"
+            ) from exc
 
         stage_sources: dict[str, tuple[Path, ...]] = {
             "oewn": (inputs.oewn,),
@@ -849,7 +877,7 @@ def _validated_recovery_lexical_state(
             raise RuntimeError(f"recovery lexical integrity_check failed: {integrity!r}")
     finally:
         connection.close()
-    return stage_counts, lexical_counts
+    return stage_counts, lexical_counts, wordplay_counts
 
 
 def _completed_semantic_recovery_counts(
@@ -1089,7 +1117,7 @@ def _recover_full_corpus_from_semantic_partial_locked(
                 "recorded lexical pipeline identity does not match original build commit"
             )
     checkpoints = Checkpoints(checkpoint_dir)
-    stage_counts, lexical_counts = _validated_recovery_lexical_state(
+    stage_counts, lexical_counts, wordplay_counts = _validated_recovery_lexical_state(
         inputs,
         partial,
         checkpoints,
@@ -1147,6 +1175,10 @@ def _recover_full_corpus_from_semantic_partial_locked(
         },
         "lexical_counts": lexical_counts,
         "stage_counts": stage_counts,
+        "wordplay": {
+            "index_version": 1,
+            **wordplay_counts,
+        },
         "semantic": semantic_counts,
         "corpus_floors": corpus_floors,
         "corpus_floors_enforced": enforce_corpus_floors,

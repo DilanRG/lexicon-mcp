@@ -160,9 +160,9 @@ class SQLiteWordplaySearch:
         schema_row = self._connection.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
-        if schema_row is None or str(schema_row[0]) != "2":
+        if schema_row is None or str(schema_row[0]) != "3":
             value = None if schema_row is None else str(schema_row[0])
-            raise RuntimeError(f"Compact wordplay requires lexical schema version 2, got {value!r}")
+            raise RuntimeError(f"Compact wordplay requires lexical schema version 3, got {value!r}")
 
         expected_columns = {
             "lexical_terms": {"term_id", "term", "normalized_term", "language"},

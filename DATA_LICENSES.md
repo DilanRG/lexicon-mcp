@@ -21,6 +21,14 @@ results into indexed SQLite/FTS5 databases and USearch indexes. The Wiktionary-,
 ConceptNet-, and Numberbatch-derived portions remain under CC BY-SA 4.0. No
 upstream project or contributor endorses Lexicon MCP or this redistribution.
 
+Since `data-v1.1.0` the lexical database also carries derived wordplay lookup
+indexes (normalized-letter signatures, palindrome keys, and ARPAbet onset splits).
+These are deterministic derivations of the same pinned inputs: letter keys derive
+from stored headwords, and every phonetic derivation (onsets, swapped clusters,
+homophone keys) derives from the CMU Pronouncing Dictionary under its BSD-style
+license. Sense distinctions surfaced by `wordplay(kind="pun")` carry Open English
+WordNet or Wiktextract provenance exactly as dictionary tools do.
+
 Each Wiktionary-derived record preserves its English Wiktionary page title as the
 display term. For a term `T`, contributor attribution, source text, and revision
 history are available at `https://en.wiktionary.org/w/index.php?title=T` and

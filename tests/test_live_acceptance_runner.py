@@ -120,6 +120,7 @@ def test_fixture_replay_drives_exactly_ten_stop_start_pairs(tmp_path: Path) -> N
             "dictionary_relations": 1,
             "dictionary_semantic_neighbors": 1,
             "rhymes": 1,
+            "wordplay": 2,
             "calculate": 10,
         }
     )
@@ -244,12 +245,12 @@ def test_fixture_replay_rejects_wordplay_query_echo(tmp_path: Path) -> None:
         _run_fixture(tmp_path, value)
 
 
-def test_exact_lexicon_openapi_rejects_any_seventh_operation() -> None:
+def test_exact_lexicon_openapi_rejects_any_eighth_operation() -> None:
     paths: dict[str, object] = {f"/{name}": {"post": {}} for name in EXPECTED_LEXICON_TOOLS}
     assert set(validate_lexicon_openapi({"paths": paths})) == EXPECTED_LEXICON_TOOLS
 
     paths["/repair"] = {"post": {}}
-    with pytest.raises(AcceptanceFailure, match="exact six-tool contract"):
+    with pytest.raises(AcceptanceFailure, match="exact seven-tool contract"):
         validate_lexicon_openapi({"paths": paths})
 
 

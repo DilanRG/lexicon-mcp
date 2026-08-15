@@ -10,6 +10,7 @@ import pytest
 from lexicon_mcp.pipeline.schema import (
     create_lexical_query_indexes,
     create_lexical_schema,
+    create_wordplay_indexes,
 )
 from lexicon_mcp.runtime.locator import DatasetLocator
 from lexicon_mcp.runtime.normalization import normalize_key, normalize_language
@@ -367,6 +368,7 @@ def lexical_database(tmp_path: Path) -> Path:
         create_lexical_schema(connection, "data-test-v1")
         _insert_fixture_data(connection)
         create_lexical_query_indexes(connection)
+        create_wordplay_indexes(connection)
     return path
 
 

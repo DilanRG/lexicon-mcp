@@ -1,14 +1,27 @@
-"""Compact v2 on-disk schema shared by corpus builders and query runtime.
+"""Compact v3 on-disk schema shared by corpus builders and query runtime.
 
-No v1 dataset was publicly released, so no migration is required.  Builders
-always create v2 artifacts from pinned upstream sources.
+No v1 dataset was publicly released, so no migration is required.  v2 artifacts
+remain immutable; builders create v3 artifacts from pinned upstream sources,
+adding the bounded wordplay reverse indexes on top of the v2 tables.
 """
 
 from __future__ import annotations
 
 import sqlite3
 
-from .constants import SCHEMA_VERSION
+from .constants import SCHEMA_VERSION, SEMANTIC_SCHEMA_VERSION
+from .wordplay import (
+    is_palindrome,
+    is_wordplay_eligible,
+    letter_signature,
+    normalized_letters,
+    reverse_letters,
+    split_arpabet_onset,
+)
+
+# Streaming batch size for index population; keeps Python memory bounded
+# regardless of corpus size.
+_WORDPLAY_BATCH_SIZE = 10_000
 
 DIMENSION_SCHEMA = """
 CREATE TABLE IF NOT EXISTS provenance (
@@ -123,6 +136,36 @@ CREATE VIRTUAL TABLE wordplay_fts USING fts5(
 );
 """
 
+WORDPLAY_INDEX_SCHEMA = """
+DROP TABLE IF EXISTS wordplay_terms;
+DROP TABLE IF EXISTS pronunciation_onsets;
+CREATE TABLE wordplay_terms (
+  term_id INTEGER PRIMARY KEY REFERENCES lexical_terms(term_id),
+  normalized_letters TEXT NOT NULL,
+  letter_signature TEXT NOT NULL,
+  reverse_letters TEXT NOT NULL,
+  is_palindrome INTEGER NOT NULL CHECK (is_palindrome IN (0,1)),
+  wordplay_eligible INTEGER NOT NULL CHECK (wordplay_eligible IN (0,1))
+) WITHOUT ROWID;
+CREATE INDEX wordplay_terms_anagram
+  ON wordplay_terms(letter_signature, normalized_letters, term_id)
+  WHERE wordplay_eligible = 1;
+CREATE INDEX wordplay_terms_palindrome
+  ON wordplay_terms(normalized_letters, term_id)
+  WHERE is_palindrome = 1;
+CREATE TABLE pronunciation_onsets (
+  term_id INTEGER NOT NULL REFERENCES lexical_terms(term_id),
+  phonemes TEXT NOT NULL,
+  onset TEXT NOT NULL,
+  remainder TEXT NOT NULL,
+  PRIMARY KEY (term_id, phonemes)
+) WITHOUT ROWID;
+CREATE INDEX pronunciation_onsets_lookup
+  ON pronunciation_onsets(onset, remainder, term_id);
+CREATE INDEX pronunciation_onsets_reverse
+  ON pronunciation_onsets(remainder, onset, term_id);
+"""
+
 
 SEMANTIC_SCHEMA = (
     """
@@ -171,7 +214,7 @@ def create_semantic_schema(
     connection.executemany(
         "INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)",
         (
-            ("schema_version", SCHEMA_VERSION),
+            ("schema_version", SEMANTIC_SCHEMA_VERSION),
             ("dataset_version", dataset_version),
             ("dimensions", str(dimensions)),
             ("vector_dtype", "float16"),
@@ -200,6 +243,87 @@ def create_lexical_query_indexes(connection: sqlite3.Connection) -> None:
         "INSERT INTO wordplay_fts(wordplay_fts) VALUES('integrity-check')"
     )
     connection.commit()
+
+
+def create_wordplay_indexes(connection: sqlite3.Connection) -> dict[str, int]:
+    """Build the v3 bounded wordplay reverse indexes after bulk imports.
+
+    Both source tables are streamed in fixed-size batches so the full term
+    corpus is never held in Python.  The returned counts feed the build
+    report and dataset metadata.
+    """
+
+    connection.executescript(WORDPLAY_INDEX_SCHEMA)
+    eligible_terms = 0
+    palindromes = 0
+    term_rows: list[tuple[int, str, str, str, int, int]] = []
+    cursor = connection.execute(
+        "SELECT term_id, term FROM lexical_terms WHERE language = 'en' ORDER BY term_id"
+    )
+    while True:
+        batch = cursor.fetchmany(_WORDPLAY_BATCH_SIZE)
+        if not batch:
+            break
+        for term_id, term in batch:
+            letters = normalized_letters(str(term))
+            eligible = is_wordplay_eligible(str(term))
+            palindrome = int(eligible and is_palindrome(letters))
+            term_rows.append(
+                (
+                    int(term_id),
+                    letters,
+                    letter_signature(letters),
+                    reverse_letters(letters),
+                    palindrome,
+                    int(eligible),
+                )
+            )
+            eligible_terms += int(eligible)
+            palindromes += palindrome
+        connection.executemany(
+            "INSERT INTO wordplay_terms"
+            " (term_id, normalized_letters, letter_signature, reverse_letters,"
+            " is_palindrome, wordplay_eligible) VALUES (?, ?, ?, ?, ?, ?)",
+            term_rows,
+        )
+        term_rows.clear()
+    cursor.close()
+
+    onset_rows: list[tuple[int, str, str, str]] = []
+    onset_count = 0
+    cursor = connection.execute(
+        "SELECT term_id, phonemes FROM pronunciations_words ORDER BY term_id, phonemes"
+    )
+    while True:
+        batch = cursor.fetchmany(_WORDPLAY_BATCH_SIZE)
+        if not batch:
+            break
+        for term_id, phonemes in batch:
+            onset, remainder = split_arpabet_onset(str(phonemes))
+            onset_rows.append((int(term_id), str(phonemes), onset, remainder))
+            onset_count += 1
+        connection.executemany(
+            "INSERT INTO pronunciation_onsets (term_id, phonemes, onset, remainder)"
+            " VALUES (?, ?, ?, ?)",
+            onset_rows,
+        )
+        onset_rows.clear()
+    cursor.close()
+    connection.executemany(
+        "INSERT OR REPLACE INTO metadata(key,value) VALUES (?,?)",
+        (
+            ("wordplay_index_version", "1"),
+            ("wordplay.eligible_terms", str(eligible_terms)),
+            ("wordplay.palindromes", str(palindromes)),
+            ("wordplay.pronunciation_onsets", str(onset_count)),
+        ),
+    )
+    connection.commit()
+    return {
+        "eligible_terms": eligible_terms,
+        "palindromes": palindromes,
+        "pronunciation_onsets": onset_count,
+    }
 
 
 def create_semantic_query_indexes(connection: sqlite3.Connection) -> None:

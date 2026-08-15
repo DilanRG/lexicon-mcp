@@ -23,6 +23,7 @@ from lexicon_mcp.pipeline.schema import (
     create_lexical_query_indexes,
     create_lexical_schema,
     create_semantic_schema,
+    create_wordplay_indexes,
 )
 from lexicon_mcp.runtime.offline import NetworkDisabledError
 from lexicon_mcp.runtime.semantic import SemanticWorker, _semantic_search_task, _SemanticRequest
@@ -401,6 +402,7 @@ def test_windows_stdio_semantic_worker_handles_nested_process_and_unicode(
     with sqlite3.connect(database) as connection:
         create_lexical_schema(connection, "data-test-v1")
         create_lexical_query_indexes(connection)
+        create_wordplay_indexes(connection)
         connection.commit()
 
     child_code = f"""

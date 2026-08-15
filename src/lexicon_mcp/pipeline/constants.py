@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
+
+# The semantic mapping schema is unchanged by the v3 lexical wordplay
+# indexes; its artifacts keep their own version line.
+SEMANTIC_SCHEMA_VERSION = "2"
 
 RELATION_CODES = {
     "synonym": 1,

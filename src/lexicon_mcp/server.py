@@ -1,4 +1,4 @@
-"""FastMCP adapter exposing the six public lexicon tools."""
+"""FastMCP adapter exposing the seven public lexicon tools."""
 
 from __future__ import annotations
 
@@ -26,6 +26,17 @@ Relation = Literal[
     "related",
 ]
 RhymeMode = Literal["exact", "near"]
+WordplayKind = Literal["anagram", "palindrome", "spoonerism", "pun"]
+WordplayContext = Annotated[
+    str,
+    Field(
+        min_length=1,
+        max_length=512,
+        description=(
+            "Optional context sentence; only accepted when kind is 'pun'."
+        ),
+    ),
+]
 QueryText = Annotated[
     str,
     Field(
@@ -285,6 +296,28 @@ def create_mcp(service: LexiconService | None = None) -> FastMCP:
         """
 
         return provider.get().rhymes(text, mode, limit)
+
+    @server.tool()
+    def wordplay(
+        text: QueryText,
+        kind: WordplayKind,
+        context: WordplayContext | None = None,
+        limit: ResultLimit = 20,
+    ) -> dict[str, Any]:
+        """Find corpus-backed wordplay candidates of one requested kind.
+
+        kind selects exactly one relation: anagram (eligible English
+        headwords with the same normalized letters), palindrome (stored
+        corpus palindromes; the query's own status is reported as
+        input_is_palindrome), spoonerism (exactly two whitespace-separated
+        English headwords whose initial consonant clusters are exchanged),
+        or pun (exact CMUdict homophones whose source-native senses differ,
+        returned as labelled candidates, never jokes). context is only
+        accepted for pun; without it pun results are labelled
+        context_scope="uncontextualized". Every result carries provenance.
+        """
+
+        return provider.get().wordplay(text, kind, context, limit)
 
     return server
 

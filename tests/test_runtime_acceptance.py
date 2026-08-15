@@ -139,6 +139,9 @@ def test_performance_report_shape_names_working_set_separately() -> None:
         "semantic_warm_samples": 9,
         "semantic_seed": "cat",
         "semantic_language": "en",
+        "wordplay_cold_ms": {},
+        "wordplay_warm_p95_ms": {},
+        "wordplay_samples": 0,
     }
     assert report.to_evidence() == json.loads(report.to_json())
     assert report.to_json() == report.to_json()
@@ -148,6 +151,8 @@ def test_performance_report_shape_names_working_set_separately() -> None:
             "lexical_p95": 1.0,
             "semantic_cold": 2.0,
             "semantic_warm_p95": 3.0,
+            "wordplay_cold_by_kind": {},
+            "wordplay_warm_p95_by_kind": {},
         },
         "memory_bytes": {
             "idle_process_private": 4,
@@ -156,7 +161,7 @@ def test_performance_report_shape_names_working_set_separately() -> None:
             "semantic_worker_peak_total_working_set": 6,
         },
         "report": "performance_acceptance",
-        "samples": {"lexical": 8, "semantic_warm": 9},
+        "samples": {"lexical": 8, "semantic_warm": 9, "wordplay_warm": 0},
         "semantic_query": {"language": "en", "seed": "cat"},
     }
 
