@@ -131,6 +131,42 @@ active dataset is selected through an atomically replaced `current.json` pointer
 Downloads resume into `.partial` files, are hash-checked before extraction, and are
 activated only after database/index integrity checks.
 
+### Air-gapped and mirrored installation
+
+Runtime operation is fully offline, but installation normally downloads its
+release. To install without ever putting the target machine on a network, mirror
+the release somewhere connected and carry it across:
+
+```powershell
+# On a connected machine
+lexicon-data fetch --profile full --version data-v1.0.0 --dest E:\transfer\data-v1.0.0
+
+# On the isolated machine, after copying the directory across
+lexicon-data install --profile full --version data-v1.0.0 --from E:\transfer\data-v1.0.0
+```
+
+`fetch` writes the exact published release layout — `manifest.json` beside one
+file per part — and verifies every part against its manifest SHA-256 before
+giving it its final name. It is resumable and idempotent: rerun it after an
+interruption and it continues, skipping whatever is already valid. It never
+writes to the dataset root, never activates anything, and the manifest is written
+last, so an interrupted mirror fails loudly on install rather than looking
+complete.
+
+**`install --from` performs no network access at all.** Every part is resolved on
+disk; a release that cannot be satisfied locally is an error rather than a silent
+fall back to the network. Because the transferred assets carry their manifest
+hashes, the transfer itself is integrity-checked end to end.
+
+`--from` accepts a mirror directory, a `manifest.json` path, an HTTP(S) URL, or a
+template containing `{version}` and `{profile}`. `repair` accepts it too, so a
+damaged air-gapped install can be repaired from the same media. To install from a
+self-hosted mirror instead, publish the release with `base_url` set and point
+`--from` at its `manifest.json`; `LEXICON_MANIFEST_URL` sets a default template.
+
+`--manifest-url` remains as a deprecated alias for `--from` and is removed in
+2.0.0.
+
 The `english` profile keeps only English lexical terms, English-to-English
 relations, CMUdict pronunciation data, and the English Numberbatch vectors. It
 stores one shared English semantic index instead of a global index plus a
@@ -228,7 +264,7 @@ uv run --frozen python scripts/package_data.py `
 
 uv run --frozen lexicon-data --data-dir E:\AI\data\lexicon-mcp install `
   --profile full --version data-v1.0.0 `
-  --manifest-url E:\AI\state\lexicon-mcp-build\release\data-v1.0.0\manifest.json
+  --from E:\AI\state\lexicon-mcp-build\release\data-v1.0.0
 ```
 
 Release acceptance is separate from ordinary CI because it reads the full activated

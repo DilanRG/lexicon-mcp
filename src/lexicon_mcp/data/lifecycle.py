@@ -93,6 +93,22 @@ def _atomic_replace(source: Path, destination: Path) -> None:
         os.replace(source, destination)
 
 
+def local_manifest_path(source: str | Path) -> Path | None:
+    """Resolve a local install source to its manifest file, or None for HTTP(S).
+
+    A directory is resolved to the ``manifest.json`` inside it, so a mirror
+    produced by ``lexicon-data fetch`` can be installed by pointing at the
+    directory itself.
+    """
+
+    if not isinstance(source, Path) and str(source).startswith(("http://", "https://")):
+        return None
+    path = Path(source).expanduser()
+    if path.is_dir():
+        return path / "manifest.json"
+    return path
+
+
 def _path_within(base: Path, relative: str) -> Path:
     """Resolve an activation path while rejecting traversal and symlinks."""
 
@@ -162,8 +178,8 @@ class DatasetLifecycle:
     def load_manifest(self, source: str | Path) -> DatasetManifest:
         """Load a local or HTTP(S) release manifest, bounded to 16 MiB."""
 
-        if isinstance(source, Path) or not str(source).startswith(("http://", "https://")):
-            path = Path(source)
+        path = local_manifest_path(source)
+        if path is not None:
             try:
                 if path.stat().st_size > 16 * 1024 * 1024:
                     raise ManifestError("manifest exceeds 16 MiB")
@@ -245,6 +261,140 @@ class DatasetLifecycle:
                 "components": len(manifest.components),
                 "path": str(target),
             }
+
+    def fetch(
+        self,
+        manifest_source: str | Path | DatasetManifest,
+        *,
+        profile: str,
+        version: str,
+        dest: Path | str,
+    ) -> dict[str, Any]:
+        """Mirror a release into *dest* without touching the dataset root.
+
+        The result reproduces the packaged release layout exactly: one
+        ``manifest.json`` beside one file per part, named by its manifest asset
+        name.  It installs directly with ``install --from <dest>``, so a
+        connected machine can prepare an air-gapped install.  Nothing here
+        writes to the data root, activates a version, or takes the install lock.
+        """
+
+        destination = Path(dest).expanduser()
+        if isinstance(manifest_source, DatasetManifest):
+            manifest = manifest_source
+            local_asset_root: Path | None = None
+        else:
+            manifest = self.load_manifest(manifest_source)
+            local_asset_root = self._local_asset_root(manifest_source)
+        self._match_request(manifest, profile=profile, version=version)
+        destination.mkdir(parents=True, exist_ok=True)
+        resolved = destination.resolve()
+        if local_asset_root is not None and local_asset_root == resolved:
+            raise LifecycleError("fetch source and destination are the same directory")
+        targets = self._mirror_targets(manifest, resolved)
+        self._fetch_preflight(targets, resolved)
+        fetched: list[str] = []
+        skipped: list[str] = []
+        bytes_fetched = 0
+        for part, target in targets:
+            name = str(part.name)
+            if self._valid_file(target, part.size, part.sha256):
+                skipped.append(name)
+                continue
+            if target.is_symlink() or (target.exists() and not target.is_file()):
+                raise DownloadError(f"unsafe mirror destination: {target}")
+            partial = target.with_name(target.name + ".partial")
+            if partial.is_symlink() or (partial.exists() and not partial.is_file()):
+                raise DownloadError(f"unsafe partial mirror path: {partial}")
+            if partial.is_file() and partial.stat().st_size > part.size:
+                partial.unlink()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            # Drop an unverified file first so a failed fetch never leaves one
+            # sitting at its final, trusted name.
+            target.unlink(missing_ok=True)
+            if local_asset_root is not None:
+                self._copy_local_asset(local_asset_root, part, partial, target)
+            else:
+                self._http_download(
+                    self._part_url(manifest, part),
+                    partial,
+                    target,
+                    size=part.size,
+                    sha256=part.sha256,
+                    description=f"release asset {name}",
+                )
+            fetched.append(name)
+            bytes_fetched += part.size
+        # The manifest lands last: a mirror interrupted mid-fetch has no
+        # manifest, so it fails loudly on install instead of looking complete.
+        manifest_path = resolved / "manifest.json"
+        temporary = manifest_path.with_name(f".manifest.{uuid.uuid4().hex}.tmp")
+        try:
+            with temporary.open("xb") as stream:
+                stream.write(manifest.raw)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, manifest_path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return {
+            "action": "fetched",
+            "version": manifest.dataset_version,
+            "profile": manifest.profile,
+            "dest": str(resolved),
+            "components": len(manifest.components),
+            "assets_fetched": len(fetched),
+            "assets_skipped": len(skipped),
+            "bytes_fetched": bytes_fetched,
+            "manifest_sha256": manifest.sha256,
+        }
+
+    @staticmethod
+    def _mirror_targets(
+        manifest: DatasetManifest, destination: Path
+    ) -> list[tuple[Part, Path]]:
+        """Map every distinct release part onto its mirrored asset path."""
+
+        targets: list[tuple[Part, Path]] = []
+        seen: dict[str, str] = {}
+        for component in manifest.components:
+            for index, part in enumerate(component.parts):
+                if part.name is None:
+                    raise LifecycleError(
+                        f"component {component.id} part {index} has no asset name "
+                        "and cannot be mirrored"
+                    )
+                if part.name == "manifest.json":
+                    raise LifecycleError("a release part must not be named manifest.json")
+                previous = seen.get(part.name)
+                if previous is not None:
+                    if previous != part.sha256:
+                        raise LifecycleError(
+                            f"release asset name is reused with different content: {part.name}"
+                        )
+                    continue
+                seen[part.name] = part.sha256
+                targets.append((part, destination.joinpath(*part.name.split("/"))))
+        return targets
+
+    def _fetch_preflight(self, targets: list[tuple[Part, Path]], destination: Path) -> None:
+        required = 0
+        for part, target in targets:
+            if self._valid_file(target, part.size, part.sha256):
+                continue
+            partial = target.with_name(target.name + ".partial")
+            present = partial.stat().st_size if partial.is_file() else 0
+            required += max(0, part.size - min(present, part.size))
+        margin = max(self.safety_margin, required // 20)
+        try:
+            free = int(self.disk_usage(destination).free)
+        except OSError as exc:
+            raise SpaceError(f"cannot determine free space for {destination}: {exc}") from exc
+        if free < required + margin:
+            raise SpaceError(
+                f"release mirror requires {required + margin} free bytes "
+                f"({required} working + {margin} reserve), but {free} are available"
+            )
 
     def status(self) -> dict[str, Any]:
         """Report pointers and installed manifests without hashing large files."""
@@ -505,13 +655,13 @@ class DatasetLifecycle:
         """Resolve sibling assets only when the manifest itself is local.
 
         This allows a clean installation of the exact production manifest
-        before its immutable GitHub release is published. HTTP manifests retain
-        the ordinary release URL behavior.
+        before its immutable GitHub release is published, and installation from
+        a mirror directory produced by ``fetch``.  HTTP manifests retain the
+        ordinary release URL behavior.
         """
 
-        if isinstance(source, Path) or not str(source).startswith(("http://", "https://")):
-            return Path(source).expanduser().resolve().parent
-        return None
+        path = local_manifest_path(source)
+        return None if path is None else path.resolve().parent
 
     @staticmethod
     def _valid_file(path: Path, size: int, digest: str) -> bool:
@@ -545,51 +695,86 @@ class DatasetLifecycle:
             raise DownloadError(f"unsafe partial download path: {partial}")
         if partial.is_file() and partial.stat().st_size > part.size:
             partial.unlink()
-        if local_asset_root is not None and part.url is None:
-            if part.name is None:  # guarded by manifest parsing
-                raise DownloadError("local release part has no asset name")
-            source_candidate = local_asset_root.joinpath(*part.name.split("/"))
-            cursor = local_asset_root
-            for piece in part.name.split("/"):
-                cursor /= piece
-                if cursor.is_symlink():
-                    raise DownloadError(
-                        f"local release asset must not traverse a symlink: {part.name}"
-                    )
-            try:
-                source = source_candidate.resolve(strict=True)
-            except OSError as exc:
-                raise DownloadError(f"local release asset is missing: {part.name}") from exc
-            if not source.is_relative_to(local_asset_root) or not source.is_file():
-                raise DownloadError(f"local release asset is missing or unsafe: {part.name}")
-            offset = partial.stat().st_size if partial.is_file() else 0
-            try:
-                with (
-                    source.open("rb") as input_stream,
-                    partial.open("ab" if offset else "wb") as output,
-                ):
-                    input_stream.seek(offset)
-                    received = offset
-                    while chunk := input_stream.read(1024 * 1024):
-                        received += len(chunk)
-                        if received > part.size:
-                            raise DownloadError("local release asset exceeds its declared size")
-                        output.write(chunk)
-                    output.flush()
-                    os.fsync(output.fileno())
-            except OSError as exc:
-                raise DownloadError(f"cannot copy local release asset {part.name}: {exc}") from exc
-            if partial.stat().st_size != part.size:
+        if local_asset_root is not None:
+            # A local install source is a hard offline guarantee.  Every part is
+            # resolved on disk; a part that cannot be is an error rather than a
+            # silent fall back to the network.
+            return self._copy_local_asset(local_asset_root, part, partial, complete)
+        return self._http_download(
+            self._part_url(manifest, part),
+            partial,
+            complete,
+            size=part.size,
+            sha256=part.sha256,
+            description=f"component {component.id} part {index}",
+        )
+
+    @staticmethod
+    def _copy_local_asset(
+        local_asset_root: Path, part: Part, partial: Path, complete: Path
+    ) -> Path:
+        """Copy one verified release part from a local asset directory."""
+
+        if part.name is None:
+            raise DownloadError(
+                "local release part has no asset name; this release cannot be "
+                "installed from a local source"
+            )
+        root = local_asset_root.resolve()
+        pieces = part.name.split("/")
+        cursor = root
+        for piece in pieces:
+            cursor /= piece
+            if cursor.is_symlink():
                 raise DownloadError(
-                    f"incomplete local release asset (expected {part.size}, "
-                    f"got {partial.stat().st_size})"
+                    f"local release asset must not traverse a symlink: {part.name}"
                 )
-            if sha256_file(partial) != part.sha256:
-                partial.unlink(missing_ok=True)
-                raise DownloadError(f"local release asset SHA-256 mismatch: {part.name}")
-            os.replace(partial, complete)
-            return complete
-        url = self._part_url(manifest, part)
+        try:
+            source = root.joinpath(*pieces).resolve(strict=True)
+        except OSError as exc:
+            raise DownloadError(f"local release asset is missing: {part.name}") from exc
+        if not source.is_relative_to(root) or not source.is_file():
+            raise DownloadError(f"local release asset is missing or unsafe: {part.name}")
+        offset = partial.stat().st_size if partial.is_file() else 0
+        try:
+            with (
+                source.open("rb") as input_stream,
+                partial.open("ab" if offset else "wb") as output,
+            ):
+                input_stream.seek(offset)
+                received = offset
+                while chunk := input_stream.read(1024 * 1024):
+                    received += len(chunk)
+                    if received > part.size:
+                        raise DownloadError("local release asset exceeds its declared size")
+                    output.write(chunk)
+                output.flush()
+                os.fsync(output.fileno())
+        except OSError as exc:
+            raise DownloadError(f"cannot copy local release asset {part.name}: {exc}") from exc
+        if partial.stat().st_size != part.size:
+            raise DownloadError(
+                f"incomplete local release asset (expected {part.size}, "
+                f"got {partial.stat().st_size})"
+            )
+        if sha256_file(partial) != part.sha256:
+            partial.unlink(missing_ok=True)
+            raise DownloadError(f"local release asset SHA-256 mismatch: {part.name}")
+        os.replace(partial, complete)
+        return complete
+
+    def _http_download(
+        self,
+        url: str,
+        partial: Path,
+        complete: Path,
+        *,
+        size: int,
+        sha256: str,
+        description: str,
+    ) -> Path:
+        """Resumably fetch one verified payload, retrying with backoff."""
+
         last_error: BaseException | None = None
         for attempt in range(self.retries):
             offset = partial.stat().st_size if partial.is_file() else 0
@@ -611,30 +796,28 @@ class DatasetLifecycle:
                     with partial.open(mode) as output:
                         while chunk := response.body.read(1024 * 1024):
                             received += len(chunk)
-                            if received > part.size:
+                            if received > size:
                                 raise DownloadError("release asset exceeds its declared size")
                             output.write(chunk)
                         output.flush()
                         os.fsync(output.fileno())
                 actual_size = partial.stat().st_size
-                if actual_size != part.size:
+                if actual_size != size:
                     raise DownloadError(
-                        f"incomplete release part (expected {part.size}, got {actual_size})"
+                        f"incomplete release part (expected {size}, got {actual_size})"
                     )
-                if sha256_file(partial) != part.sha256:
+                if sha256_file(partial) != sha256:
                     partial.unlink(missing_ok=True)
                     raise DownloadError("release part SHA-256 mismatch")
                 os.replace(partial, complete)
                 return complete
             except (DownloadError, TransportError, OSError) as exc:
                 last_error = exc
-                if partial.is_file() and partial.stat().st_size > part.size:
+                if partial.is_file() and partial.stat().st_size > size:
                     partial.unlink(missing_ok=True)
                 if attempt + 1 < self.retries:
                     self.sleep(min(8.0, 0.5 * (2**attempt)))
-        raise DownloadError(
-            f"unable to download component {component.id} part {index}: {last_error}"
-        ) from last_error
+        raise DownloadError(f"unable to download {description}: {last_error}") from last_error
 
     def _materialize_component(
         self,

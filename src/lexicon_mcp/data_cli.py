@@ -28,10 +28,39 @@ DATASET_PROFILES = ("full", "english")
 
 def _manifest_source(value: str | None, *, version: str, profile: str) -> str:
     template = value or os.environ.get("LEXICON_MANIFEST_URL") or DEFAULT_MANIFEST
+    if "{" not in template:
+        # A plain URL or filesystem path is used verbatim.  Windows paths and
+        # mirror directories must never be reinterpreted as format fields.
+        return template
     try:
         return template.format(version=version, profile=profile)
-    except (KeyError, ValueError) as exc:
+    except (KeyError, IndexError, ValueError) as exc:
         raise LifecycleError(f"invalid manifest URL template: {exc}") from exc
+
+
+def _resolved_source(args: argparse.Namespace) -> str | None:
+    """Return the requested source, honoring the deprecated alias."""
+
+    source: str | None = getattr(args, "source", None)
+    legacy: str | None = getattr(args, "manifest_url", None)
+    if source and legacy:
+        raise LifecycleError("--from and --manifest-url cannot be combined; use --from")
+    if legacy:
+        print(
+            "warning: --manifest-url is deprecated and will be removed in 2.0.0; use --from",
+            file=sys.stderr,
+        )
+        return legacy
+    return source
+
+
+def _add_source_arguments(parser: argparse.ArgumentParser, *, help_text: str) -> None:
+    parser.add_argument("--from", dest="source", help=help_text)
+    parser.add_argument(
+        "--manifest-url",
+        dest="manifest_url",
+        help="deprecated alias for --from (removed in 2.0.0)",
+    )
 
 
 def _emit(value: dict[str, Any], *, stream: Any = sys.stdout) -> None:
@@ -53,9 +82,30 @@ def build_parser() -> argparse.ArgumentParser:
     install = commands.add_parser("install", help="install and atomically activate a release")
     install.add_argument("--profile", choices=DATASET_PROFILES, required=True)
     install.add_argument("--version", required=True)
-    install.add_argument(
-        "--manifest-url",
-        help="HTTP(S) URL, local path, or template containing {version} and {profile}",
+    _add_source_arguments(
+        install,
+        help_text=(
+            "install source: a mirror directory produced by 'fetch', a manifest.json "
+            "path, an HTTP(S) URL, or a template containing {version} and {profile}. "
+            "A local source installs with no network access at all."
+        ),
+    )
+
+    fetch = commands.add_parser(
+        "fetch",
+        help="mirror a release to a local directory without installing it",
+    )
+    fetch.add_argument("--profile", choices=DATASET_PROFILES, required=True)
+    fetch.add_argument("--version", required=True)
+    fetch.add_argument(
+        "--dest",
+        type=Path,
+        required=True,
+        help="destination directory; install it later with 'install --from <dest>'",
+    )
+    _add_source_arguments(
+        fetch,
+        help_text="release source (defaults to the published immutable release)",
     )
 
     commands.add_parser("status", help="show active and retained versions")
@@ -70,9 +120,9 @@ def build_parser() -> argparse.ArgumentParser:
         choices=DATASET_PROFILES,
         help="installed profile (normally detected from activation/manifest metadata)",
     )
-    repair.add_argument(
-        "--manifest-url",
-        help="optional pinned manifest URL/path if the installed manifest is damaged",
+    _add_source_arguments(
+        repair,
+        help_text="optional pinned source if the installed manifest is damaged",
     )
 
     rollback = commands.add_parser("rollback", help="activate the retained previous version")
@@ -110,12 +160,27 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     lifecycle = DatasetLifecycle(args.data_dir)
     if args.command == "install":
         source = _manifest_source(
-            args.manifest_url,
+            _resolved_source(args),
             version=args.version,
             profile=args.profile,
         )
         return (
             lifecycle.install(source, profile=args.profile, version=args.version),
+            0,
+        )
+    if args.command == "fetch":
+        source = _manifest_source(
+            _resolved_source(args),
+            version=args.version,
+            profile=args.profile,
+        )
+        return (
+            lifecycle.fetch(
+                source,
+                profile=args.profile,
+                version=args.version,
+                dest=args.dest,
+            ),
             0,
         )
     if args.command == "status":
@@ -125,8 +190,9 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         result = lifecycle.verify(args.version)
         return result, 0 if result["ok"] else 1
     if args.command == "repair":
+        requested_source = _resolved_source(args)
         repair_source: str | None = None
-        if args.manifest_url:
+        if requested_source:
             version: str | None = args.version
             if version is None:
                 status = lifecycle.status()
@@ -139,7 +205,7 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 version=version,
                 requested=args.profile,
             )
-            repair_source = _manifest_source(args.manifest_url, version=version, profile=profile)
+            repair_source = _manifest_source(requested_source, version=version, profile=profile)
         return lifecycle.repair(version=args.version, manifest_source=repair_source), 0
     if args.command == "rollback":
         return lifecycle.rollback(args.version), 0
