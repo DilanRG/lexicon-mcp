@@ -27,8 +27,10 @@ from lexicon_mcp.pipeline.packs import (
 from lexicon_mcp.pipeline.release import load_sources, package_packs
 from lexicon_mcp.pipeline.transform import (
     PackResult,
+    SemanticPackResult,
     build_core_pack,
     build_lexical_pack,
+    build_semantic_pack,
     build_term_counts,
     language_sizes,
 )
@@ -89,6 +91,9 @@ def main() -> int:
     )
     parser.add_argument(
         "--skip-package", action="store_true", help="build packs but do not compress a release"
+    )
+    parser.add_argument(
+        "--skip-semantic", action="store_true", help="build lexical packs only"
     )
     args = parser.parse_args()
 
@@ -172,6 +177,32 @@ def main() -> int:
             flush=True,
         )
 
+    semantic_built: list[SemanticPackResult] = []
+    if not args.skip_semantic:
+        for language in semantic_languages(args.dataset):
+            pack_id = f"semantic-{language}"
+            if wanted is not None and pack_id not in wanted:
+                continue
+            started = time.monotonic()
+            print(f"building {pack_id} ...", flush=True)
+            result = build_semantic_pack(
+                args.dataset / "semantic",
+                packs_dir / pack_id,
+                language,
+                dataset_version=args.dataset_version,
+            )
+            semantic_built.append(result)
+            total = (
+                result.mapping.stat().st_size
+                + result.vectors.stat().st_size
+                + result.index.stat().st_size
+            )
+            print(
+                f"  {total / 1024**2:>10,.1f} MiB  terms {result.terms:>9,}"
+                f"  [{time.monotonic() - started:.1f}s]",
+                flush=True,
+            )
+
     summary = args.work / "build-report.json"
     summary.write_text(
         json.dumps(
@@ -187,6 +218,23 @@ def main() -> int:
                     "translations": item.translations,
                 }
                 for item in built
+            ]
+            + [
+                {
+                    "pack": f"semantic-{item.language}",
+                    "capability": "semantic",
+                    "languages": 1,
+                    "raw_bytes": (
+                        item.mapping.stat().st_size
+                        + item.vectors.stat().st_size
+                        + item.index.stat().st_size
+                    ),
+                    "terms": item.terms,
+                    "stubs": 0,
+                    "relations": 0,
+                    "translations": 0,
+                }
+                for item in semantic_built
             ],
             indent=2,
         ),
@@ -203,6 +251,7 @@ def main() -> int:
         repository=args.repository,
         tag=args.dataset_version,
         transformation_commit=args.transformation_commit,
+        semantic=semantic_built,
         sources=load_sources(args.dataset),
         source_dataset={
             "dataset_version": json.loads(
