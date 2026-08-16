@@ -108,19 +108,15 @@ Similarity = Annotated[
 
 
 def _open_active_dataset() -> LexiconService:
-    """Open whichever dataset layout is installed.
+    """Open the active schema-2 install.
 
-    A schema-2 install is served from its activation; anything else falls back
-    to the schema-1 path, so a data root written by an earlier release still
-    opens rather than failing on an unrecognised layout.
+    This release serves component datasets only. A schema-1 data root is
+    reported with its remedy rather than served, because keeping both query
+    surfaces alive would mean maintaining and testing two of everything for the
+    life of the project.
     """
 
-    try:
-        return LexiconService.from_components(ComponentLocator().active())
-    except RuntimeError as exc:
-        if "schema 1 layout" not in str(exc):
-            raise
-    return LexiconService.from_locator()
+    return LexiconService.from_components(ComponentLocator().active())
 
 
 class _LazyService:
