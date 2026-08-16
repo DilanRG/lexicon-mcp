@@ -380,8 +380,13 @@ class LexiconService:
         query resolves its connection here rather than assuming one exists.
         """
 
-        if self._router is None or language is None:
+        if self._router is None:
             return self._connection
+        if language is None:
+            raise RuntimeError(
+                "a schema-2 query must name its language; routing cannot guess "
+                "which pack holds a sense"
+            )
         connection = self._router.connection_for("lexical", language)
         if connection is None:
             raise LanguageNotInstalled(language)
@@ -662,6 +667,7 @@ class LexiconService:
                         "examples",
                         "example, position",
                         sense_id,
+                        language=language,
                         limit=examples_limit + 1,
                     )
                 ]
@@ -673,6 +679,7 @@ class LexiconService:
                         "pronunciations",
                         "ipa, region, position",
                         entry_id,
+                        language=language,
                         id_column="entry_id",
                         limit=pronunciations_limit + 1,
                     )
@@ -921,7 +928,35 @@ class LexiconService:
         source_sense_id: str | None,
         limit: int,
     ) -> list[dict[str, Any]]:
-        """Orient compact physical assertions around the requested source term."""
+        """Oriented assertions for one source term, ranked."""
+
+        return self._rank_oriented_relation_rows(
+            self._oriented_relation_rows(
+                word,
+                language,
+                relation_code,
+                target_language=target_language,
+                source_sense_id=source_sense_id,
+                limit=limit,
+            ),
+            limit=limit,
+        )
+
+    def _oriented_relation_rows(
+        self,
+        word: str,
+        language: str,
+        relation_code: int,
+        *,
+        target_language: str | None,
+        source_sense_id: str | None,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Orient compact physical assertions around the requested source term.
+
+        Deliberately unranked: callers that rank a merged set of their own must
+        not receive rows that were already ranked and truncated per source.
+        """
 
         forward_clauses = [
             "source.normalized_term = ?",
@@ -1107,7 +1142,28 @@ class LexiconService:
             item["relation_code"] = relation_code
             item["direction_code"] = _INVERSE_DIRECTION_CODES[int(item["direction_code"])]
             oriented.append(item)
-        return self._rank_oriented_relation_rows(oriented, limit=limit)
+        return oriented
+
+    @staticmethod
+    def _source_prefetch_key(item: Mapping[str, Any]) -> tuple[Any, ...]:
+        """Mirror the batched statement's source_prefetch_rank ordering."""
+
+        normalized = str(item["target_normalized"])
+        return (
+            1
+            if item["source_sense_id"] is None and item["target_sense_id"] is None
+            else 0,
+            1 if item["target_sense_id"] is None else 0,
+            normalized.count(" "),
+            len(normalized),
+            str(item["target_language"]),
+            normalized,
+            str(item["target_term"]),
+            str(item["source_sense_id"] or ""),
+            str(item["target_sense_id"] or ""),
+            int(item["provenance_id"]),
+            int(item["direction_code"]),
+        )
 
     @staticmethod
     def _relation_row_rank_key(item: Mapping[str, Any]) -> tuple[Any, ...]:
@@ -1175,19 +1231,65 @@ class LexiconService:
             return []
 
         by_source: dict[tuple[str, str], list[dict[str, Any]]] = {}
-        for offset in range(0, len(unique_sources), _RELATION_BATCH_SOURCE_LIMIT):
-            batch = unique_sources[offset : offset + _RELATION_BATCH_SOURCE_LIMIT]
-            for item in self._batched_relation_rows(
-                batch,
-                relation_code,
-                target_language=target_language,
-                per_orientation_limit=branch_limit,
-            ):
+        if self._router is not None:
+            # A frontier spans languages, and each language lives in a different
+            # pack, so the batch is routed per source rather than issued as one
+            # statement. Pack queries are far cheaper than the monolith's, which
+            # more than pays for losing the batching.
+            # Mirror the batched statement exactly: each orientation is bounded
+            # independently by source_prefetch_rank at a prefetch limit, and the
+            # two are appended forward-first. Bounding the merged set instead
+            # changes which second-hop candidates survive.
+            prefetch_limit = min(128, max(32, branch_limit * 4))
+            batched: list[dict[str, Any]] = []
+            for normalized, source_language in unique_sources:
+                pack_connection = self._router.connection_for("lexical", source_language)
+                if pack_connection is None:
+                    continue
+                for reverse in (False, True):
+                    code = (
+                        _INVERSE_RELATION_CODES[relation_code] if reverse else relation_code
+                    )
+                    rows = [
+                        dict(row)
+                        for row in pack_relation_rows(
+                            pack_connection,
+                            word=normalized,
+                            language=source_language,
+                            relation_code=code,
+                            limit=prefetch_limit,
+                            reverse=reverse,
+                            target_language=target_language,
+                        )
+                    ]
+                    for item in rows:
+                        item["relation_code"] = relation_code
+                        if reverse:
+                            item["direction_code"] = _INVERSE_DIRECTION_CODES[
+                                int(item["direction_code"])
+                            ]
+                    rows.sort(key=self._source_prefetch_key)
+                    batched.extend(rows[:prefetch_limit])
+            for item in batched:
                 identity = (
                     str(item["source_normalized"]),
                     str(item["source_language"]),
                 )
                 by_source.setdefault(identity, []).append(item)
+        else:
+            for offset in range(0, len(unique_sources), _RELATION_BATCH_SOURCE_LIMIT):
+                batch = unique_sources[offset : offset + _RELATION_BATCH_SOURCE_LIMIT]
+                for item in self._batched_relation_rows(
+                    batch,
+                    relation_code,
+                    target_language=target_language,
+                    per_orientation_limit=branch_limit,
+                ):
+                    identity = (
+                        str(item["source_normalized"]),
+                        str(item["source_language"]),
+                    )
+                    by_source.setdefault(identity, []).append(item)
 
         ranked: list[dict[str, Any]] = []
         for source in unique_sources:
@@ -1766,7 +1868,10 @@ class LexiconService:
             translations: list[dict[str, Any]] = []
             seen_in_sense: set[tuple[str, str]] = set()
             for item in self._translation_rows(
-                row_sense_id, target_language=target_language, limit=limit
+                row_sense_id,
+                target_language=target_language,
+                limit=limit,
+                language=source_language,
             ):
                 identity = (
                     str(item["normalized_term"]),

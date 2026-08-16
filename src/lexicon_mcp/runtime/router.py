@@ -201,11 +201,15 @@ class PackRouter:
     def _open_read_only(path: Path) -> sqlite3.Connection:
         # Store objects are immutable by construction -- their name is their
         # content hash -- so immutable=1 is accurate and skips locking entirely.
-        return sqlite3.connect(
+        connection = sqlite3.connect(
             f"file:{path.as_posix()}?mode=ro&immutable=1",
             uri=True,
             check_same_thread=False,
         )
+        # Callers index rows by column name, exactly as they do against a
+        # monolith, so a pack connection must be configured the same way.
+        connection.row_factory = sqlite3.Row
+        return connection
 
     @property
     def open_pack_count(self) -> int:
