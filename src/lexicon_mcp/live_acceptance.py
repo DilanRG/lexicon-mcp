@@ -399,17 +399,46 @@ def inventory_diff(
     }
 
 
+def _creation_ticks(value: str) -> int | None:
+    """Extract a comparable timestamp from a process creation time."""
+
+    digits = "".join(character for character in value if character.isdigit())
+    return int(digits) if digits else None
+
+
 def _descendants(root_pid: int, processes: Sequence[ProcessRecord]) -> tuple[ProcessRecord, ...]:
+    """Walk real children only.
+
+    Windows never clears a process's recorded parent PID when the parent dies,
+    and it recycles PIDs. An unrelated orphan whose long-dead parent's PID was
+    later reused therefore looks like a descendant -- which is how an
+    acceptance run came to report Zen Browser and svchost as surviving MCPO
+    children. A genuine child cannot predate its parent, so links that run
+    backwards in time are not followed.
+    """
+
     by_parent: dict[int, list[ProcessRecord]] = {}
     for process in processes:
         by_parent.setdefault(process.parent_pid, []).append(process)
+    by_pid = {process.pid: process for process in processes}
     found: list[ProcessRecord] = []
     pending = [root_pid]
     seen = {root_pid}
     while pending:
         parent = pending.pop()
+        parent_record = by_pid.get(parent)
+        parent_ticks = (
+            _creation_ticks(parent_record.creation_time) if parent_record else None
+        )
         for child in by_parent.get(parent, []):
             if child.pid in seen:
+                continue
+            child_ticks = _creation_ticks(child.creation_time)
+            if (
+                parent_ticks is not None
+                and child_ticks is not None
+                and child_ticks < parent_ticks
+            ):
                 continue
             seen.add(child.pid)
             found.append(child)
