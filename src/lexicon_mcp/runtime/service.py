@@ -1293,6 +1293,7 @@ class LexiconService:
                             limit=prefetch_limit,
                             reverse=reverse,
                             target_language=target_language,
+                            prefetch_order=True,
                         )
                     ]
                     for item in rows:
@@ -1301,8 +1302,7 @@ class LexiconService:
                             item["direction_code"] = _INVERSE_DIRECTION_CODES[
                                 int(item["direction_code"])
                             ]
-                    rows.sort(key=self._source_prefetch_key)
-                    batched.extend(rows[:prefetch_limit])
+                    batched.extend(rows)
             for item in batched:
                 identity = (
                     str(item["source_normalized"]),

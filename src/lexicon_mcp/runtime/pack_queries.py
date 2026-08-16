@@ -65,11 +65,31 @@ _RELATION_ORDER = """
     LIMIT ?
 """
 
+# The batched multi-hop path bounds each source by this ordering, not by the
+# ranking used for a direct query. Truncating by the wrong one selects different
+# rows, so the ordering has to be applied in SQL rather than after the LIMIT.
+_PREFETCH_ORDER = """
+    ORDER BY CASE
+                 WHEN source_sense_id IS NULL AND target_sense_id IS NULL THEN 1
+                 ELSE 0
+             END,
+             CASE WHEN target_sense_id IS NULL THEN 1 ELSE 0 END,
+             (LENGTH(target_normalized) -
+              LENGTH(REPLACE(target_normalized, ' ', ''))),
+             LENGTH(target_normalized), target_language,
+             target_normalized, target_term,
+             source_sense_id, target_sense_id,
+             provenance_id, direction_code
+    LIMIT ?
+"""
+
+
 def _relation_sql(
     *,
     reverse: bool,
     target_language: bool,
     sense_filter: bool,
+    prefetch_order: bool = False,
 ) -> str:
     """Build the relation query for one orientation and filter combination.
 
@@ -143,7 +163,7 @@ WITH candidates AS (
     WHERE {" AND ".join(clauses)}
 )
 SELECT * FROM candidates
-{_RELATION_ORDER}
+{_PREFETCH_ORDER if prefetch_order else _RELATION_ORDER}
 """
 
 
@@ -157,13 +177,19 @@ def relation_rows(
     reverse: bool = False,
     target_language: str | None = None,
     sense_id: str | None = None,
+    prefetch_order: bool = False,
 ) -> list[sqlite3.Row]:
-    """Direct relations for a word, resolved entirely within one pack."""
+    """Direct relations for a word, resolved entirely within one pack.
+
+    ``prefetch_order`` selects the ordering the batched multi-hop path bounds
+    by, which differs from the ordering a direct query ranks by.
+    """
 
     sql = _relation_sql(
         reverse=reverse,
         target_language=target_language is not None,
         sense_filter=sense_id is not None,
+        prefetch_order=prefetch_order,
     )
     parameters: list[Any] = [word, language, relation_code]
     if target_language is not None:
