@@ -1,0 +1,1502 @@
+[
+  {
+    "pack": "core",
+    "capability": "core",
+    "languages": 0,
+    "raw_bytes": 204800,
+    "terms": 0,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-en",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 2156011520,
+    "terms": 1985802,
+    "stubs": 5102203,
+    "relations": 10575211,
+    "translations": 3549954
+  },
+  {
+    "pack": "lexical-fr",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 536981504,
+    "terms": 1548392,
+    "stubs": 838395,
+    "relations": 4245700,
+    "translations": 1
+  },
+  {
+    "pack": "lexical-la",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 446689280,
+    "terms": 900179,
+    "stubs": 110990,
+    "relations": 418663,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-es",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 420786176,
+    "terms": 862893,
+    "stubs": 165697,
+    "relations": 489254,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-de",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 377409536,
+    "terms": 756223,
+    "stubs": 554248,
+    "relations": 1715170,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-it",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 325996544,
+    "terms": 660656,
+    "stubs": 179323,
+    "relations": 620703,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-ru",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 298164224,
+    "terms": 588111,
+    "stubs": 114777,
+    "relations": 420669,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-pt",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 272273408,
+    "terms": 523737,
+    "stubs": 116617,
+    "relations": 380318,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-zh",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 407998464,
+    "terms": 473560,
+    "stubs": 143662,
+    "relations": 832450,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-ja",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 208080896,
+    "terms": 402820,
+    "stubs": 413961,
+    "relations": 1400856,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-fi",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 199774208,
+    "terms": 390977,
+    "stubs": 155278,
+    "relations": 565862,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-sv",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 160780288,
+    "terms": 374025,
+    "stubs": 113150,
+    "relations": 264568,
+    "translations": 1
+  },
+  {
+    "pack": "lexical-pl",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 156098560,
+    "terms": 257825,
+    "stubs": 87510,
+    "relations": 204181,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-ca",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 117809152,
+    "terms": 256681,
+    "stubs": 92423,
+    "relations": 196947,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-bg",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 72335360,
+    "terms": 253463,
+    "stubs": 45903,
+    "relations": 223706,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-nl",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 118607872,
+    "terms": 249800,
+    "stubs": 136836,
+    "relations": 509079,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-gl",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 106164224,
+    "terms": 244361,
+    "stubs": 43156,
+    "relations": 87628,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-eo",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 74461184,
+    "terms": 197413,
+    "stubs": 57610,
+    "relations": 172262,
+    "translations": 1
+  },
+  {
+    "pack": "lexical-ro",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 69378048,
+    "terms": 156329,
+    "stubs": 51513,
+    "relations": 119636,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-el",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 66465792,
+    "terms": 153099,
+    "stubs": 54635,
+    "relations": 136323,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-lv",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 74350592,
+    "terms": 145135,
+    "stubs": 30592,
+    "relations": 90804,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-cmn",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 44863488,
+    "terms": 144016,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-sh",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 51625984,
+    "terms": 140497,
+    "stubs": 54959,
+    "relations": 138016,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-hu",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 58023936,
+    "terms": 131868,
+    "stubs": 60335,
+    "relations": 143944,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-cs",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 57114624,
+    "terms": 129098,
+    "stubs": 75883,
+    "relations": 229079,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-ar",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 54685696,
+    "terms": 126272,
+    "stubs": 54457,
+    "relations": 127506,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-uk",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 51589120,
+    "terms": 124048,
+    "stubs": 36770,
+    "relations": 52087,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-mul",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 50126848,
+    "terms": 110999,
+    "stubs": 19439,
+    "relations": 42728,
+    "translations": 1523
+  },
+  {
+    "pack": "lexical-th",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 43913216,
+    "terms": 106040,
+    "stubs": 74704,
+    "relations": 156352,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-ms",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 31870976,
+    "terms": 105670,
+    "stubs": 67233,
+    "relations": 230694,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-sl",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 18096128,
+    "terms": 105166,
+    "stubs": 27429,
+    "relations": 119786,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-grc",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 63115264,
+    "terms": 95220,
+    "stubs": 41050,
+    "relations": 96728,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-ko",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 58220544,
+    "terms": 94291,
+    "stubs": 42504,
+    "relations": 82973,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-da",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 37675008,
+    "terms": 91909,
+    "stubs": 51835,
+    "relations": 102849,
+    "translations": 1
+  },
+  {
+    "pack": "lexical-mk",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 41205760,
+    "terms": 87967,
+    "stubs": 27553,
+    "relations": 58557,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-nb",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 37011456,
+    "terms": 83657,
+    "stubs": 0,
+    "relations": 470,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-tr",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 35184640,
+    "terms": 82932,
+    "stubs": 48379,
+    "relations": 91018,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-vi",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 45424640,
+    "terms": 80146,
+    "stubs": 47658,
+    "relations": 112742,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-ang",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 44666880,
+    "terms": 72799,
+    "stubs": 24025,
+    "relations": 54237,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-se",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 12804096,
+    "terms": 70815,
+    "stubs": 10001,
+    "relations": 86136,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-fa",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 29855744,
+    "terms": 66494,
+    "stubs": 53446,
+    "relations": 102375,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-nn",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 28409856,
+    "terms": 65834,
+    "stubs": 0,
+    "relations": 404,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-no",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 13950976,
+    "terms": 61327,
+    "stubs": 57164,
+    "relations": 138125,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-is",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 23130112,
+    "terms": 60894,
+    "stubs": 34245,
+    "relations": 104130,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-eu",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 20434944,
+    "terms": 59460,
+    "stubs": 42186,
+    "relations": 78417,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-lt",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 21454848,
+    "terms": 59247,
+    "stubs": 29872,
+    "relations": 45587,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-ga",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 28389376,
+    "terms": 55899,
+    "stubs": 32360,
+    "relations": 79920,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-enm",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 28504064,
+    "terms": 55375,
+    "stubs": 13707,
+    "relations": 30656,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-hi",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 38387712,
+    "terms": 55300,
+    "stubs": 24543,
+    "relations": 56300,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-he",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 19468288,
+    "terms": 51906,
+    "stubs": 38874,
+    "relations": 68030,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-tl",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 33406976,
+    "terms": 51572,
+    "stubs": 0,
+    "relations": 524,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-sk",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 16261120,
+    "terms": 49241,
+    "stubs": 27742,
+    "relations": 46053,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-id",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 28176384,
+    "terms": 48475,
+    "stubs": 0,
+    "relations": 634,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-be",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 12165120,
+    "terms": 48205,
+    "stubs": 20897,
+    "relations": 32139,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-ka",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 23560192,
+    "terms": 47391,
+    "stubs": 33963,
+    "relations": 59529,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-cy",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 21430272,
+    "terms": 45712,
+    "stubs": 19946,
+    "relations": 34198,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-sq",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 17707008,
+    "terms": 41793,
+    "stubs": 20512,
+    "relations": 49430,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-hy",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 25923584,
+    "terms": 41565,
+    "stubs": 35707,
+    "relations": 70997,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-ast",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 18362368,
+    "terms": 41527,
+    "stubs": 10096,
+    "relations": 18857,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-et",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 12271616,
+    "terms": 39817,
+    "stubs": 30100,
+    "relations": 47221,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-io",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 14229504,
+    "terms": 38849,
+    "stubs": 31238,
+    "relations": 56682,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-az",
+    "capability": "lexical",
+    "languages": 1,
+    "raw_bytes": 13459456,
+    "terms": 33888,
+    "stubs": 17528,
+    "relations": 26419,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-bundle-001",
+    "capability": "lexical",
+    "languages": 10,
+    "raw_bytes": 111861760,
+    "terms": 275489,
+    "stubs": 75541,
+    "relations": 321121,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-bundle-002",
+    "capability": "lexical",
+    "languages": 13,
+    "raw_bytes": 116375552,
+    "terms": 278146,
+    "stubs": 85503,
+    "relations": 340209,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-bundle-003",
+    "capability": "lexical",
+    "languages": 18,
+    "raw_bytes": 104660992,
+    "terms": 269516,
+    "stubs": 77313,
+    "relations": 267944,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-bundle-004",
+    "capability": "lexical",
+    "languages": 27,
+    "raw_bytes": 119771136,
+    "terms": 267945,
+    "stubs": 67011,
+    "relations": 233840,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-bundle-005",
+    "capability": "lexical",
+    "languages": 46,
+    "raw_bytes": 108040192,
+    "terms": 264727,
+    "stubs": 54570,
+    "relations": 213116,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-bundle-006",
+    "capability": "lexical",
+    "languages": 88,
+    "raw_bytes": 120508416,
+    "terms": 263657,
+    "stubs": 53145,
+    "relations": 213165,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-bundle-007",
+    "capability": "lexical",
+    "languages": 291,
+    "raw_bytes": 111652864,
+    "terms": 262259,
+    "stubs": 35786,
+    "relations": 109602,
+    "translations": 0
+  },
+  {
+    "pack": "lexical-bundle-008",
+    "capability": "lexical",
+    "languages": 4953,
+    "raw_bytes": 59359232,
+    "terms": 147578,
+    "stubs": 3830,
+    "relations": 7837,
+    "translations": 808
+  },
+  {
+    "pack": "wordplay-en",
+    "capability": "wordplay",
+    "languages": 1,
+    "raw_bytes": 315887616,
+    "terms": 1985802,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 135164
+  },
+  {
+    "pack": "semantic-af",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 19134592,
+    "terms": 16132,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-ang",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 18532032,
+    "terms": 15700,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-ar",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 103990232,
+    "terms": 85325,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-ast",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 34004884,
+    "terms": 28401,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-az",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 20689168,
+    "terms": 17184,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-be",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 27765876,
+    "terms": 22117,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-bg",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 224657768,
+    "terms": 178508,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-ca",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 105154104,
+    "terms": 87508,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-cs",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 106122708,
+    "terms": 88613,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-cy",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 22344548,
+    "terms": 18721,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-da",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 68317168,
+    "terms": 57119,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-de",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 720994164,
+    "terms": 594456,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-el",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 82612548,
+    "terms": 65905,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-en",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 620897460,
+    "terms": 516782,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-eo",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 114771840,
+    "terms": 96255,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-es",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 786026380,
+    "terms": 651859,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-et",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 31805744,
+    "terms": 26525,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-eu",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 53112628,
+    "terms": 44151,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-fa",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 66890688,
+    "terms": 53984,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-fi",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 323614764,
+    "terms": 267307,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-fil",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 30056492,
+    "terms": 25088,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-fo",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 19107860,
+    "terms": 15973,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-fr",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 1682609800,
+    "terms": 1388686,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-fro",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 25228676,
+    "terms": 21249,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-ga",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 44513948,
+    "terms": 36988,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-gd",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 20230376,
+    "terms": 16827,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-gl",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 70833360,
+    "terms": 59006,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-grc",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 45755772,
+    "terms": 36977,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-gv",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 10108036,
+    "terms": 8425,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-he",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 41041448,
+    "terms": 33435,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-hi",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 30140664,
+    "terms": 23538,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-hsb",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 30193568,
+    "terms": 24852,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-hu",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 89581968,
+    "terms": 74384,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-hy",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 37362140,
+    "terms": 29844,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-io",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 29737856,
+    "terms": 25004,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-is",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 58368248,
+    "terms": 48639,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-it",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 672784756,
+    "terms": 557743,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-ja",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 312848308,
+    "terms": 256648,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-ka",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 42670004,
+    "terms": 32338,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-kk",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 21257484,
+    "terms": 16979,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-ko",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 50772880,
+    "terms": 42106,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-ku",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 16738524,
+    "terms": 13804,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-la",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 1028760268,
+    "terms": 855294,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-lt",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 34755920,
+    "terms": 28826,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-lv",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 43661256,
+    "terms": 36333,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-mg",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 32338464,
+    "terms": 26865,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-mk",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 41506000,
+    "terms": 33370,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-ms",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 109436652,
+    "terms": 90554,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-mul",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 23222444,
+    "terms": 19376,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-nl",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 229144168,
+    "terms": 190221,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-no",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 126599436,
+    "terms": 105689,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-non",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 10142000,
+    "terms": 8536,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-nrf",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 12104620,
+    "terms": 10048,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-nv",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 10094960,
+    "terms": 8232,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-oc",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 31110996,
+    "terms": 26095,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-pl",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 184261876,
+    "terms": 152949,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-pt",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 316929304,
+    "terms": 262904,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-ro",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 61701156,
+    "terms": 51437,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-ru",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 572414312,
+    "terms": 455325,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-rup",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 6115624,
+    "terms": 5107,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-sa",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 13940900,
+    "terms": 11081,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-se",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 81665028,
+    "terms": 67601,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-sh",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 80118644,
+    "terms": 66746,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-sk",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 35292424,
+    "terms": 29376,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-sl",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 109248280,
+    "terms": 91134,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-sq",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 24484264,
+    "terms": 20493,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-sv",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 202114900,
+    "terms": 167321,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-sw",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 13375524,
+    "terms": 11150,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-ta",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 17151736,
+    "terms": 12690,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-te",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 28709008,
+    "terms": 22173,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-th",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 130259808,
+    "terms": 95342,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-tr",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 62053904,
+    "terms": 51308,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-uk",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 46589184,
+    "terms": 36851,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-ur",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 14793444,
+    "terms": 12006,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-vi",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 48175824,
+    "terms": 39802,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-vo",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 15261160,
+    "terms": 12731,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-xcl",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 22972384,
+    "terms": 18420,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  },
+  {
+    "pack": "semantic-zh",
+    "capability": "semantic",
+    "languages": 1,
+    "raw_bytes": 369857772,
+    "terms": 307441,
+    "stubs": 0,
+    "relations": 0,
+    "translations": 0
+  }
+]

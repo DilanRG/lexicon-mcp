@@ -1,0 +1,14 @@
+{
+  "ann_ok": true,
+  "clean_install_ok": true,
+  "completed_at": "2026-08-16T05:40:53.293968+00:00",
+  "dataset_version": "data-v2.0.0",
+  "full_corpus_ok": true,
+  "manifest_sha256": "87c3e5900e6fd1c34492e02337c92c54fa9954f382204cd6c8ec2196a593486a",
+  "offline_runtime_ok": true,
+  "performance_ok": true,
+  "runtime_commit": "a321bb59d4a2b80faad3bfbf93082fa3aacdccd2",
+  "schema_version": 1,
+  "transformation_commit": "f15b40e1bb5c5b6ec61fe08a98d2ed37d74ae67d",
+  "verify_ok": true
+}
