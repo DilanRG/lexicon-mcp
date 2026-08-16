@@ -10,6 +10,7 @@ from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
 from .runtime import LexiconService
+from .runtime.locator import ComponentLocator
 from .runtime.offline import install_network_guard
 
 Relation = Literal[
@@ -106,6 +107,22 @@ Similarity = Annotated[
 ]
 
 
+def _open_active_dataset() -> LexiconService:
+    """Open whichever dataset layout is installed.
+
+    A schema-2 install is served from its activation; anything else falls back
+    to the schema-1 path, so a data root written by an earlier release still
+    opens rather than failing on an unrecognised layout.
+    """
+
+    try:
+        return LexiconService.from_components(ComponentLocator().active())
+    except RuntimeError as exc:
+        if "schema 1 layout" not in str(exc):
+            raise
+    return LexiconService.from_locator()
+
+
 class _LazyService:
     def __init__(self, service: LexiconService | None = None) -> None:
         self._service = service
@@ -114,7 +131,7 @@ class _LazyService:
     def get(self) -> LexiconService:
         with self._lock:
             if self._service is None:
-                self._service = LexiconService.from_locator()
+                self._service = _open_active_dataset()
             return self._service
 
 

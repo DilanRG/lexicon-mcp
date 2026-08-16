@@ -344,9 +344,30 @@ class LexiconService:
             )
 
     def _supports_languages(self, *languages: str | None) -> bool:
+        if self._router is not None:
+            # A schema-2 install serves the languages it installed. The source
+            # language must be present; a target language is a filter, and a
+            # missing one is reported by the caller rather than refused here.
+            source = next((item for item in languages if item is not None), None)
+            if source is None:
+                return True
+            return self._router.availability("lexical", source).installed
         return self.dataset_profile != "english" or all(
             language is None or language == "en" for language in languages
         )
+
+    def _language_unavailable_reason(self, *languages: str | None) -> str:
+        """Why the request cannot be served, in the shared vocabulary."""
+
+        if self._router is None:
+            return "english_profile_supports_only_en"
+        for language in languages:
+            if language is None:
+                continue
+            availability = self._router.availability("lexical", language)
+            if not availability.installed:
+                return availability.reason
+        return "language_not_installed"
 
     def _unsupported_language_response(
         self,
@@ -357,7 +378,17 @@ class LexiconService:
     ) -> dict[str, Any]:
         response = self._response(response_type, query, [])
         response["available"] = False
-        response["unavailable_reason"] = "english_profile_supports_only_en"
+        response["unavailable_reason"] = self._language_unavailable_reason(
+            *(
+                value
+                for key, value in query.items()
+                if key.endswith("language") and isinstance(value, str)
+            )
+        )
+        if self._router is not None:
+            response["installed_languages"] = list(
+                self._router.installed_languages("lexical")
+            )
         if candidate_count:
             response["candidate_count"] = 0
         return response
