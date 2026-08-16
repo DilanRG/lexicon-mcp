@@ -33,7 +33,7 @@ from .lifecycle import (
     default_data_root,
 )
 from .locking import InstallationLock
-from .manifest import DatasetManifest, safe_identifier
+from .manifest import DatasetManifest, safe_identifier, safe_version
 from .selection import Selection, resolve
 from .store import ComponentStore
 
@@ -383,6 +383,7 @@ class ComponentLifecycle:
 
             previous = self._active_id()
             reused = previous == activation.activation_id
+            self._retain_manifest(manifest)
             self._write_activation(activation)
             self._write_pointer(activation, previous=previous)
         return {
@@ -413,6 +414,31 @@ class ComponentLifecycle:
                 f"install requires {required + margin} free bytes "
                 f"({required} payload + {margin} reserve), but {free} are available"
             )
+
+    def manifest_path(self, dataset_version: str) -> Path:
+        return self.root / "manifests" / f"{safe_version(dataset_version)}.json"
+
+    def _retain_manifest(self, manifest: DatasetManifest) -> None:
+        """Keep the manifest an install came from.
+
+        Releases are immutable, so this is a faithful record of what was
+        installed -- and it is what lets provenance be read back without asking
+        the caller to supply the release again.
+        """
+
+        path = self.manifest_path(manifest.dataset_version)
+        if path.is_file() and path.read_bytes() == manifest.raw:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            with temporary.open("xb") as stream:
+                stream.write(manifest.raw)
+                stream.flush()
+                os.fsync(stream.fileno())
+            _atomic_replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def _write_activation(self, activation: Activation) -> None:
         path = self.activation_path(activation.activation_id)

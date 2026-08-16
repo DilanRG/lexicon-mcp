@@ -800,12 +800,31 @@ class LiveAcceptanceRunner:
         )
 
     def _wait_old_tree_exit(self, tree: ProcessTree) -> None:
-        expected_absent = tree.pids
+        # Identity, not PID: Windows recycles PIDs, and a reused one belongs to
+        # an unrelated process. Descending by PID after the root has exited
+        # reported csrss and svchost as MCPO children on a busy machine.
+        expected_absent = {tree.root.identity} | {
+            item.identity for item in tree.descendants
+        }
 
         def exited() -> bool:
             processes = self.host.process_table()
-            present = sorted(expected_absent.intersection(item.pid for item in processes))
-            late_descendants = [item.pid for item in _descendants(tree.root.pid, processes)]
+            alive = {item.identity: item for item in processes}
+            present = sorted(
+                alive[identity].pid for identity in expected_absent if identity in alive
+            )
+            # A descendant only counts if it is recognisably one of ours.
+            # After the root's PID is recycled, unrelated system processes
+            # inherit it as their parent and would otherwise be reported.
+            late_descendants = [
+                item.pid
+                for item in _descendants(tree.root.pid, processes)
+                if _process_has_marker(item, self.config.mcpo_command_marker)
+                or any(
+                    _process_has_marker(item, marker)
+                    for marker in self.config.required_child_markers
+                )
+            ]
             remaining = sorted(set(present).union(late_descendants))
             if remaining:
                 raise AcceptanceFailure(f"old MCPO process tree still alive: {remaining}")
@@ -1784,6 +1803,8 @@ def _read_installation(data_root: Path) -> Installation:
         ) from exc
     if not isinstance(pointer, dict):
         raise AcceptanceFailure("active dataset pointer is not an object")
+    if pointer.get("schema_version") == 2:
+        return _read_component_installation(data_root, pointer)
     version = pointer.get("version")
     relative_path = pointer.get("path")
     if not isinstance(version, str) or not isinstance(relative_path, str):
@@ -1804,6 +1825,47 @@ def _read_installation(data_root: Path) -> Installation:
     return Installation(
         version=version,
         path=active_path,
+        manifest_sha256=hashlib.sha256(raw).hexdigest(),
+        transformation_commit=manifest.transformation_commit,
+        manifest_size=len(raw),
+    )
+
+
+def _read_component_installation(data_root: Path, pointer: Mapping[str, Any]) -> Installation:
+    """Resolve a schema-2 install.
+
+    There is no per-version directory here: components live in the content
+    store and the manifest is retained beside the activations, which is where
+    the release provenance is read from.
+    """
+
+    version = pointer.get("dataset_version")
+    activation_id = pointer.get("activation_id")
+    if not isinstance(version, str) or not isinstance(activation_id, str):
+        raise AcceptanceFailure("active dataset pointer has no valid version/activation")
+    activation_path = (data_root / "activations" / f"{activation_id}.json").resolve()
+    if not activation_path.is_file():
+        raise AcceptanceFailure(f"activation record is missing: {activation_path}")
+    # The acceptance inventories the installed content to prove it never
+    # changes during the run. Schema 1 points at a version directory; the
+    # equivalent here is the component store, which holds the artifacts
+    # themselves rather than the record naming them.
+    content_path = (data_root / "components").resolve()
+    if not content_path.is_dir():
+        raise AcceptanceFailure(f"component store is missing: {content_path}")
+    manifest_path = (data_root / "manifests" / f"{version}.json").resolve()
+    try:
+        raw = manifest_path.read_bytes()
+        manifest = parse_manifest(raw)
+    except (OSError, ValueError) as exc:
+        raise AcceptanceFailure(
+            f"cannot parse retained manifest {manifest_path}: {exc}"
+        ) from exc
+    if manifest.dataset_version != version:
+        raise AcceptanceFailure("current.json and retained manifest versions differ")
+    return Installation(
+        version=version,
+        path=content_path,
         manifest_sha256=hashlib.sha256(raw).hexdigest(),
         transformation_commit=manifest.transformation_commit,
         manifest_size=len(raw),
