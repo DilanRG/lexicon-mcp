@@ -602,3 +602,46 @@ def test_wordplay_pack_rebuilds_its_contentless_search_index(tmp_path: Path) -> 
 
     hits = read(result.path, "SELECT rowid FROM wordplay_fts WHERE wordplay_fts MATCH 'stop'")
     assert hits == [(1,)]
+
+
+def test_wordplay_pack_carries_the_index_version_the_runtime_pins(
+    tmp_path: Path,
+) -> None:
+    """The runtime refuses a wordplay database that cannot identify its index."""
+
+    from lexicon_mcp.pipeline.transform import build_wordplay_pack
+
+    corpus = wordplay_corpus(tmp_path)
+    connection = sqlite3.connect(corpus)
+    connection.execute("INSERT OR REPLACE INTO metadata VALUES ('wordplay_index_version','1')")
+    connection.execute("INSERT OR REPLACE INTO metadata VALUES ('wordplay.palindromes','1')")
+    connection.commit()
+    connection.close()
+
+    result = build_wordplay_pack(
+        corpus, tmp_path / "wordplay-en.sqlite3", dataset_version=VERSION
+    )
+
+    metadata = dict(read(result.path, "SELECT key, value FROM metadata"))
+    assert metadata["wordplay_index_version"] == "1"
+    assert metadata["wordplay.palindromes"] == "1"
+
+
+def test_wordplay_pack_carries_sense_and_provenance_context(tmp_path: Path) -> None:
+    """Results name their source, so the pack needs the tables behind that."""
+
+    from lexicon_mcp.pipeline.transform import build_wordplay_pack
+
+    corpus = wordplay_corpus(tmp_path)
+    connection = sqlite3.connect(corpus)
+    connection.execute("INSERT INTO lexical_entries VALUES ('e1',1,'noun',NULL,1)")
+    connection.execute("INSERT INTO senses VALUES ('s1','e1','to halt')")
+    connection.commit()
+    connection.close()
+
+    result = build_wordplay_pack(
+        corpus, tmp_path / "wordplay-en.sqlite3", dataset_version=VERSION
+    )
+
+    assert read(result.path, "SELECT sense_id, gloss FROM senses") == [("s1", "to halt")]
+    assert read(result.path, "SELECT COUNT(*) FROM provenance") == [(1,)]

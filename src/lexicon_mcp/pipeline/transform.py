@@ -734,12 +734,21 @@ def build_wordplay_pack(
         }
         if not counts["wordplay_terms"]:
             raise TransformError(f"no wordplay indexes for {language!r} in the corpus")
+        # The runtime pins the wordplay index version, so carry it and the
+        # index statistics across rather than leaving the pack unidentifiable.
+        carried = dict(
+            db.execute(
+                "SELECT key, value FROM src.metadata WHERE key = 'wordplay_index_version'"
+                " OR key LIKE 'wordplay.%'"
+            ).fetchall()
+        )
         for key, value in (
             ("schema_version", str(DATASET_SCHEMA_VERSION)),
             ("dataset_version", dataset_version),
             ("pack_id", f"wordplay-{language}"),
             ("capability", "wordplay"),
             ("languages", language),
+            *sorted(carried.items()),
         ):
             db.execute("INSERT INTO metadata VALUES (?, ?)", (key, value))
         db.executescript(WORDPLAY_PACK_INDEXES)
