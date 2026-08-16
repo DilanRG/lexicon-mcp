@@ -117,19 +117,47 @@ diagnostic containing the exact `lexicon-data install` command.
 
 ## Dataset lifecycle
 
+Install only the languages and capabilities you want:
+
 ```powershell
-lexicon-data install --profile full --version data-v1.0.0
-lexicon-data install --profile english --version data-en-v1.0.0
+lexicon-data install --version data-v2.0.0 --languages en --capabilities lexical,semantic,wordplay
+lexicon-data install --version data-v2.0.0 --languages en,fr,de --capabilities lexical
+lexicon-data install --version data-v2.0.0 --all-languages
+
+lexicon-data languages           # coverage, and what this install serves
+lexicon-data add-language --version data-v2.0.0 --languages fr
+lexicon-data remove-language --version data-v2.0.0 --languages fr
 lexicon-data status
 lexicon-data verify
-lexicon-data repair
-lexicon-data rollback
+lexicon-data activate --activation <id>   # switch back to a retained selection
+lexicon-data prune                        # reclaim unreferenced components
 ```
 
-`LEXICON_DATA_DIR` selects the installation root. Releases are immutable and the
-active dataset is selected through an atomically replaced `current.json` pointer.
-Downloads resume into `.partial` files, are hash-checked before extraction, and are
-activated only after database/index integrity checks.
+The corpus carries **5,508 lexical languages**, of which 78 also have semantic
+vectors, and English additionally has pronunciation and wordplay indexes. Those
+are selected independently, so "every language, English vectors only" is a valid
+install. A selection is never silently narrowed: a language the release does not
+carry fails outright, while one that simply lacks the capability you asked for is
+reported alongside the install.
+
+Typical footprints:
+
+| Selection | Download | Installed |
+| --- | --- | --- |
+| English lexical | 0.60 GiB | 2.01 GiB |
+| English + semantic + wordplay | 1.11 GiB | 2.88 GiB |
+| All 5,508 lexical languages | 2.67 GiB | 8.24 GiB |
+
+`LEXICON_DATA_DIR` selects the installation root. Releases are immutable.
+Components are stored by content hash, so a component two selections share is
+held once, `add-language` fetches only what is genuinely new, and switching back
+to an earlier selection is a pointer swap rather than a re-download. Every
+mutation ends in an atomic swap, so an interrupted operation leaves the previous
+install exactly as it was. Downloads resume into `.partial` files and are
+hash-checked before anything is activated.
+
+Verification is scoped to what you installed rather than to the whole release,
+so a deliberately partial install is not reported as damaged.
 
 ### Air-gapped and mirrored installation
 
@@ -167,11 +195,25 @@ self-hosted mirror instead, publish the release with `base_url` set and point
 `--manifest-url` remains as a deprecated alias for `--from` and is removed in
 2.0.0.
 
-The `english` profile keeps only English lexical terms, English-to-English
-relations, CMUdict pronunciation data, and the English Numberbatch vectors. It
-stores one shared English semantic index instead of a global index plus a
-duplicate language shard. Cross-language calls return a typed unavailable
-response; the same six-tool MCP surface remains stable across profiles.
+### Asking for something you did not install
+
+A language you did not install is never confused with a word that does not
+exist. Every tool distinguishes these, and says which:
+
+| Reason | Meaning |
+| --- | --- |
+| `language_not_installed` | the corpus has it; install it and the query works |
+| `unknown_language` | the corpus never had it |
+| `capability_not_installed` | the language is installed, that capability was not selected |
+| `not_available_upstream` | the corpus has no such data for that language at all |
+
+Semantic search over a subset reports which languages it actually searched and
+whether the result was restricted, because an unrestricted search on a full
+corpus covers all 78 vector languages and on a subset covers what is installed.
+
+Relation results also mark whether a target's own entry is installed, so a
+translation into a language you do not have is still returned and still usable
+-- it simply cannot be expanded further.
 
 ## Corpus
 
