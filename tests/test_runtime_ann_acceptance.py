@@ -13,7 +13,11 @@ from lexicon_mcp.runtime.acceptance import (
     AcceptanceDatasetUnavailable,
     load_acceptance_dataset,
 )
-from lexicon_mcp.runtime.ann_validation import DEFAULT_LANGUAGES, validate_ann_acceptance
+from lexicon_mcp.runtime.ann_validation import (
+    DEFAULT_LANGUAGES,
+    validate_ann_acceptance,
+    validate_ann_acceptance_packs,
+)
 from lexicon_mcp.runtime.locator import ActiveDataset
 from lexicon_mcp.runtime.normalization import normalize_key
 from lexicon_mcp.runtime.offline import deny_network
@@ -110,23 +114,34 @@ def test_numberbatch_ann_recall_and_language_shards_offline() -> None:
     except AcceptanceDatasetUnavailable as exc:
         pytest.skip(str(exc))
 
+    # A schema-2 release ships one index per semantic language and no combined
+    # one, so the language shards are the whole of what queries run against.
+    components = getattr(dataset, "is_components", False)
     with deny_network():
-        report = validate_ann_acceptance(dataset)
+        report = (
+            validate_ann_acceptance_packs(dataset)
+            if components
+            else validate_ann_acceptance(dataset)
+        )
     print(report.to_json(), flush=True)
 
+    expected_scopes = {"language_shard"} if components else {"global", "language_shard"}
+    per_language = 10 if components else 20
+
     assert report.languages == DEFAULT_LANGUAGES
-    assert len(report.results) == 200
+    assert len(report.results) == 100 * len(expected_scopes)
     seed_scopes: dict[int, set[str]] = {}
     for result in report.results:
         seed_scopes.setdefault(result.seed_semantic_id, set()).add(result.index_scope)
     assert len(seed_scopes) == 100
-    assert all(scopes == {"global", "language_shard"} for scopes in seed_scopes.values())
+    assert all(scopes == expected_scopes for scopes in seed_scopes.values())
     assert all(
-        sum(result.language == language for result in report.results) == 20
+        sum(result.language == language for result in report.results) == per_language
         for language in DEFAULT_LANGUAGES
     )
-    assert sum(result.index_scope == "global" for result in report.results) == 100
     assert sum(result.index_scope == "language_shard" for result in report.results) == 100
+    if not components:
+        assert sum(result.index_scope == "global" for result in report.results) == 100
     assert all(result.deterministic for result in report.results)
     assert all(result.strict_language_filtering for result in report.results)
     assert all(len(result.ann_semantic_ids) == 20 for result in report.results)
@@ -150,28 +165,30 @@ def test_numberbatch_ann_recall_and_language_shards_offline() -> None:
         for result in report.results
     )
     evidence = report.to_evidence()
-    assert evidence["comparison_count"] == 200
+    assert evidence["comparison_count"] == 100 * len(expected_scopes)
     assert evidence["unique_seed_count"] == 100
-    assert evidence["global"]["comparison_count"] == 100
+    if not components:
+        assert evidence["global"]["comparison_count"] == 100
     assert evidence["language_shards"]["comparison_count"] == 100
     assert all(
         language_report["seed_count"] == 10
-        and language_report["comparison_count"] == 20
+        and language_report["comparison_count"] == per_language
         and language_report["deterministic"] is True
         and language_report["strict_language_filtering"] is True
         for language_report in evidence["per_language"].values()
     )
-    assert report.global_recall_at_k >= 0.90, {
-        "global_recall_at_20": report.global_recall_at_k,
-        "worst_global_seeds": sorted(
-            (
-                (result.language, result.seed_term, result.recall_at_k)
-                for result in report.results
-                if result.index_scope == "global"
-            ),
-            key=lambda item: item[2],
-        )[:10],
-    }
+    if not components:
+        assert report.global_recall_at_k >= 0.90, {
+            "global_recall_at_20": report.global_recall_at_k,
+            "worst_global_seeds": sorted(
+                (
+                    (result.language, result.seed_term, result.recall_at_k)
+                    for result in report.results
+                    if result.index_scope == "global"
+                ),
+                key=lambda item: item[2],
+            )[:10],
+        }
     assert report.shard_recall_at_k >= 0.90, {
         "shard_recall_at_20": report.shard_recall_at_k,
         "per_language": report.per_language_recall,

@@ -684,3 +684,119 @@ def validate_ann_acceptance(
         connection.close()
 
     return AnnAcceptanceReport(languages, seeds_per_language, k, tuple(results))
+
+
+def validate_ann_acceptance_packs(
+    dataset: Any,
+    *,
+    languages: tuple[str, ...] = DEFAULT_LANGUAGES,
+    seeds_per_language: int = 10,
+    k: int = 20,
+    chunk_size: int = 8192,
+) -> AnnAcceptanceReport:
+    """Validate the per-language ANN indexes a schema-2 install actually serves.
+
+    There is no global-index scope here: a schema-2 release ships one index per
+    semantic language and no combined one, so the language shards are the whole
+    of what queries run against. Each pack is self-contained -- its own mapping,
+    vectors and index -- which is why every seed and candidate resolves without
+    reaching outside it.
+    """
+
+    if not languages or len(set(languages)) != len(languages):
+        raise ValueError("languages must be a non-empty sequence of unique language tags")
+    if seeds_per_language < 1 or k < 1 or chunk_size < k:
+        raise ValueError("seeds_per_language and k must be positive; chunk_size must be >= k")
+
+    from .locator import ComponentLocator
+
+    active = ComponentLocator(dataset.root).active()
+    results: list[AnnSeedResult] = []
+    # The router is opened only to validate the activation is serviceable;
+    # every path below comes from the activation and the store directly.
+    with active.router():
+        for language in languages:
+            component = active.activation.component_for("semantic", language)
+            if component is None:
+                raise RuntimeError(f"semantic pack for {language!r} is not installed")
+            pack = next(
+                item
+                for item in active.activation.packs
+                if item.capability == "semantic" and language in item.languages
+            )
+            paths: dict[str, Path] = {}
+            for component_id in pack.components:
+                entry = active.activation.component(component_id)
+                stored = active.store.open_path(entry.sha256)
+                if entry.path.endswith(".usearch"):
+                    paths["index"] = stored
+                elif entry.path.endswith(".f16"):
+                    paths["vectors"] = stored
+                else:
+                    paths["mapping"] = stored
+
+            connection = _sqlite_ro(paths["mapping"])
+            try:
+                metadata = _metadata(connection)
+                if metadata.get("dataset_version") != dataset.version:
+                    raise RuntimeError(
+                        f"semantic pack {language!r} does not match the active dataset"
+                    )
+                dimensions = int(metadata["dimensions"])
+                connectivity = int(metadata.get("connectivity", "16"))
+                expansion_add = int(metadata.get("expansion_add", "256"))
+                expansion_search = int(metadata.get("expansion_search", "512"))
+                row_bytes = dimensions * np.dtype("<f2").itemsize
+                row_count = paths["vectors"].stat().st_size // row_bytes
+                matrix: np.memmap[Any, Any] = np.memmap(
+                    paths["vectors"], mode="r", dtype="<f2", shape=(row_count, dimensions)
+                )
+                seeds = _seed_rows(connection, language, seeds_per_language)
+                exact = _exact_neighbors_batch(
+                    connection,
+                    matrix,
+                    seeds,
+                    candidate_language=language,
+                    k=k,
+                    chunk_size=chunk_size,
+                )
+                index = open_index_view(
+                    paths["index"],
+                    dimensions=dimensions,
+                    metric="cos",
+                    dtype="i8",
+                    connectivity=connectivity,
+                    expansion_add=expansion_add,
+                    expansion_search=expansion_search,
+                    expected_count=row_count,
+                )
+                try:
+                    for seed in seeds:
+                        query = _unit_vector(matrix, seed.vector_offset)
+                        ann, deterministic, strict_language = _ann_neighbors(
+                            index,
+                            connection,
+                            matrix,
+                            query,
+                            seed,
+                            k=k,
+                            index_size=row_count,
+                            expected_language=language,
+                        )
+                        results.append(
+                            _seed_result(
+                                "language_shard",
+                                seed,
+                                ann,
+                                exact[seed.semantic_id],
+                                deterministic,
+                                strict_language,
+                                k,
+                            )
+                        )
+                finally:
+                    index.reset()
+                del matrix
+            finally:
+                connection.close()
+    return AnnAcceptanceReport(languages, seeds_per_language, k, tuple(results))

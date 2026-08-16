@@ -349,6 +349,25 @@ class DatasetLifecycle:
             "manifest_sha256": manifest.sha256,
         }
 
+    def materialize(
+        self,
+        manifest: DatasetManifest,
+        component: Component,
+        stage: Path,
+        *,
+        local_asset_root: Path | None = None,
+    ) -> Path:
+        """Fetch, assemble, decompress and verify one component into *stage*.
+
+        The seam the schema-2 installer fetches through, so both schemas share
+        one download path with its resume, retry and integrity behavior.
+        """
+
+        self._materialize_component(
+            manifest, component, stage, local_asset_root=local_asset_root
+        )
+        return stage.joinpath(*component.path.parts)
+
     @staticmethod
     def _mirror_targets(
         manifest: DatasetManifest, destination: Path

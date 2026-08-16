@@ -11,7 +11,7 @@ from typing import Any, TypeVar
 
 from ..pipeline.wordplay import is_palindrome, normalized_letters
 from .actual_wordplay import WORDPLAY_KINDS, SQLiteActualWordplaySearch
-from .locator import ActiveDataset, DatasetLocator
+from .locator import ActiveComponents, ActiveDataset, DatasetLocator
 from .normalization import (
     normalize_key,
     normalize_language,
@@ -19,8 +19,13 @@ from .normalization import (
     sense_scope,
     validate_limit,
 )
+from .pack_queries import relation_rows as pack_relation_rows
+from .pack_queries import translation_coverage as pack_translation_coverage
+from .pack_queries import translation_rows as pack_translation_rows
+from .pack_semantic import PackSemanticSearch
+from .router import PackRouter
 from .semantic import SemanticSearch, SemanticWorker, UnavailableSemanticSearch
-from .wordplay import SQLiteWordplaySearch
+from .wordplay import SQLiteWordplaySearch, UnavailableWordplaySearch
 
 RELATIONS = frozenset(
     {
@@ -152,6 +157,19 @@ def _provenance(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, str | None]:
     }
 
 
+class LanguageNotInstalled(RuntimeError):
+    """A query named a language this install does not serve.
+
+    Raised rather than returning nothing, so a caller can never mistake an
+    uninstalled language for a word that does not exist. Tool entry points
+    translate it into a typed unavailable response.
+    """
+
+    def __init__(self, language: str) -> None:
+        super().__init__(f"language is not installed: {language}")
+        self.language = language
+
+
 class LexiconService:
     """Thread-safe queries over one immutable, already-activated dataset."""
 
@@ -163,16 +181,18 @@ class LexiconService:
         semantic_directory: str | Path | None = None,
         semantic_search: SemanticSearch | None = None,
         dataset_profile: str = "full",
+        router: PackRouter | None = None,
     ) -> None:
         self.database_path = Path(database_path).resolve()
         if not self.database_path.is_file():
             raise RuntimeError(f"Lexical database does not exist: {self.database_path}")
         if not dataset_version:
             raise ValueError("dataset_version cannot be empty")
-        if dataset_profile not in SUPPORTED_DATASET_PROFILES:
+        if router is None and dataset_profile not in SUPPORTED_DATASET_PROFILES:
             raise ValueError("dataset_profile must be full or english")
         self.dataset_version = dataset_version
         self.dataset_profile = dataset_profile
+        self._router = router
         self._connection = sqlite3.connect(
             f"file:{self.database_path.as_posix()}?mode=ro&immutable=1",
             uri=True,
@@ -200,6 +220,12 @@ class LexiconService:
             "relations",
             "pronunciations_words",
         }
+        if router is not None:
+            # A lexical pack carries the catalogue instead of the wordplay
+            # indexes, which live in their own pack.
+            required_tables = (required_tables - {"pronunciations_words"}) | {
+                "target_catalogue"
+            }
         missing = required_tables - self._tables
         if missing:
             self._connection.close()
@@ -207,8 +233,9 @@ class LexiconService:
                 "Lexical database is missing required compact-schema tables: "
                 + ", ".join(sorted(missing))
             )
-        self._check_dataset_version()
-        self._check_dataset_profile()
+        if router is None:
+            self._check_dataset_version()
+            self._check_dataset_profile()
 
         if semantic_search is not None:
             self._semantic = semantic_search
@@ -221,9 +248,19 @@ class LexiconService:
             )
         else:
             self._semantic = UnavailableSemanticSearch()
-        self._wordplay = SQLiteWordplaySearch(self.database_path)
+        wordplay_path = self.database_path
+        if router is not None:
+            component = router.activation.component_for("wordplay", "en")
+            wordplay_path = (
+                router.store.open_path(component.sha256) if component is not None else None
+            )
         try:
-            self._actual_wordplay = SQLiteActualWordplaySearch(self.database_path)
+            if wordplay_path is None:
+                self._wordplay = UnavailableWordplaySearch()
+                self._actual_wordplay = UnavailableWordplaySearch()
+            else:
+                self._wordplay = SQLiteWordplaySearch(wordplay_path)
+                self._actual_wordplay = SQLiteActualWordplaySearch(wordplay_path)
         except BaseException:
             self._connection.close()
             raise
@@ -240,6 +277,37 @@ class LexiconService:
     @classmethod
     def from_locator(cls, locator: DatasetLocator | None = None) -> LexiconService:
         return cls.from_active_dataset((locator or DatasetLocator()).active())
+
+    @classmethod
+    def from_components(cls, active: ActiveComponents) -> LexiconService:
+        """Serve a schema-2 install, routing each language to its own pack.
+
+        The primary connection is any installed lexical pack: it is only read
+        for schema introspection, because every language-scoped query resolves
+        its own connection through the router.
+        """
+
+        router = active.router()
+        languages = router.installed_languages("lexical")
+        if not languages:
+            router.close()
+            raise RuntimeError(
+                "The active installation has no lexical languages. Install at least "
+                "one with: lexicon-data add-language --languages en"
+            )
+        component = active.activation.component_for("lexical", languages[0])
+        assert component is not None  # a listed language always has a component
+        try:
+            return cls(
+                active.store.open_path(component.sha256),
+                active.version,
+                dataset_profile="components",
+                router=router,
+                semantic_search=PackSemanticSearch(router, active.version),
+            )
+        except BaseException:
+            router.close()
+            raise
 
     def _check_dataset_version(self) -> None:
         metadata = {
@@ -276,9 +344,30 @@ class LexiconService:
             )
 
     def _supports_languages(self, *languages: str | None) -> bool:
+        if self._router is not None:
+            # A schema-2 install serves the languages it installed. The source
+            # language must be present; a target language is a filter, and a
+            # missing one is reported by the caller rather than refused here.
+            source = next((item for item in languages if item is not None), None)
+            if source is None:
+                return True
+            return self._router.availability("lexical", source).installed
         return self.dataset_profile != "english" or all(
             language is None or language == "en" for language in languages
         )
+
+    def _language_unavailable_reason(self, *languages: str | None) -> str:
+        """Why the request cannot be served, in the shared vocabulary."""
+
+        if self._router is None:
+            return "english_profile_supports_only_en"
+        for language in languages:
+            if language is None:
+                continue
+            availability = self._router.availability("lexical", language)
+            if not availability.installed:
+                return availability.reason
+        return "language_not_installed"
 
     def _unsupported_language_response(
         self,
@@ -289,7 +378,17 @@ class LexiconService:
     ) -> dict[str, Any]:
         response = self._response(response_type, query, [])
         response["available"] = False
-        response["unavailable_reason"] = "english_profile_supports_only_en"
+        response["unavailable_reason"] = self._language_unavailable_reason(
+            *(
+                value
+                for key, value in query.items()
+                if key.endswith("language") and isinstance(value, str)
+            )
+        )
+        if self._router is not None:
+            response["installed_languages"] = list(
+                self._router.installed_languages("lexical")
+            )
         if candidate_count:
             response["candidate_count"] = 0
         return response
@@ -305,6 +404,26 @@ class LexiconService:
 
     def __exit__(self, *_: object) -> None:
         self.close()
+
+    def _db(self, language: str | None = None) -> sqlite3.Connection:
+        """The connection serving *language*.
+
+        A monolith answers for every language from one file. A schema-2 install
+        answers from the pack that owns the language, so every language-scoped
+        query resolves its connection here rather than assuming one exists.
+        """
+
+        if self._router is None:
+            return self._connection
+        if language is None:
+            raise RuntimeError(
+                "a schema-2 query must name its language; routing cannot guess "
+                "which pack holds a sense"
+            )
+        connection = self._router.connection_for("lexical", language)
+        if connection is None:
+            raise LanguageNotInstalled(language)
+        return connection
 
     def _sense_rows(
         self,
@@ -324,7 +443,7 @@ class LexiconService:
             parameters.append(sense_id)
         parameters.append(limit)
         with self._lock:
-            return self._connection.execute(
+            return self._db(language).execute(
                 f"""
                 SELECT sense.sense_id, entry.entry_id, term.term AS word,
                        term.normalized_term AS normalized_word,
@@ -349,6 +468,7 @@ class LexiconService:
         columns: str,
         identifier: str,
         *,
+        language: str | None = None,
         id_column: str = "sense_id",
         limit: int = 100,
     ) -> list[sqlite3.Row]:
@@ -357,7 +477,7 @@ class LexiconService:
         if id_column not in {"sense_id", "entry_id"}:
             raise RuntimeError(f"unsafe dependent-row key {id_column!r}")
         with self._lock:
-            return self._connection.execute(
+            return self._db(language).execute(
                 f"SELECT {columns} FROM {table} WHERE {id_column} = ? ORDER BY position LIMIT ?",
                 (identifier, limit),
             ).fetchall()
@@ -366,6 +486,7 @@ class LexiconService:
         self,
         sense_id: str,
         *,
+        language: str | None = None,
         target_language: str | None = None,
         limit: int = 100,
     ) -> list[sqlite3.Row]:
@@ -376,7 +497,14 @@ class LexiconService:
             parameters.append(target_language)
         parameters.append(limit)
         with self._lock:
-            return self._connection.execute(
+            if self._router is not None:
+                return pack_translation_rows(
+                    self._db(language),
+                    sense_id=sense_id,
+                    limit=limit,
+                    target_language=target_language,
+                )
+            return self._db(language).execute(
                 f"""
                 SELECT term.term, term.normalized_term,
                        term.language AS target_language,
@@ -396,14 +524,18 @@ class LexiconService:
                 parameters,
             ).fetchall()
 
-    def _translation_coverage(self, sense_ids: list[str]) -> dict[str, tuple[int, int]]:
+    def _translation_coverage(
+        self, sense_ids: list[str], *, language: str | None = None
+    ) -> dict[str, tuple[int, int]]:
         """Return distinct-language and row counts for a bounded sense set."""
 
         if not sense_ids or "translations" not in self._tables:
             return {}
         placeholders = ", ".join("?" for _sense_id in sense_ids)
         with self._lock:
-            rows = self._connection.execute(
+            if self._router is not None:
+                return pack_translation_coverage(self._db(language), sense_ids)
+            rows = self._db(language).execute(
                 f"""
                 SELECT translation.sense_id,
                        COUNT(DISTINCT term.language) AS language_count,
@@ -444,7 +576,7 @@ class LexiconService:
             return candidates[:limit]
 
         sense_ids = [str(row["sense_id"]) for row in candidates]
-        coverage = self._translation_coverage(sense_ids)
+        coverage = self._translation_coverage(sense_ids, language=language)
         if not coverage:
             return candidates[:limit]
 
@@ -467,9 +599,11 @@ class LexiconService:
             selected_ids.add(str(row["sense_id"]))
         return [row for row in candidates if str(row["sense_id"]) in selected_ids][:limit]
 
-    def _synonym_rows(self, sense_id: str, *, limit: int) -> list[sqlite3.Row]:
+    def _synonym_rows(
+        self, sense_id: str, *, limit: int, language: str | None = None
+    ) -> list[sqlite3.Row]:
         with self._lock:
-            return self._connection.execute(
+            return self._db(language).execute(
                 """
                 SELECT term.term, term.normalized_term, term.language,
                        synonym.part_of_speech, synonym.position,
@@ -566,6 +700,7 @@ class LexiconService:
                         "examples",
                         "example, position",
                         sense_id,
+                        language=language,
                         limit=examples_limit + 1,
                     )
                 ]
@@ -577,6 +712,7 @@ class LexiconService:
                         "pronunciations",
                         "ipa, region, position",
                         entry_id,
+                        language=language,
                         id_column="entry_id",
                         limit=pronunciations_limit + 1,
                     )
@@ -592,7 +728,9 @@ class LexiconService:
                         "sense_scope": sense_scope(sense_id),
                         "provenance": _provenance(item),
                     }
-                    for item in self._translation_rows(sense_id, limit=translations_limit + 1)
+                    for item in self._translation_rows(
+                        sense_id, limit=translations_limit + 1, language=language
+                    )
                 ]
             )
 
@@ -679,7 +817,9 @@ class LexiconService:
             row_sense_id = str(row["sense_id"])
             candidates: list[tuple[tuple[str, str], dict[str, Any]]] = []
             seen_in_sense: set[tuple[str, str]] = set()
-            for item in self._synonym_rows(row_sense_id, limit=_MAX_QUERY_BUDGET):
+            for item in self._synonym_rows(
+                row_sense_id, limit=_MAX_QUERY_BUDGET, language=language
+            ):
                 identity = (str(item["normalized_term"]), str(item["language"]))
                 if identity == (key, language) or identity in seen_in_sense:
                     continue
@@ -821,7 +961,35 @@ class LexiconService:
         source_sense_id: str | None,
         limit: int,
     ) -> list[dict[str, Any]]:
-        """Orient compact physical assertions around the requested source term."""
+        """Oriented assertions for one source term, ranked."""
+
+        return self._rank_oriented_relation_rows(
+            self._oriented_relation_rows(
+                word,
+                language,
+                relation_code,
+                target_language=target_language,
+                source_sense_id=source_sense_id,
+                limit=limit,
+            ),
+            limit=limit,
+        )
+
+    def _oriented_relation_rows(
+        self,
+        word: str,
+        language: str,
+        relation_code: int,
+        *,
+        target_language: str | None,
+        source_sense_id: str | None,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Orient compact physical assertions around the requested source term.
+
+        Deliberately unranked: callers that rank a merged set of their own must
+        not receive rows that were already ranked and truncated per source.
+        """
 
         forward_clauses = [
             "source.normalized_term = ?",
@@ -969,8 +1137,33 @@ class LexiconService:
             LIMIT ?
         """
         with self._lock:
-            forward = self._connection.execute(select_forward, forward_parameters).fetchall()
-            reverse = self._connection.execute(select_reverse, reverse_parameters).fetchall()
+            if self._router is None:
+                forward = self._connection.execute(select_forward, forward_parameters).fetchall()
+                reverse = self._connection.execute(select_reverse, reverse_parameters).fetchall()
+            else:
+                # A pack's lexical_terms holds only its own headwords, so the
+                # monolith's join would silently drop every foreign target. The
+                # pack form resolves those through target_catalogue instead.
+                pack = self._db(language)
+                forward = pack_relation_rows(
+                    pack,
+                    word=word,
+                    language=language,
+                    relation_code=relation_code,
+                    limit=limit,
+                    target_language=target_language,
+                    sense_id=source_sense_id,
+                )
+                reverse = pack_relation_rows(
+                    pack,
+                    word=word,
+                    language=language,
+                    relation_code=inverse_code,
+                    limit=limit,
+                    reverse=True,
+                    target_language=target_language,
+                    sense_id=source_sense_id,
+                )
 
         oriented: list[dict[str, Any]] = []
         for row in forward:
@@ -982,7 +1175,28 @@ class LexiconService:
             item["relation_code"] = relation_code
             item["direction_code"] = _INVERSE_DIRECTION_CODES[int(item["direction_code"])]
             oriented.append(item)
-        return self._rank_oriented_relation_rows(oriented, limit=limit)
+        return oriented
+
+    @staticmethod
+    def _source_prefetch_key(item: Mapping[str, Any]) -> tuple[Any, ...]:
+        """Mirror the batched statement's source_prefetch_rank ordering."""
+
+        normalized = str(item["target_normalized"])
+        return (
+            1
+            if item["source_sense_id"] is None and item["target_sense_id"] is None
+            else 0,
+            1 if item["target_sense_id"] is None else 0,
+            normalized.count(" "),
+            len(normalized),
+            str(item["target_language"]),
+            normalized,
+            str(item["target_term"]),
+            str(item["source_sense_id"] or ""),
+            str(item["target_sense_id"] or ""),
+            int(item["provenance_id"]),
+            int(item["direction_code"]),
+        )
 
     @staticmethod
     def _relation_row_rank_key(item: Mapping[str, Any]) -> tuple[Any, ...]:
@@ -1050,19 +1264,65 @@ class LexiconService:
             return []
 
         by_source: dict[tuple[str, str], list[dict[str, Any]]] = {}
-        for offset in range(0, len(unique_sources), _RELATION_BATCH_SOURCE_LIMIT):
-            batch = unique_sources[offset : offset + _RELATION_BATCH_SOURCE_LIMIT]
-            for item in self._batched_relation_rows(
-                batch,
-                relation_code,
-                target_language=target_language,
-                per_orientation_limit=branch_limit,
-            ):
+        if self._router is not None:
+            # A frontier spans languages, and each language lives in a different
+            # pack, so the batch is routed per source rather than issued as one
+            # statement. Pack queries are far cheaper than the monolith's, which
+            # more than pays for losing the batching.
+            # Mirror the batched statement exactly: each orientation is bounded
+            # independently by source_prefetch_rank at a prefetch limit, and the
+            # two are appended forward-first. Bounding the merged set instead
+            # changes which second-hop candidates survive.
+            prefetch_limit = min(128, max(32, branch_limit * 4))
+            batched: list[dict[str, Any]] = []
+            for normalized, source_language in unique_sources:
+                pack_connection = self._router.connection_for("lexical", source_language)
+                if pack_connection is None:
+                    continue
+                for reverse in (False, True):
+                    code = (
+                        _INVERSE_RELATION_CODES[relation_code] if reverse else relation_code
+                    )
+                    rows = [
+                        dict(row)
+                        for row in pack_relation_rows(
+                            pack_connection,
+                            word=normalized,
+                            language=source_language,
+                            relation_code=code,
+                            limit=prefetch_limit,
+                            reverse=reverse,
+                            target_language=target_language,
+                            prefetch_order=True,
+                        )
+                    ]
+                    for item in rows:
+                        item["relation_code"] = relation_code
+                        if reverse:
+                            item["direction_code"] = _INVERSE_DIRECTION_CODES[
+                                int(item["direction_code"])
+                            ]
+                    batched.extend(rows)
+            for item in batched:
                 identity = (
                     str(item["source_normalized"]),
                     str(item["source_language"]),
                 )
                 by_source.setdefault(identity, []).append(item)
+        else:
+            for offset in range(0, len(unique_sources), _RELATION_BATCH_SOURCE_LIMIT):
+                batch = unique_sources[offset : offset + _RELATION_BATCH_SOURCE_LIMIT]
+                for item in self._batched_relation_rows(
+                    batch,
+                    relation_code,
+                    target_language=target_language,
+                    per_orientation_limit=branch_limit,
+                ):
+                    identity = (
+                        str(item["source_normalized"]),
+                        str(item["source_language"]),
+                    )
+                    by_source.setdefault(identity, []).append(item)
 
         ranked: list[dict[str, Any]] = []
         for source in unique_sources:
@@ -1641,7 +1901,10 @@ class LexiconService:
             translations: list[dict[str, Any]] = []
             seen_in_sense: set[tuple[str, str]] = set()
             for item in self._translation_rows(
-                row_sense_id, target_language=target_language, limit=limit
+                row_sense_id,
+                target_language=target_language,
+                limit=limit,
+                language=source_language,
             ):
                 identity = (
                     str(item["normalized_term"]),
@@ -1929,6 +2192,32 @@ class LexiconService:
             results,
         )
         response["available"] = self._semantic.available
+        if self._router is not None:
+            # An unrestricted search over a monolith covers every language with
+            # vectors. Over packs it covers the installed ones, and a caller that
+            # is not told so would read the difference as the corpus disagreeing
+            # with itself.
+            searched = (
+                [target_language]
+                if target_language is not None
+                else list(self._router.installed_languages("semantic"))
+            )
+            response["searched_languages"] = searched
+            response["semantic_languages_installed"] = list(
+                self._router.installed_languages("semantic")
+            )
+            available_upstream = sum(
+                1 for item in self._router.coverage.values() if item.has_semantic
+            )
+            response["semantic_languages_available"] = available_upstream
+            response["restricted_to_installed"] = (
+                target_language is None and len(searched) < available_upstream
+            )
+            if target_language is not None:
+                availability = self._router.availability("semantic", target_language)
+                if not availability.installed:
+                    response["available"] = False
+                    response["unavailable_reason"] = availability.reason
         return response
 
     def dictionary_wordplay(self, mode: str, text: str, limit: int = 20) -> dict[str, Any]:

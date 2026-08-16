@@ -10,6 +10,7 @@ from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
 from .runtime import LexiconService
+from .runtime.locator import ComponentLocator
 from .runtime.offline import install_network_guard
 
 Relation = Literal[
@@ -106,6 +107,18 @@ Similarity = Annotated[
 ]
 
 
+def _open_active_dataset() -> LexiconService:
+    """Open the active schema-2 install.
+
+    This release serves component datasets only. A schema-1 data root is
+    reported with its remedy rather than served, because keeping both query
+    surfaces alive would mean maintaining and testing two of everything for the
+    life of the project.
+    """
+
+    return LexiconService.from_components(ComponentLocator().active())
+
+
 class _LazyService:
     def __init__(self, service: LexiconService | None = None) -> None:
         self._service = service
@@ -114,7 +127,7 @@ class _LazyService:
     def get(self) -> LexiconService:
         with self._lock:
             if self._service is None:
-                self._service = LexiconService.from_locator()
+                self._service = _open_active_dataset()
             return self._service
 
 
