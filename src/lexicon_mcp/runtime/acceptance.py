@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import multiprocessing
 import os
@@ -22,12 +23,98 @@ from .service import LexiconService
 MIB = 1024 * 1024
 
 
+class AcceptanceLayoutUnsupported(RuntimeError):
+    """A gate cannot run against this dataset layout."""
+
+
 class AcceptanceDatasetUnavailable(RuntimeError):
     """No activated full corpus is present on this host."""
 
 
-def load_acceptance_dataset() -> ActiveDataset:
-    """Resolve the explicit data root or the standard E:\\AI full-corpus root.
+@dataclass(frozen=True, slots=True)
+class AcceptanceDataset:
+    """A dataset to run acceptance against, whichever layout it uses.
+
+    Picklable on purpose: the performance gate reconstructs it inside a spawned
+    process rather than being handed paths that only exist in one layout.
+    """
+
+    root: Path
+    version: str
+    schema_version: int
+    # A schema-1 dataset directory used directly, for fixtures and builds that
+    # were never installed and so have no activation pointer to resolve.
+    dataset_path: Path | None = None
+
+    @property
+    def is_components(self) -> bool:
+        return self.schema_version >= 2
+
+    def open_service(self) -> LexiconService:
+        if self.is_components:
+            from .locator import ComponentLocator
+
+            return LexiconService.from_components(ComponentLocator(self.root).active())
+        if self.dataset_path is not None:
+            return LexiconService(
+                self.dataset_path / "lexicon.sqlite3",
+                self.version,
+                semantic_directory=self.dataset_path / "semantic",
+            )
+        return LexiconService.from_active_dataset(DatasetLocator(self.root).active())
+
+    @property
+    def semantic_directory(self) -> Path:
+        """The schema-1 semantic artifact directory.
+
+        Schema 2 has no such directory -- its semantic artifacts are per-language
+        components in the content store -- so callers that need one must handle
+        that case rather than receive a path that does not exist.
+        """
+
+        if self.is_components:
+            raise AcceptanceLayoutUnsupported(
+                "a schema 2 install has no semantic directory; its semantic "
+                "artifacts are per-language components"
+            )
+        if self.dataset_path is not None:
+            return self.dataset_path / "semantic"
+        return DatasetLocator(self.root).active().semantic_directory
+
+    def artifact_root(self) -> Path:
+        """Where dataset artifacts live, for mapped-RSS diagnostics.
+
+        Schema 1 keeps semantic artifacts in one directory; schema 2 keeps every
+        component in the content-addressed store, so the store is the root.
+        """
+
+        if self.is_components:
+            return (self.root / "components").resolve()
+        return self.semantic_directory.resolve()
+
+    def semantic_seed(self) -> tuple[str, str]:
+        """A benchmark seed word that exists in the installed semantic data."""
+
+        if not self.is_components:
+            return _semantic_seed_from_mapping(self.artifact_root() / "mapping.sqlite3")
+        from .locator import ComponentLocator
+
+        active = ComponentLocator(self.root).active()
+        with active.router() as router:
+            for language in router.installed_languages("semantic"):
+                component = active.activation.component_for("semantic", language)
+                if component is None:
+                    continue
+                seed = _semantic_seed_from_mapping(
+                    active.store.open_path(component.sha256)
+                )
+                if seed is not None:
+                    return seed
+        raise RuntimeError("no installed semantic pack contains a benchmark seed")
+
+
+def load_acceptance_dataset() -> AcceptanceDataset:
+    """Resolve the explicit data root, or the conventional Windows corpus root.
 
     An explicitly configured but invalid root is a failure. The conventional
     Windows root being absent means this host simply cannot run full-corpus gates.
@@ -35,21 +122,34 @@ def load_acceptance_dataset() -> ActiveDataset:
 
     configured = os.environ.get("LEXICON_DATA_DIR")
     if configured:
-        dataset = DatasetLocator(configured).active()
+        root = Path(configured)
     else:
         if os.name != "nt":
             raise AcceptanceDatasetUnavailable(
                 "set LEXICON_DATA_DIR to an activated full lexicon dataset"
             )
-        default = Path(r"E:\AI\data\lexicon-mcp")
-        if not (default / "current.json").is_file():
+        root = Path(r"E:\AI\data\lexicon-mcp")
+        if not (root / "current.json").is_file():
             raise AcceptanceDatasetUnavailable(
-                f"no activated full lexicon dataset at {default}"
+                f"no activated full lexicon dataset at {root}"
             )
-        dataset = DatasetLocator(default).active()
+    pointer = root / "current.json"
+    if not pointer.is_file():
+        raise AcceptanceDatasetUnavailable(f"no activated dataset at {pointer}")
+    try:
+        value = json.loads(pointer.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise AcceptanceDatasetUnavailable(f"cannot read {pointer}: {exc}") from exc
+    schema_version = value.get("schema_version")
+    if schema_version == 2:
+        from .locator import ComponentLocator
+
+        active = ComponentLocator(root).active()
+        return AcceptanceDataset(root, active.version, 2)
+    dataset = DatasetLocator(root).active()
     if dataset.manifest.get("profile") != "full":
         raise RuntimeError("release acceptance requires a manifest with profile='full'")
-    return dataset
+    return AcceptanceDataset(root, dataset.version, 1)
 
 
 def percentile(values: list[float], quantile: float) -> float:
@@ -157,8 +257,7 @@ class PerformanceReport:
         return compact_evidence_json(self.to_evidence())
 
 
-def _semantic_seed(directory: Path) -> tuple[str, str]:
-    mapping = directory / "mapping.sqlite3"
+def _semantic_seed_from_mapping(mapping: Path) -> tuple[str, str] | None:
     connection = sqlite3.connect(
         f"file:{mapping.as_posix()}?mode=ro&immutable=1", uri=True
     )
@@ -188,7 +287,7 @@ def _semantic_seed(directory: Path) -> tuple[str, str]:
     finally:
         connection.close()
     if row is None:
-        raise RuntimeError("semantic mapping contains no benchmark seed")
+        return None
     return str(row[0]), str(row[1])
 
 
@@ -280,39 +379,68 @@ def _monitor_semantic_children(
     private_peak: list[int],
     working_set_peak: list[int],
     mapped_peak: list[int],
-    semantic_directory: Path,
+    artifact_root: Path,
+    in_process: bool = False,
 ) -> None:
+    """Track whichever process actually performs semantic work.
+
+    Schema 1 runs semantic search in a subprocess, so the peaks come from
+    children. Schema 2 searches installed packs in the serving process, so there
+    is no child to sample and the same measurement is taken here.
+    """
+
     try:
         import psutil
     except ImportError:
         return
     parent = psutil.Process(os.getpid())
+
+    def sample() -> None:
+        if in_process:
+            _sample_process(
+                parent, private_peak, working_set_peak, mapped_peak, artifact_root
+            )
+        else:
+            _sample_semantic_children(
+                parent, private_peak, working_set_peak, mapped_peak, artifact_root
+            )
+
     while not stop.wait(0.02):
-        _sample_semantic_children(
-            parent, private_peak, working_set_peak, mapped_peak, semantic_directory
-        )
+        sample()
     # Capture persistent mmap views once more after the final warm query.
-    _sample_semantic_children(
-        parent, private_peak, working_set_peak, mapped_peak, semantic_directory
-    )
+    sample()
+
+
+def _sample_process(
+    process: Any,
+    private_peak: list[int],
+    working_set_peak: list[int],
+    mapped_peak: list[int],
+    artifact_root: Path,
+) -> None:
+    try:
+        private_peak[0] = max(private_peak[0], process_private_bytes(process.pid))
+        working_set_peak[0] = max(
+            working_set_peak[0], process_working_set_bytes(process.pid)
+        )
+        mapped_peak[0] = max(
+            mapped_peak[0], process_mapped_artifact_rss_bytes(process.pid, artifact_root)
+        )
+    except Exception:
+        return
 
 
 def _performance_worker(
     channel: Connection,
-    database: str,
-    dataset_version: str,
-    semantic_directory: str,
+    dataset: AcceptanceDataset,
     lexical_iterations: int,
     semantic_iterations: int,
 ) -> None:
     service: LexiconService | None = None
+    artifact_root = dataset.artifact_root()
     try:
         with deny_network():
-            service = LexiconService(
-                database,
-                dataset_version,
-                semantic_directory=semantic_directory,
-            )
+            service = dataset.open_service()
             idle_private = process_private_bytes()
             lexical_calls = (
                 lambda: service.dictionary_lookup("bank", "en"),
@@ -366,7 +494,7 @@ def _performance_worker(
             }
             wordplay_samples = sum(len(t) for t in wordplay_warm.values())
 
-            seed, language = _semantic_seed(Path(semantic_directory))
+            seed, language = dataset.semantic_seed()
             stop = threading.Event()
             child_private_peak = [0]
             child_working_set_peak = [0]
@@ -378,7 +506,8 @@ def _performance_worker(
                     child_private_peak,
                     child_working_set_peak,
                     child_mapped_peak,
-                    Path(semantic_directory).resolve(),
+                    artifact_root,
+                    dataset.is_components,
                 ),
                 name="semantic-memory-monitor",
                 daemon=True,
@@ -438,14 +567,7 @@ def run_isolated_performance(
     receive, send = context.Pipe(duplex=False)
     process = context.Process(
         target=_performance_worker,
-        args=(
-            send,
-            str(dataset.lexical_database),
-            dataset.version,
-            str(dataset.semantic_directory),
-            lexical_iterations,
-            semantic_iterations,
-        ),
+        args=(send, dataset, lexical_iterations, semantic_iterations),
         name="lexicon-performance-acceptance",
     )
     process.start()

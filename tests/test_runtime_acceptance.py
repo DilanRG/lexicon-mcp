@@ -11,16 +11,16 @@ import pytest
 from lexicon_mcp.pipeline import BuildInputs, build_full_corpus
 from lexicon_mcp.runtime import acceptance
 from lexicon_mcp.runtime.acceptance import (
+    AcceptanceDataset,
     PerformanceReport,
     percentile,
     process_mapped_artifact_rss_bytes,
     run_isolated_performance,
 )
 from lexicon_mcp.runtime.evidence import compact_evidence_json
-from lexicon_mcp.runtime.locator import ActiveDataset
 
 
-def _fixture_dataset(tmp_path: Path) -> ActiveDataset:
+def _fixture_dataset(tmp_path: Path) -> AcceptanceDataset:
     fixtures = Path(__file__).parent / "fixtures" / "build_inputs"
     output = tmp_path / "dataset"
     build_full_corpus(
@@ -37,7 +37,7 @@ def _fixture_dataset(tmp_path: Path) -> ActiveDataset:
         dataset_version="fixture-v1",
         retrieved_at="2026-01-01T00:00:00Z",
     )
-    return ActiveDataset(output, "fixture-v1", output, {"profile": "full"})
+    return AcceptanceDataset(output, "fixture-v1", 1, dataset_path=output)
 
 
 def test_percentile_uses_nearest_rank() -> None:

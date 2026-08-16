@@ -9,7 +9,6 @@ from lexicon_mcp.runtime.acceptance import (
     load_acceptance_dataset,
 )
 from lexicon_mcp.runtime.offline import deny_network
-from lexicon_mcp.runtime.service import LexiconService
 from lexicon_mcp.server import create_mcp
 
 
@@ -124,7 +123,7 @@ def _assert_transitive_hierarchy_relation(
 @pytest.mark.full_corpus
 def test_required_full_corpus_anchors_offline() -> None:
     dataset = _dataset_or_skip()
-    with LexiconService.from_active_dataset(dataset) as service, deny_network():
+    with dataset.open_service() as service, deny_network():
         bank = service.dictionary_lookup(
             "bank",
             "en",
@@ -414,7 +413,7 @@ def test_required_full_corpus_anchors_offline() -> None:
 @pytest.mark.asyncio
 async def test_full_corpus_mcp_exposes_exactly_seven_offline_tools() -> None:
     dataset = _dataset_or_skip()
-    with LexiconService.from_active_dataset(dataset) as service, deny_network():
+    with dataset.open_service() as service, deny_network():
         mcp = create_mcp(service)
         tools = await mcp.list_tools()
         assert {tool.name for tool in tools} == {
