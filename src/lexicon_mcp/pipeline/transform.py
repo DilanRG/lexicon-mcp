@@ -245,6 +245,11 @@ def build_lexical_pack(
         }
         _assert_pack_is_closed(db)
         db.executescript(LEXICAL_PACK_INDEXES)
+        # Without query-planner statistics SQLite picks catastrophic plans:
+        # spoonerism measured 841 ms against 0.1 ms with them. The monolith
+        # ships sqlite_stat1, so every pack must too. Scoped to main: the
+        # read-only sources are still attached and cannot be written.
+        db.execute("ANALYZE main")
         db.commit()
         db.execute("DETACH DATABASE src")
         db.execute("DETACH DATABASE counts")
@@ -413,6 +418,7 @@ def build_core_pack(
             ("capability", "core"),
         ):
             db.execute("INSERT INTO metadata VALUES (?, ?)", (key, value))
+        db.execute("ANALYZE main")
         db.commit()
         db.execute("DETACH DATABASE src")
         db.execute("DETACH DATABASE counts")
@@ -568,6 +574,7 @@ def build_semantic_pack(
             ("term_count", str(len(rows))),
         ):
             db.execute("INSERT INTO metadata VALUES (?, ?)", (key, value))
+        db.execute("ANALYZE main")
         db.commit()
         db.execute("VACUUM")
 
@@ -752,6 +759,11 @@ def build_wordplay_pack(
         ):
             db.execute("INSERT INTO metadata VALUES (?, ?)", (key, value))
         db.executescript(WORDPLAY_PACK_INDEXES)
+        # Without query-planner statistics SQLite picks catastrophic plans:
+        # spoonerism measured 841 ms against 0.1 ms with them. The monolith
+        # ships sqlite_stat1, so every pack must too. Scoped to main: the
+        # read-only sources are still attached and cannot be written.
+        db.execute("ANALYZE main")
         db.commit()
         db.execute("DETACH DATABASE src")
         db.execute("VACUUM")
