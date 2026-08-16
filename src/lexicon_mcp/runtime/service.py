@@ -22,6 +22,7 @@ from .normalization import (
 from .pack_queries import relation_rows as pack_relation_rows
 from .pack_queries import translation_coverage as pack_translation_coverage
 from .pack_queries import translation_rows as pack_translation_rows
+from .pack_semantic import PackSemanticSearch
 from .router import PackRouter
 from .semantic import SemanticSearch, SemanticWorker, UnavailableSemanticSearch
 from .wordplay import SQLiteWordplaySearch, UnavailableWordplaySearch
@@ -302,6 +303,7 @@ class LexiconService:
                 active.version,
                 dataset_profile="components",
                 router=router,
+                semantic_search=PackSemanticSearch(router, active.version),
             )
         except BaseException:
             router.close()
@@ -2159,6 +2161,32 @@ class LexiconService:
             results,
         )
         response["available"] = self._semantic.available
+        if self._router is not None:
+            # An unrestricted search over a monolith covers every language with
+            # vectors. Over packs it covers the installed ones, and a caller that
+            # is not told so would read the difference as the corpus disagreeing
+            # with itself.
+            searched = (
+                [target_language]
+                if target_language is not None
+                else list(self._router.installed_languages("semantic"))
+            )
+            response["searched_languages"] = searched
+            response["semantic_languages_installed"] = list(
+                self._router.installed_languages("semantic")
+            )
+            available_upstream = sum(
+                1 for item in self._router.coverage.values() if item.has_semantic
+            )
+            response["semantic_languages_available"] = available_upstream
+            response["restricted_to_installed"] = (
+                target_language is None and len(searched) < available_upstream
+            )
+            if target_language is not None:
+                availability = self._router.availability("semantic", target_language)
+                if not availability.installed:
+                    response["available"] = False
+                    response["unavailable_reason"] = availability.reason
         return response
 
     def dictionary_wordplay(self, mode: str, text: str, limit: int = 20) -> dict[str, Any]:
