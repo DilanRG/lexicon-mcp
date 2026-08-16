@@ -101,7 +101,11 @@ class AcceptanceDataset:
 
         active = ComponentLocator(self.root).active()
         with active.router() as router:
-            for language in router.installed_languages("semantic"):
+            installed = router.installed_languages("semantic")
+            # English first, matching the schema-1 seed, so the benchmark does
+            # not depend on which language happens to sort first.
+            ordered = sorted(installed, key=lambda item: (item != "en", item))
+            for language in ordered:
                 component = active.activation.component_for("semantic", language)
                 if component is None:
                     continue
@@ -145,6 +149,30 @@ def load_acceptance_dataset() -> AcceptanceDataset:
         from .locator import ComponentLocator
 
         active = ComponentLocator(root).active()
+        # The schema-1 gate demanded profile='full'. The equivalent here is an
+        # install that withheld nothing: a subset would pass acceptance while
+        # missing the very anchors the gates check.
+        with active.router() as router:
+            catalogue = router.coverage
+            installed = set(router.installed_languages("lexical"))
+            missing = len(catalogue) - len(installed)
+            if missing > 0:
+                raise RuntimeError(
+                    "release acceptance requires a complete install; this one is "
+                    f"missing {missing} of {len(catalogue)} lexical languages"
+                )
+            for capability in ("semantic", "wordplay"):
+                offered = {
+                    language
+                    for language, coverage in catalogue.items()
+                    if coverage.offers(capability)
+                }
+                absent = offered - set(router.installed_languages(capability))
+                if absent:
+                    raise RuntimeError(
+                        "release acceptance requires a complete install; "
+                        f"{len(absent)} {capability} languages are not installed"
+                    )
         return AcceptanceDataset(root, active.version, 2)
     dataset = DatasetLocator(root).active()
     if dataset.manifest.get("profile") != "full":
@@ -318,7 +346,10 @@ def process_mapped_artifact_rss_bytes(
         except ValueError:
             continue
         name = os.path.basename(mapped_path)
-        if not name.endswith(
+        # Content-addressed components are named by digest and carry no
+        # extension, so anything inside the store counts; elsewhere the
+        # extension still identifies a dataset artifact.
+        if os.sep + "sha256" + os.sep not in mapped_path and not name.endswith(
             (".usearch", ".f16", ".sqlite", ".sqlite3", ".db", "-wal", "-shm")
         ):
             continue
